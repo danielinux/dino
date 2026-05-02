@@ -573,7 +573,10 @@ public class Database : Qlite.Database {
         peer_bundle.aik_pub_ed25519_base64 = aik_ed;
         peer_bundle.aik_pub_mldsa_base64 = aik_m;
         peer_bundle.device_certificate = device_certificate;
-        peer_bundle.identity_pub_x25519_base64 = ik;
+        // Use the device certificate as the canonical remote device identity.
+        // If the published <ik/> field ever drifts from the certified DIK, the
+        // initiator and responder derive different X3DH secrets.
+        peer_bundle.identity_pub_x25519_base64 = bytes_to_base64(device_certificate.dik_pub_x25519);
         peer_bundle.signed_pre_key_id = (uint32) ((!) row)[bundle.signed_pre_key_id];
         peer_bundle.signed_pre_key_base64 = spk;
         peer_bundle.signed_pre_key_signature_base64 = spk_sig;

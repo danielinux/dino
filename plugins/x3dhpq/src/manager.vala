@@ -175,18 +175,7 @@ public class Manager : Object {
         Bytes payload_key = global::X3dhpq.Crypto.random_bytes(32);
         Bytes payload_nonce = global::X3dhpq.Crypto.random_bytes(12);
         Bytes payload_transport_key = bytes_from_uint8_array(concat_byte_arrays(bytes_to_uint8_array(payload_key), bytes_to_uint8_array(payload_nonce)));
-        Bytes payload_ciphertext;
-        try {
-            payload_ciphertext = global::X3dhpq.Crypto.aes256gcm_encrypt(payload_key, payload_nonce, new Bytes((uint8[]) message_stanza.body.data));
-        } catch (Error e) {
-            warning("x3dhpq payload encrypt failed for %s (key=%u nonce=%u transport=%u): %s",
-                conversation.counterpart.to_string(),
-                (uint) bytes_to_uint8_array(payload_key).length,
-                (uint) bytes_to_uint8_array(payload_nonce).length,
-                (uint) bytes_to_uint8_array(payload_transport_key).length,
-                e.message);
-            throw e;
-        }
+        Bytes payload_ciphertext = global::X3dhpq.Crypto.aes256gcm_encrypt(payload_key, payload_nonce, new Bytes((uint8[]) message_stanza.body.data));
         StanzaNode envelope = new StanzaNode.build("x3dhpq", Protocol.NS_ENVELOPE)
             .add_self_xmlns()
             .put_attribute("sender-device", ((!) local_device_id).to_string())
@@ -220,35 +209,13 @@ public class Manager : Object {
 
                 Protocol.MessageHeader header;
                 Bytes encrypted_transport_key;
-                try {
-                    Protocol.encrypt_transport_key((!) state, payload_transport_key, out header, out encrypted_transport_key);
-                } catch (Error e) {
-                    warning("x3dhpq transport encrypt failed for %s/%d: %s",
-                        recipient.to_string(),
-                        device_id,
-                        e.message);
-                    throw e;
-                }
+                Protocol.encrypt_transport_key((!) state, payload_transport_key, out header, out encrypted_transport_key);
                 db.store_session(conversation.account, recipient.bare_jid.to_string(), device_id, (!) state);
-
-                Bytes marshaled_header = header.marshal();
-                string marshaled_header_b64 = bytes_to_base64(marshaled_header);
-                if (Protocol.MessageHeader.unmarshal(marshaled_header) == null) {
-                    warning("x3dhpq local header self-check failed for %s/%d before base64", recipient.to_string(), device_id);
-                }
-                if (Protocol.MessageHeader.unmarshal(bytes_from_base64(marshaled_header_b64)) == null) {
-                    warning("x3dhpq local header base64 self-check failed for %s/%d", recipient.to_string(), device_id);
-                }
 
                 StanzaNode key_node = new StanzaNode.build("key", Protocol.NS_ENVELOPE)
                     .put_attribute("rid", device_id.to_string())
-                    .put_node(new StanzaNode.build("hdr", Protocol.NS_ENVELOPE).put_node(new StanzaNode.text(marshaled_header_b64)))
+                    .put_node(new StanzaNode.build("hdr", Protocol.NS_ENVELOPE).put_node(new StanzaNode.text(bytes_to_base64(header.marshal()))))
                     .put_node(new StanzaNode.build("emk", Protocol.NS_ENVELOPE).put_node(new StanzaNode.text(bytes_to_base64(encrypted_transport_key))));
-                warning("x3dhpq send header for %s/%d: raw=%u b64=%u",
-                    recipient.to_string(),
-                    device_id,
-                    (uint) bytes_to_uint8_array(marshaled_header).length,
-                    (uint) marshaled_header_b64.length);
 
                 if (bootstrap != null) {
                     StanzaNode prekey_node = new StanzaNode.build("prekey", Protocol.NS_ENVELOPE)
@@ -295,7 +262,6 @@ public class Manager : Object {
 
         int? local_device_id = db.get_local_device_id(conversation.account);
         if (local_device_id == null) {
-            warning("x3dhpq decrypt skipped: no local device id for %s", conversation.account.bare_jid.to_string());
             return false;
         }
 
@@ -304,14 +270,12 @@ public class Manager : Object {
             sender_jid_value = stanza.from.bare_jid.to_string();
         }
         if (sender_jid_value == null) {
-            warning("x3dhpq decrypt skipped: missing sender-jid");
             return false;
         }
 
         int sender_device_id = envelope.get_attribute_int("sender-device");
         StanzaNode? payload_node = envelope.get_subnode("payload", Protocol.NS_ENVELOPE);
         if (payload_node == null || payload_node.get_string_content() == null) {
-            warning("x3dhpq decrypt skipped: missing payload node");
             return false;
         }
 
@@ -323,7 +287,6 @@ public class Manager : Object {
             }
         }
         if (key_node == null) {
-            warning("x3dhpq decrypt skipped: no key node for local device %d", (!) local_device_id);
             return false;
         }
 
@@ -331,20 +294,17 @@ public class Manager : Object {
         if (state == null) {
             StanzaNode? prekey_node = ((!) key_node).get_subnode("prekey", Protocol.NS_ENVELOPE);
             if (prekey_node == null) {
-                warning("x3dhpq decrypt skipped: missing prekey node for new session from %s/%d", sender_jid_value, sender_device_id);
                 return false;
             }
 
             Protocol.DeviceCertificate? peer_cert = Protocol.DeviceCertificate.unmarshal(bytes_from_base64(prekey_node.get_deep_string_content("dc")));
             if (peer_cert == null) {
-                warning("x3dhpq decrypt skipped: invalid peer certificate from %s/%d", sender_jid_value, sender_device_id);
                 return false;
             }
             Row local_bundle = db.get_required_local_bundle(conversation.account);
             Row? local_spk = db.get_local_signed_pre_key(conversation.account, local_bundle[db.bundle.signed_pre_key_id]);
             Row? local_kem = db.get_local_kem_pre_key(conversation.account, prekey_node.get_attribute_int("kemkey-id"));
             if (local_spk == null || local_kem == null) {
-                warning("x3dhpq decrypt skipped: missing local SPK or KEM key for new session from %s/%d", sender_jid_value, sender_device_id);
                 return false;
             }
             Row? local_opk = null;
@@ -381,18 +341,10 @@ public class Manager : Object {
             StanzaNode? hdr_node = ((!) key_node).get_subnode("hdr", Protocol.NS_ENVELOPE);
             StanzaNode? emk_node = ((!) key_node).get_subnode("emk", Protocol.NS_ENVELOPE);
             if (hdr_node == null || emk_node == null || hdr_node.get_string_content() == null || emk_node.get_string_content() == null) {
-                warning("x3dhpq decrypt skipped: missing hdr/emk nodes from %s/%d", sender_jid_value, sender_device_id);
                 return false;
             }
-            Bytes raw_header = bytes_from_base64(hdr_node.get_string_content());
-            warning("x3dhpq recv header from %s/%d: b64=%u raw=%u",
-                sender_jid_value,
-                sender_device_id,
-                (uint) hdr_node.get_string_content().length,
-                (uint) bytes_to_uint8_array(raw_header).length);
-            Protocol.MessageHeader? header = Protocol.MessageHeader.unmarshal(raw_header);
+            Protocol.MessageHeader? header = Protocol.MessageHeader.unmarshal(bytes_from_base64(hdr_node.get_string_content()));
             if (header == null) {
-                warning("x3dhpq decrypt skipped: invalid header from %s/%d", sender_jid_value, sender_device_id);
                 return false;
             }
             Bytes transport_key = Protocol.decrypt_transport_key((!) state, header, bytes_from_base64(emk_node.get_string_content()));

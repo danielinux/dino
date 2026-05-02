@@ -434,12 +434,6 @@ public void encrypt_transport_key(SessionState state, Bytes transport_key, out M
     Bytes aes_key;
     Bytes nonce;
     derive_message_key(mk, out aes_key, out nonce);
-    warning("x3dhpq transport key sizes: chain_send=%u mk=%u aes=%u nonce=%u transport=%u",
-        (uint) bytes_to_uint8_array((!) state.chain_send_key).length,
-        (uint) bytes_to_uint8_array(mk).length,
-        (uint) bytes_to_uint8_array(aes_key).length,
-        (uint) bytes_to_uint8_array(nonce).length,
-        (uint) bytes_to_uint8_array(transport_key).length);
     ciphertext = global::X3dhpq.Crypto.aes256gcm_encrypt(aes_key, nonce, transport_key, new Bytes(concat_byte_arrays(bytes_to_uint8_array(state.ad), bytes_to_uint8_array(header.marshal()))));
     state.send_count++;
     state.kem_since_checkpoint++;
@@ -558,6 +552,7 @@ private void derive_message_key(Bytes mk, out Bytes aes_key, out Bytes nonce) th
     aes_key = slice_bytes(derived, 0, 32);
     nonce = slice_bytes(derived, 32, 12);
 }
+
 
 private Bytes hkdf64(Bytes salt, Bytes ikm, string info) throws GLib.Error {
     Bytes prk = global::X3dhpq.Crypto.hkdf_extract_sha512(salt, ikm);
