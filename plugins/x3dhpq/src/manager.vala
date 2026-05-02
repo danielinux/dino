@@ -81,6 +81,9 @@ public class Manager : Object {
         } else {
             recipients.add(message_stanza.to.bare_jid);
         }
+        // Include our own bare JID so sent carbons / archived copies contain a
+        // decryptable key for this account's devices too.
+        recipients.add(conversation.account.bare_jid);
         return recipients;
     }
 
@@ -278,6 +281,7 @@ public class Manager : Object {
 
         int? local_device_id = db.get_local_device_id(conversation.account);
         if (local_device_id == null) {
+            warning("x3dhpq decrypt skipped: no local device id for %s", conversation.account.bare_jid.to_string());
             return false;
         }
 
@@ -286,12 +290,14 @@ public class Manager : Object {
             sender_jid_value = stanza.from.bare_jid.to_string();
         }
         if (sender_jid_value == null) {
+            warning("x3dhpq decrypt skipped: missing sender-jid");
             return false;
         }
 
         int sender_device_id = envelope.get_attribute_int("sender-device");
         StanzaNode? payload_node = envelope.get_subnode("payload", Protocol.NS_ENVELOPE);
         if (payload_node == null || payload_node.get_string_content() == null) {
+            warning("x3dhpq decrypt skipped: missing payload node");
             return false;
         }
 
@@ -303,6 +309,7 @@ public class Manager : Object {
             }
         }
         if (key_node == null) {
+            warning("x3dhpq decrypt skipped: no key node for local device %d", (!) local_device_id);
             return false;
         }
 
@@ -310,17 +317,20 @@ public class Manager : Object {
         if (state == null) {
             StanzaNode? prekey_node = ((!) key_node).get_subnode("prekey", Protocol.NS_ENVELOPE);
             if (prekey_node == null) {
+                warning("x3dhpq decrypt skipped: missing prekey node for new session from %s/%d", sender_jid_value, sender_device_id);
                 return false;
             }
 
             Protocol.DeviceCertificate? peer_cert = Protocol.DeviceCertificate.unmarshal(bytes_from_base64(prekey_node.get_deep_string_content("dc")));
             if (peer_cert == null) {
+                warning("x3dhpq decrypt skipped: invalid peer certificate from %s/%d", sender_jid_value, sender_device_id);
                 return false;
             }
             Row local_bundle = db.get_required_local_bundle(conversation.account);
             Row? local_spk = db.get_local_signed_pre_key(conversation.account, local_bundle[db.bundle.signed_pre_key_id]);
             Row? local_kem = db.get_local_kem_pre_key(conversation.account, prekey_node.get_attribute_int("kemkey-id"));
             if (local_spk == null || local_kem == null) {
+                warning("x3dhpq decrypt skipped: missing local SPK or KEM key for new session from %s/%d", sender_jid_value, sender_device_id);
                 return false;
             }
             Row? local_opk = null;
@@ -357,10 +367,12 @@ public class Manager : Object {
             StanzaNode? hdr_node = ((!) key_node).get_subnode("hdr", Protocol.NS_ENVELOPE);
             StanzaNode? emk_node = ((!) key_node).get_subnode("emk", Protocol.NS_ENVELOPE);
             if (hdr_node == null || emk_node == null || hdr_node.get_string_content() == null || emk_node.get_string_content() == null) {
+                warning("x3dhpq decrypt skipped: missing hdr/emk nodes from %s/%d", sender_jid_value, sender_device_id);
                 return false;
             }
             Protocol.MessageHeader? header = Protocol.MessageHeader.unmarshal(bytes_from_base64(hdr_node.get_string_content()));
             if (header == null) {
+                warning("x3dhpq decrypt skipped: invalid header from %s/%d", sender_jid_value, sender_device_id);
                 return false;
             }
             Bytes transport_key = Protocol.decrypt_transport_key((!) state, header, bytes_from_base64(emk_node.get_string_content()));

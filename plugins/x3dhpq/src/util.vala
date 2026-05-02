@@ -1,7 +1,7 @@
 namespace Dino.Plugins.X3dhpq {
 
 internal string bytes_to_base64(Bytes bytes) {
-    return Base64.encode(bytes.get_data());
+    return Base64.encode(bytes_to_uint8_array(bytes));
 }
 
 internal Bytes bytes_from_base64(string data) {
