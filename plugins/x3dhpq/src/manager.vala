@@ -231,10 +231,24 @@ public class Manager : Object {
                 }
                 db.store_session(conversation.account, recipient.bare_jid.to_string(), device_id, (!) state);
 
+                Bytes marshaled_header = header.marshal();
+                string marshaled_header_b64 = bytes_to_base64(marshaled_header);
+                if (Protocol.MessageHeader.unmarshal(marshaled_header) == null) {
+                    warning("x3dhpq local header self-check failed for %s/%d before base64", recipient.to_string(), device_id);
+                }
+                if (Protocol.MessageHeader.unmarshal(bytes_from_base64(marshaled_header_b64)) == null) {
+                    warning("x3dhpq local header base64 self-check failed for %s/%d", recipient.to_string(), device_id);
+                }
+
                 StanzaNode key_node = new StanzaNode.build("key", Protocol.NS_ENVELOPE)
                     .put_attribute("rid", device_id.to_string())
-                    .put_node(new StanzaNode.build("hdr", Protocol.NS_ENVELOPE).put_node(new StanzaNode.text(bytes_to_base64(header.marshal()))))
+                    .put_node(new StanzaNode.build("hdr", Protocol.NS_ENVELOPE).put_node(new StanzaNode.text(marshaled_header_b64)))
                     .put_node(new StanzaNode.build("emk", Protocol.NS_ENVELOPE).put_node(new StanzaNode.text(bytes_to_base64(encrypted_transport_key))));
+                warning("x3dhpq send header for %s/%d: raw=%u b64=%u",
+                    recipient.to_string(),
+                    device_id,
+                    (uint) bytes_to_uint8_array(marshaled_header).length,
+                    (uint) marshaled_header_b64.length);
 
                 if (bootstrap != null) {
                     StanzaNode prekey_node = new StanzaNode.build("prekey", Protocol.NS_ENVELOPE)
@@ -370,7 +384,13 @@ public class Manager : Object {
                 warning("x3dhpq decrypt skipped: missing hdr/emk nodes from %s/%d", sender_jid_value, sender_device_id);
                 return false;
             }
-            Protocol.MessageHeader? header = Protocol.MessageHeader.unmarshal(bytes_from_base64(hdr_node.get_string_content()));
+            Bytes raw_header = bytes_from_base64(hdr_node.get_string_content());
+            warning("x3dhpq recv header from %s/%d: b64=%u raw=%u",
+                sender_jid_value,
+                sender_device_id,
+                (uint) hdr_node.get_string_content().length,
+                (uint) bytes_to_uint8_array(raw_header).length);
+            Protocol.MessageHeader? header = Protocol.MessageHeader.unmarshal(raw_header);
             if (header == null) {
                 warning("x3dhpq decrypt skipped: invalid header from %s/%d", sender_jid_value, sender_device_id);
                 return false;

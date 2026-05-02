@@ -148,33 +148,38 @@ public class MessageHeader : Object {
     public Bytes? kem_pub_for_reply { get; set; }
 
     public Bytes marshal() {
-        uint8[] encoded = concat_five_fields(
-            bytes_to_uint8_array(dh_pub),
-            uint32_to_bytes(prev_chain_len),
-            uint32_to_bytes(n),
-            kem_ciphertext != null ? bytes_to_uint8_array((!) kem_ciphertext) : new uint8[0],
-            kem_pub_for_reply != null ? bytes_to_uint8_array((!) kem_pub_for_reply) : new uint8[0]
-        );
-        return new Bytes(encoded);
+        StringBuilder builder = new StringBuilder();
+        append_serialized(builder, "dh_pub", bytes_to_base64(dh_pub));
+        append_serialized(builder, "prev_chain_len", prev_chain_len.to_string());
+        append_serialized(builder, "n", n.to_string());
+        append_serialized(builder, "kem_ciphertext", kem_ciphertext != null ? bytes_to_base64((!) kem_ciphertext) : "");
+        append_serialized(builder, "kem_pub_for_reply", kem_pub_for_reply != null ? bytes_to_base64((!) kem_pub_for_reply) : "");
+        return bytes_from_uint8_array(string_to_bytes(builder.str));
     }
 
     public static MessageHeader? unmarshal(Bytes bytes) {
-        uint8[] data = bytes_to_uint8_array(bytes);
-        int offset = 0;
-        uint8[]? dh_pub = read_u32_prefixed_field(data, ref offset);
-        uint8[]? prev = read_u32_prefixed_field(data, ref offset);
-        uint8[]? n = read_u32_prefixed_field(data, ref offset);
-        uint8[]? kem_ct = read_u32_prefixed_field(data, ref offset);
-        uint8[]? kem_pub = read_u32_prefixed_field(data, ref offset);
-        if (dh_pub == null || prev == null || prev.length != 4 || n == null || n.length != 4 || kem_ct == null || kem_pub == null) {
+        string encoded = (string) bytes_to_uint8_array(bytes);
+        HashMap<string, string> values = new HashMap<string, string>();
+        foreach (string line in encoded.split("\n")) {
+            if (line == "" || !line.contains("=")) {
+                continue;
+            }
+            string[] parts = line.split("=", 2);
+            values[parts[0]] = parts[1];
+        }
+        if (!values.has_key("dh_pub") || !values.has_key("prev_chain_len") || !values.has_key("n") || !values.has_key("kem_ciphertext") || !values.has_key("kem_pub_for_reply")) {
             return null;
         }
         MessageHeader header = new MessageHeader();
-        header.dh_pub = new Bytes((owned) dh_pub);
-        header.prev_chain_len = uint32_from_bytes(prev);
-        header.n = uint32_from_bytes(n);
-        header.kem_ciphertext = kem_ct.length > 0 ? new Bytes((owned) kem_ct) : null;
-        header.kem_pub_for_reply = kem_pub.length > 0 ? new Bytes((owned) kem_pub) : null;
+        try {
+            header.dh_pub = bytes_from_base64(values["dh_pub"]);
+            header.prev_chain_len = (uint32) int.parse(values["prev_chain_len"]);
+            header.n = (uint32) int.parse(values["n"]);
+            header.kem_ciphertext = values["kem_ciphertext"] != "" ? bytes_from_base64(values["kem_ciphertext"]) : null;
+            header.kem_pub_for_reply = values["kem_pub_for_reply"] != "" ? bytes_from_base64(values["kem_pub_for_reply"]) : null;
+        } catch (Error e) {
+            return null;
+        }
         return header;
     }
 }
