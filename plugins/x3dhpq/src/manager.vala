@@ -169,8 +169,10 @@ public class Manager : Object {
             throw new IOError.FAILED("Missing local device or body");
         }
 
-        Bytes payload_transport_key = global::X3dhpq.Crypto.random_bytes(44);
-        Bytes payload_ciphertext = Protocol.encrypt_payload_plaintext(message_stanza.body, payload_transport_key);
+        Bytes payload_key = global::X3dhpq.Crypto.random_bytes(32);
+        Bytes payload_nonce = global::X3dhpq.Crypto.random_bytes(12);
+        Bytes payload_transport_key = bytes_from_uint8_array(concat_byte_arrays(bytes_to_uint8_array(payload_key), bytes_to_uint8_array(payload_nonce)));
+        Bytes payload_ciphertext = global::X3dhpq.Crypto.aes256gcm_encrypt(payload_key, payload_nonce, new Bytes((uint8[]) message_stanza.body.data));
         StanzaNode envelope = new StanzaNode.build("x3dhpq", Protocol.NS_ENVELOPE)
             .add_self_xmlns()
             .put_attribute("sender-device", ((!) local_device_id).to_string())
