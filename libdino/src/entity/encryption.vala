@@ -4,6 +4,7 @@ namespace Dino.Entities {
         NONE,
         PGP,
         OMEMO,
+        X3DHPQ,
         DTLS_SRTP,
         SRTP,
         UNKNOWN;

@@ -38,6 +38,7 @@ dep_libqrencode = dependency('libqrencode', disabler: true, required: get_option
 dep_libsrtp2 = dependency('libsrtp2', disabler: true, required: plugin_crypto)
 dep_libomemo_c = dependency('libomemo-c', disabler: true, required: get_option('plugin-omemo'))
 dep_libsoup = dependency('libsoup-3.0', disabler: true, required: get_option('plugin-http-files'))
+dep_wolfssl = dependency('wolfssl', disabler: true, required: get_option('plugin-x3dhpq'))
 dep_nice = dependency('nice', version: '>=0.1.15', disabler: true, required: get_option('plugin-ice'))
 dep_m = meson.get_compiler('c').find_library('m', required: false)
 dep_sqlite3 = dependency('sqlite3', version: '>=3.24')

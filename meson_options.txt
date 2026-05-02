@@ -6,6 +6,7 @@ option('plugin-http-files', type: 'feature', value: 'enabled', description: 'HTT
 option('plugin-ice', type: 'feature', value: 'enabled', description: 'Peer-to-peer communication')
 option('plugin-omemo', type: 'feature', value: 'enabled', description: 'End-to-end encryption using OMEMO')
 option('plugin-openpgp', type: 'feature', value: 'auto', description: 'End-to-end encryption using PGP')
+option('plugin-x3dhpq', type: 'feature', value: 'auto', description: 'End-to-end encryption using x3dhpq')
 option('plugin-rtp', type: 'feature', value: 'enabled', description: 'Voice/video calls')
 option('plugin-notification-sound', type: 'feature', value: 'disabled', description: 'Sound for chat notifications')
 
