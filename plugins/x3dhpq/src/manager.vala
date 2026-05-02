@@ -46,6 +46,30 @@ public class Manager : Object {
         return true;
     }
 
+    public async void prefetch_for_conversation(Conversation conversation) {
+        if (conversation.type_ == Conversation.Type.GROUPCHAT_PM) {
+            return;
+        }
+
+        if (conversation.type_ == Conversation.Type.CHAT) {
+            yield ensure_get_keys_for_jid(conversation.account, conversation.counterpart.bare_jid);
+            return;
+        }
+
+        if (conversation.type_ == Conversation.Type.GROUPCHAT) {
+            Gee.List<Jid>? members = app.stream_interactor.get_module(MucManager.IDENTITY).get_offline_members(conversation.counterpart, conversation.account);
+            if (members == null) {
+                return;
+            }
+            foreach (Jid member in members) {
+                if (member.equals(conversation.account.bare_jid)) {
+                    continue;
+                }
+                yield ensure_get_keys_for_jid(conversation.account, member.bare_jid);
+            }
+        }
+    }
+
     private void on_account_added(Account account) {
         StreamModule? module = app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
         if (module == null) {
@@ -291,6 +315,9 @@ public class Manager : Object {
         }
 
         Protocol.SessionState? state = db.get_session(conversation.account, sender_jid_value, sender_device_id);
+        Protocol.SessionState? state_to_commit = null;
+        bool consume_one_time_prekey = false;
+        int consumed_opk_id = 0;
         if (state == null) {
             StanzaNode? prekey_node = ((!) key_node).get_subnode("prekey", Protocol.NS_ENVELOPE);
             if (prekey_node == null) {
@@ -314,7 +341,7 @@ public class Manager : Object {
             }
 
             try {
-                state = Protocol.respond_session(
+                state_to_commit = Protocol.respond_session(
                     db.get_local_identity_bytes(conversation.account, db.account_identity.dik_priv_x25519_base64),
                     db.get_local_identity_bytes(conversation.account, db.account_identity.dik_pub_x25519_base64),
                     bytes_from_base64(((!) local_spk)[db.signed_pre_key.private_base64]),
@@ -327,12 +354,18 @@ public class Manager : Object {
                     bytes_from_base64(prekey_node.get_attribute("ek")),
                     bytes_from_base64(prekey_node.get_attribute("kem-ct"))
                 );
-                db.store_session(conversation.account, sender_jid_value, sender_device_id, (!) state);
                 if (local_opk != null) {
-                    db.mark_local_one_time_pre_key_consumed(conversation.account, opk_id);
+                    consume_one_time_prekey = true;
+                    consumed_opk_id = opk_id;
                 }
             } catch (Error e) {
                 warning("Unable to respond to x3dhpq prekey message from %s/%d: %s", sender_jid_value, sender_device_id, e.message);
+                return false;
+            }
+        } else {
+            state_to_commit = Protocol.SessionState.deserialize((!) state.serialize());
+            if (state_to_commit == null) {
+                db.delete_session(conversation.account, sender_jid_value, sender_device_id);
                 return false;
             }
         }
@@ -347,11 +380,14 @@ public class Manager : Object {
             if (header == null) {
                 return false;
             }
-            Bytes transport_key = Protocol.decrypt_transport_key((!) state, header, bytes_from_base64(emk_node.get_string_content()));
-            db.store_session(conversation.account, sender_jid_value, sender_device_id, (!) state);
+            Bytes transport_key = Protocol.decrypt_transport_key((!) state_to_commit, header, bytes_from_base64(emk_node.get_string_content()));
 
             string plaintext;
             Protocol.decrypt_payload(transport_key, bytes_from_base64((!) payload_node.get_string_content()), out plaintext);
+            db.store_session(conversation.account, sender_jid_value, sender_device_id, (!) state_to_commit);
+            if (consume_one_time_prekey) {
+                db.mark_local_one_time_pre_key_consumed(conversation.account, consumed_opk_id);
+            }
             message.body = plaintext;
             message.encryption = Encryption.X3DHPQ;
             if (conversation.type_ == Conversation.Type.GROUPCHAT) {

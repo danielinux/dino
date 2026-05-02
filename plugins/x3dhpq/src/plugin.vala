@@ -23,6 +23,9 @@ public class Plugin : RootInterface, Object {
         app.plugin_registry.register_contact_details_entry(contact_details_provider);
         app.stream_interactor.module_manager.initialize_account_modules.connect(on_initialize_account_modules);
         app.stream_interactor.stream_negotiated.connect(on_stream_negotiated);
+        app.stream_interactor.get_module(ChatInteraction.IDENTITY).focused_in.connect((conversation) => {
+            prefetch_and_refresh(conversation);
+        });
     }
 
     public void shutdown() { }
@@ -38,6 +41,15 @@ public class Plugin : RootInterface, Object {
         if (module != null) {
             module.publish_current_state.begin(stream);
         }
+    }
+
+    private void prefetch_and_refresh(Conversation conversation) {
+        manager.prefetch_for_conversation.begin(conversation, (_, res) => {
+            manager.prefetch_for_conversation.end(res);
+            if (conversation.encryption == Encryption.X3DHPQ) {
+                conversation.notify_property("encryption");
+            }
+        });
     }
 
     public bool contact_supports_x3dhpq(Conversation conversation) {

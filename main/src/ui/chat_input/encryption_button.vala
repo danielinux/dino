@@ -107,6 +107,7 @@ public class EncryptionButton {
         conversation_encryption_handler_id = conversation.notify["encryption"].connect(() => {
             update_encryption_menu_state();
             update_encryption_menu_icon();
+            encryption_changed(this.conversation.encryption);
         });
     }
 }
