@@ -7,6 +7,7 @@ public const string NS_ENVELOPE = "urn:xmppqr:x3dhpq:envelope:0";
 public const string NS_PAIR = "urn:xmppqr:x3dhpq:pair:0";
 public const string NS_AUDIT = "urn:xmppqr:x3dhpq:audit:0";
 public const string NS_RECOVERY = "urn:xmppqr:x3dhpq:recovery:0";
+public const string NS_GROUP = "urn:xmppqr:x3dhpq:group:0";
 
 public string[] get_disco_features() {
     return {
@@ -17,6 +18,7 @@ public string[] get_disco_features() {
         NS_PAIR,
         NS_AUDIT,
         NS_RECOVERY,
+        NS_GROUP,
     };
 }
 

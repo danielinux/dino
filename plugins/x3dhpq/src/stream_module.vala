@@ -18,6 +18,8 @@ public class StreamModule : XmppStreamModule {
 
     public signal void device_list_loaded(Jid jid, ArrayList<int> devices);
     public signal void bundle_fetched(Jid jid, int device_id, StanzaNode bundle);
+    public signal void audit_entry_received(Jid from, string? id, string b64_payload);
+    public signal void membership_entry_received(Jid room_jid, string? id, string b64_payload);
 
     public StreamModule(Account account, Database db) {
         this.account = account;
@@ -44,6 +46,12 @@ public class StreamModule : XmppStreamModule {
             }
             parse_bundle(stream, jid, int.parse(id), node);
         }, null, null);
+        pubsub.add_filtered_notification(stream, Protocol.NS_AUDIT, (stream, jid, id, node) => {
+            handle_audit_event(stream, jid, id, node);
+        }, null, null);
+        pubsub.add_filtered_notification(stream, Protocol.NS_GROUP, (stream, jid, id, node) => {
+            handle_group_event(stream, jid, id, node);
+        }, null, null);
     }
 
     public override void detach(XmppStream stream) {
@@ -59,6 +67,8 @@ public class StreamModule : XmppStreamModule {
         Pubsub.Module pubsub = stream.get_module(Pubsub.Module.IDENTITY);
         pubsub.remove_filtered_notification(stream, Protocol.NS_DEVICELIST);
         pubsub.remove_filtered_notification(stream, Protocol.NS_BUNDLE);
+        pubsub.remove_filtered_notification(stream, Protocol.NS_AUDIT);
+        pubsub.remove_filtered_notification(stream, Protocol.NS_GROUP);
     }
 
     public async void publish_current_state(XmppStream stream) {
@@ -219,6 +229,70 @@ public class StreamModule : XmppStreamModule {
         Row? identity = db.get_local_identity(account.id);
         assert(identity != null);
         return ((!) identity)[column];
+    }
+
+    private void handle_audit_event(XmppStream stream, Jid from, string? id, StanzaNode? item_node) {
+        // X3DHPQ XEP §11. Server is transport-only; client verifies the chain.
+        // Until full audit-chain verification lands, surface the opaque payload
+        // so higher layers (manager / UI) can store and inspect it.
+        string? payload = item_node != null ? item_node.get_string_content() : null;
+        if (payload == null) {
+            return;
+        }
+        audit_entry_received(from, id, payload);
+    }
+
+    private void handle_group_event(XmppStream stream, Jid room_jid, string? id, StanzaNode? item_node) {
+        // X3DHPQ XEP §13.8. Per-room PEP membership journal hosted on the room JID.
+        // Server enforces 16 KiB / 200-item caps and owner-only publish; clients
+        // verify the entry's signature against the room owner's AIK.
+        string? payload = item_node != null ? item_node.get_string_content() : null;
+        if (payload == null) {
+            return;
+        }
+        membership_entry_received(room_jid, id, payload);
+    }
+
+    // Subscribe to a MUC room's group:0 PEP node. Per Wave 5a of the server,
+    // per-room pubsub hosts track explicit subscriptions in pep_subscriptions
+    // rather than relying on caps +notify filtering, so an explicit subscribe
+    // IQ is required after MUC join.
+    public async bool subscribe_to_group_node(XmppStream stream, Jid room_jid) {
+        string subscriber = account.bare_jid.to_string();
+        StanzaNode pubsub_node = new StanzaNode.build("pubsub", Pubsub.NS_URI).add_self_xmlns()
+            .put_node(new StanzaNode.build("subscribe", Pubsub.NS_URI)
+                .put_attribute("node", Protocol.NS_GROUP)
+                .put_attribute("jid", subscriber));
+        Iq.Stanza iq = new Iq.Stanza.set(pubsub_node) { to = room_jid };
+        try {
+            Iq.Stanza result = yield stream.get_module(Iq.Module.IDENTITY).send_iq_async(stream, iq);
+            return !result.is_error();
+        } catch (Error e) {
+            warning("subscribe to group:0 on %s failed: %s", room_jid.to_string(), e.message);
+            return false;
+        }
+    }
+
+    // Publish an opaque, client-signed audit entry to the per-account audit:0
+    // PEP node. The server stores and notifies subscribed contacts; verification
+    // is the recipient's responsibility per X3DHPQ XEP §11.5.
+    public async bool publish_audit_entry(XmppStream stream, string item_id, string base64_payload) {
+        StanzaNode entry = new StanzaNode.build("audit-entry", Protocol.NS_AUDIT)
+            .add_self_xmlns()
+            .put_node(new StanzaNode.text(base64_payload));
+        return yield stream.get_module(Pubsub.Module.IDENTITY).publish(
+            stream, null, Protocol.NS_AUDIT, item_id, entry, PUBLISH_OPTIONS);
+    }
+
+    // Publish an opaque, owner-signed membership entry to a room's group:0 PEP
+    // node. The server enforces affiliation >= owner; admins/members get
+    // <forbidden/>. Items > 16 KiB are rejected with <not-acceptable/>.
+    public async bool publish_membership_entry(XmppStream stream, Jid room_jid, string item_id, string base64_payload) {
+        StanzaNode entry = new StanzaNode.build("membership-entry", Protocol.NS_GROUP)
+            .add_self_xmlns()
+            .put_node(new StanzaNode.text(base64_payload));
+        return yield stream.get_module(Pubsub.Module.IDENTITY).publish(
+            stream, room_jid, Protocol.NS_GROUP, item_id, entry, PUBLISH_OPTIONS);
     }
 
     public override string get_ns() {

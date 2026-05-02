@@ -19,6 +19,19 @@ public class Manager : Object {
         app.stream_interactor.stream_negotiated.connect(on_stream_negotiated);
         app.stream_interactor.get_module(MessageProcessor.IDENTITY).pre_message_send.connect(on_pre_message_send);
         app.stream_interactor.get_module(MessageProcessor.IDENTITY).received_pipeline.connect(new DecryptMessageListener(this));
+        app.stream_interactor.get_module(MucManager.IDENTITY).room_info_updated.connect(on_room_info_updated);
+    }
+
+    // Subscribe to the room's X3DHPQ membership-journal PEP node when MUC info
+    // is settled. Per Wave 5a server policy, per-room pubsub hosts require an
+    // explicit subscribe IQ; caps-based +notify filtering does not apply.
+    private void on_room_info_updated(Account account, Jid muc_jid) {
+        XmppStream? stream = app.stream_interactor.get_stream(account);
+        StreamModule? module = app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
+        if (stream == null || module == null) {
+            return;
+        }
+        module.subscribe_to_group_node.begin((!) stream, muc_jid);
     }
 
     public async bool ensure_get_keys_for_jid(Account account, Jid jid) {
