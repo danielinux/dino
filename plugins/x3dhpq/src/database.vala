@@ -521,6 +521,14 @@ public class Database : Qlite.Database {
             .perform();
     }
 
+    public void delete_session(Account account, string bare_jid, int device_id) {
+        pairwise_session.delete()
+            .with(pairwise_session.account_id, "=", account.id)
+            .with(pairwise_session.bare_jid, "=", bare_jid)
+            .with(pairwise_session.device_id, "=", device_id)
+            .perform();
+    }
+
     public Protocol.SessionState? get_session(Account account, string bare_jid, int device_id) {
         Row? row = pairwise_session.select()
             .with(pairwise_session.account_id, "=", account.id)

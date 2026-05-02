@@ -198,6 +198,13 @@ public class Manager : Object {
                 }
 
                 Protocol.SessionState? state = db.get_session(conversation.account, recipient.bare_jid.to_string(), device_id);
+                if (state != null && (state.chain_send_key == null || bytes_to_uint8_array((!) state.chain_send_key).length == 0)) {
+                    warning("x3dhpq dropping corrupt local session for %s/%d: empty send chain key",
+                        recipient.to_string(),
+                        device_id);
+                    db.delete_session(conversation.account, recipient.bare_jid.to_string(), device_id);
+                    state = null;
+                }
                 Protocol.SessionBootstrap? bootstrap = null;
                 if (state == null) {
                     bootstrap = Protocol.initiate_session(
