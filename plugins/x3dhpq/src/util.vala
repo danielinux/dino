@@ -9,9 +9,10 @@ internal Bytes bytes_from_base64(string data) {
 }
 
 internal uint8[] bytes_to_uint8_array(Bytes bytes) {
+    size_t len = bytes.get_size();
     unowned uint8[] source = bytes.get_data();
-    uint8[] copy = new uint8[source.length];
-    Memory.copy(copy, source, source.length);
+    uint8[] copy = new uint8[(int) len];
+    Memory.copy(copy, source, len);
     return copy;
 }
 

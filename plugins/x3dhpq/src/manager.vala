@@ -172,7 +172,18 @@ public class Manager : Object {
         Bytes payload_key = global::X3dhpq.Crypto.random_bytes(32);
         Bytes payload_nonce = global::X3dhpq.Crypto.random_bytes(12);
         Bytes payload_transport_key = bytes_from_uint8_array(concat_byte_arrays(bytes_to_uint8_array(payload_key), bytes_to_uint8_array(payload_nonce)));
-        Bytes payload_ciphertext = global::X3dhpq.Crypto.aes256gcm_encrypt(payload_key, payload_nonce, new Bytes((uint8[]) message_stanza.body.data));
+        Bytes payload_ciphertext;
+        try {
+            payload_ciphertext = global::X3dhpq.Crypto.aes256gcm_encrypt(payload_key, payload_nonce, new Bytes((uint8[]) message_stanza.body.data));
+        } catch (Error e) {
+            warning("x3dhpq payload encrypt failed for %s (key=%u nonce=%u transport=%u): %s",
+                conversation.counterpart.to_string(),
+                (uint) bytes_to_uint8_array(payload_key).length,
+                (uint) bytes_to_uint8_array(payload_nonce).length,
+                (uint) bytes_to_uint8_array(payload_transport_key).length,
+                e.message);
+            throw e;
+        }
         StanzaNode envelope = new StanzaNode.build("x3dhpq", Protocol.NS_ENVELOPE)
             .add_self_xmlns()
             .put_attribute("sender-device", ((!) local_device_id).to_string())
@@ -199,7 +210,15 @@ public class Manager : Object {
 
                 Protocol.MessageHeader header;
                 Bytes encrypted_transport_key;
-                Protocol.encrypt_transport_key((!) state, payload_transport_key, out header, out encrypted_transport_key);
+                try {
+                    Protocol.encrypt_transport_key((!) state, payload_transport_key, out header, out encrypted_transport_key);
+                } catch (Error e) {
+                    warning("x3dhpq transport encrypt failed for %s/%d: %s",
+                        recipient.to_string(),
+                        device_id,
+                        e.message);
+                    throw e;
+                }
                 db.store_session(conversation.account, recipient.bare_jid.to_string(), device_id, (!) state);
 
                 StanzaNode key_node = new StanzaNode.build("key", Protocol.NS_ENVELOPE)
