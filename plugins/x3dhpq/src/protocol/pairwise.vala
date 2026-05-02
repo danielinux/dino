@@ -131,11 +131,10 @@ public class PeerBundle : Object {
         if (!cert_ok) {
             return false;
         }
-
-        uint8[] input = concat_byte_arrays(uint32_to_bytes(signed_pre_key_id), bytes_to_uint8_array(bytes_from_base64(signed_pre_key_base64)));
+        Bytes spk_pub = bytes_from_base64(signed_pre_key_base64);
         return global::X3dhpq.Crypto.ed25519_verify(
             device_certificate.dik_pub_ed25519,
-            new Bytes(input),
+            spk_pub,
             bytes_from_base64(signed_pre_key_signature_base64)
         );
     }
