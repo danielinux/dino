@@ -124,6 +124,7 @@ public class StreamModule : XmppStreamModule {
                 .put_node(new StanzaNode.build("cert", Protocol.NS_DEVICELIST) { val = cert }));
 
         if (yield stream.get_module(Pubsub.Module.IDENTITY).publish(stream, null, Protocol.NS_DEVICELIST, "current", node, PUBLISH_OPTIONS)) {
+            yield try_make_node_public(stream, Protocol.NS_DEVICELIST);
             db.store_device_list_payload(account, account.bare_jid.to_string(), "current", node.to_string());
         }
     }
@@ -171,8 +172,24 @@ public class StreamModule : XmppStreamModule {
         bundle_node.put_node(opks);
 
         if (yield stream.get_module(Pubsub.Module.IDENTITY).publish(stream, null, Protocol.NS_BUNDLE, ((!) device_id).to_string(), bundle_node, PUBLISH_OPTIONS)) {
+            yield try_make_node_public(stream, Protocol.NS_BUNDLE);
             db.store_bundle_payload(account, account.bare_jid.to_string(), (!) device_id, bundle_node);
             db.mark_local_bundle_published(account);
+        }
+    }
+
+    private async void try_make_node_public(XmppStream stream, string node_id) {
+        DataForms.DataForm? data_form = yield stream.get_module(Pubsub.Module.IDENTITY).request_node_config(stream, null, node_id);
+        if (data_form == null) {
+            return;
+        }
+
+        foreach (DataForms.DataForm.Field field in data_form.fields) {
+            if (field.var == "pubsub#access_model" && field.get_value_string() != Pubsub.ACCESS_MODEL_OPEN) {
+                field.set_value_string(Pubsub.ACCESS_MODEL_OPEN);
+                yield stream.get_module(Pubsub.Module.IDENTITY).submit_node_config(stream, data_form, node_id);
+                break;
+            }
         }
     }
 
