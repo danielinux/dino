@@ -331,8 +331,24 @@ public class Manager : Object {
         Protocol.SessionState? state_to_commit = null;
         bool consume_one_time_prekey = false;
         int consumed_opk_id = 0;
-        if (state == null) {
-            StanzaNode? prekey_node = ((!) key_node).get_subnode("prekey", Protocol.NS_ENVELOPE);
+
+        StanzaNode? prekey_node = ((!) key_node).get_subnode("prekey", Protocol.NS_ENVELOPE);
+
+        // Both sides may initiate near-simultaneously; whichever envelope arrives
+        // first finds an existing self-initiated session whose chain_recv_key is
+        // null because we never received from the peer. The cached session is
+        // useless for decrypting the peer's incoming prekey envelope — its
+        // sending_dh_priv is our own ephemeral, not our SPK priv. Treat that
+        // case as if no session existed and run respond_session, which derives
+        // the canonical responder state and replaces the orphan. Our previously
+        // queued outbound (encrypted under the orphan) is acceptable to drop —
+        // the peer never set up a session that could decrypt it anyway.
+        bool prekey_overrides_orphan = state != null
+            && prekey_node != null
+            && (state.chain_recv_key == null
+                || bytes_to_uint8_array((!) state.chain_recv_key).length == 0);
+
+        if (state == null || prekey_overrides_orphan) {
             if (prekey_node == null) {
                 return false;
             }
