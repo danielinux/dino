@@ -147,40 +147,98 @@ public class MessageHeader : Object {
     public Bytes? kem_ciphertext { get; set; }
     public Bytes? kem_pub_for_reply { get; set; }
 
+    // On-wire binary format matching internal/x3dhpqcrypto/header.go:Marshal.
+    // Each field is 4-byte big-endian length followed by `length` bytes; nil/empty
+    // fields are encoded as length=0. The two uint32 fields (prev_chain_len, n)
+    // are themselves length-prefixed with len=4 then the 4-byte BE value.
+    //
+    // Earlier this used a Vala-private "key=value\n" text format, which broke
+    // interop with Conversations and the Go reference and caused remote OOM
+    // crashes because the receiver tried to allocate buffers sized by random
+    // bytes from the text payload.
     public Bytes marshal() {
-        StringBuilder builder = new StringBuilder();
-        append_serialized(builder, "dh_pub", bytes_to_base64(dh_pub));
-        append_serialized(builder, "prev_chain_len", prev_chain_len.to_string());
-        append_serialized(builder, "n", n.to_string());
-        append_serialized(builder, "kem_ciphertext", kem_ciphertext != null ? bytes_to_base64((!) kem_ciphertext) : "");
-        append_serialized(builder, "kem_pub_for_reply", kem_pub_for_reply != null ? bytes_to_base64((!) kem_pub_for_reply) : "");
-        return bytes_from_uint8_array(string_to_bytes(builder.str));
+        uint8[] dh = bytes_to_uint8_array(dh_pub);
+        uint8[] kct = kem_ciphertext != null ? bytes_to_uint8_array((!) kem_ciphertext) : new uint8[0];
+        uint8[] kpr = kem_pub_for_reply != null ? bytes_to_uint8_array((!) kem_pub_for_reply) : new uint8[0];
+
+        uint8[] buf = new uint8[0];
+        buf = concat_byte_arrays(buf, length_prefixed(dh));
+        buf = concat_byte_arrays(buf, u32_field(prev_chain_len));
+        buf = concat_byte_arrays(buf, u32_field(n));
+        buf = concat_byte_arrays(buf, length_prefixed(kct));
+        buf = concat_byte_arrays(buf, length_prefixed(kpr));
+        return new Bytes(buf);
     }
 
     public static MessageHeader? unmarshal(Bytes bytes) {
-        string encoded = (string) bytes_to_uint8_array(bytes);
-        HashMap<string, string> values = new HashMap<string, string>();
-        foreach (string line in encoded.split("\n")) {
-            if (line == "" || !line.contains("=")) {
-                continue;
-            }
-            string[] parts = line.split("=", 2);
-            values[parts[0]] = parts[1];
-        }
-        if (!values.has_key("dh_pub") || !values.has_key("prev_chain_len") || !values.has_key("n") || !values.has_key("kem_ciphertext") || !values.has_key("kem_pub_for_reply")) {
-            return null;
-        }
+        uint8[] data = bytes_to_uint8_array(bytes);
+        int off = 0;
+
+        uint8[]? dh = read_field(data, ref off);
+        if (dh == null) return null;
+        uint32? pcl = read_u32_field(data, ref off);
+        if (pcl == null) return null;
+        uint32? nn = read_u32_field(data, ref off);
+        if (nn == null) return null;
+        uint8[]? kct = read_field(data, ref off);
+        if (kct == null && off > data.length) return null;
+        uint8[]? kpr = read_field(data, ref off);
+        if (kpr == null && off > data.length) return null;
+
         MessageHeader header = new MessageHeader();
-        try {
-            header.dh_pub = bytes_from_base64(values["dh_pub"]);
-            header.prev_chain_len = (uint32) int.parse(values["prev_chain_len"]);
-            header.n = (uint32) int.parse(values["n"]);
-            header.kem_ciphertext = values["kem_ciphertext"] != "" ? bytes_from_base64(values["kem_ciphertext"]) : null;
-            header.kem_pub_for_reply = values["kem_pub_for_reply"] != "" ? bytes_from_base64(values["kem_pub_for_reply"]) : null;
-        } catch (Error e) {
-            return null;
-        }
+        header.dh_pub = new Bytes(dh);
+        header.prev_chain_len = (!) pcl;
+        header.n = (!) nn;
+        header.kem_ciphertext = (kct != null && kct.length > 0) ? new Bytes(kct) : null;
+        header.kem_pub_for_reply = (kpr != null && kpr.length > 0) ? new Bytes(kpr) : null;
         return header;
+    }
+
+    // ----- binary helpers -----
+
+    private static uint8[] u32_be(uint32 v) {
+        return { (uint8)(v >> 24), (uint8)(v >> 16), (uint8)(v >> 8), (uint8) v };
+    }
+
+    private static uint8[] length_prefixed(uint8[] payload) {
+        uint8[] header = u32_be((uint32) payload.length);
+        return concat_byte_arrays(header, payload);
+    }
+
+    private static uint8[] u32_field(uint32 v) {
+        // length=4 prefix, then the 4-byte uint32 value (mirrors Go's marshalU32)
+        uint8[] buf = new uint8[8];
+        buf[0] = 0; buf[1] = 0; buf[2] = 0; buf[3] = 4;
+        buf[4] = (uint8)(v >> 24);
+        buf[5] = (uint8)(v >> 16);
+        buf[6] = (uint8)(v >> 8);
+        buf[7] = (uint8) v;
+        return buf;
+    }
+
+    private static uint8[]? read_field(uint8[] data, ref int off) {
+        if (off + 4 > data.length) return null;
+        uint32 len = ((uint32) data[off] << 24)
+                   | ((uint32) data[off + 1] << 16)
+                   | ((uint32) data[off + 2] << 8)
+                   | (uint32) data[off + 3];
+        off += 4;
+        if (len > 65536) return null; // mirrors Conversations' MAX_FIELD_LEN guard
+        if (off + (int) len > data.length) return null;
+        if (len == 0) return new uint8[0];
+        uint8[] payload = new uint8[len];
+        Memory.copy(payload, (uint8*) data + off, len);
+        off += (int) len;
+        return payload;
+    }
+
+    private static uint32? read_u32_field(uint8[] data, ref int off) {
+        uint8[]? f = read_field(data, ref off);
+        if (f == null || f.length != 4) return null;
+        return ((uint32) f[0] << 24)
+             | ((uint32) f[1] << 16)
+             | ((uint32) f[2] << 8)
+             | (uint32) f[3];
     }
 }
 

@@ -123,7 +123,27 @@ public class StreamModule : XmppStreamModule {
             return;
         }
 
-        string cert = db.ensure_local_device_certificate(account);
+        string cert;
+        try {
+            cert = db.ensure_local_device_certificate(account);
+        } catch (GLib.Error e) {
+            warning("Skipping x3dhpq devicelist publish for %s: certificate not yet available (%s)",
+                account.bare_jid.to_string(), e.message);
+            return;
+        }
+        if (cert == "") {
+            // Defensive: if the cert ever comes back empty we must not publish a
+            // <cert/> empty element — peers would store an unverifiable bundle
+            // and silently drop our messages.
+            warning("Refusing to publish x3dhpq devicelist with empty certificate for %s",
+                account.bare_jid.to_string());
+            return;
+        }
+        // The cert string MUST be added as a text sub-node, not via the `val`
+        // initialiser. For an element StanzaNode (built via .build()), `val`
+        // is ignored during serialization — only sub_nodes are rendered, so
+        // `{ val = cert }` produces `<cert/>` empty on the wire. publish_bundle
+        // below already does the right thing for <dc>; we mirror that pattern.
         StanzaNode node = new StanzaNode.build("devicelist", Protocol.NS_DEVICELIST)
             .add_self_xmlns()
             .put_attribute("version", "1")
@@ -131,7 +151,8 @@ public class StreamModule : XmppStreamModule {
             .put_node(new StanzaNode.build("device", Protocol.NS_DEVICELIST)
                 .put_attribute("id", ((!) device_id).to_string())
                 .put_attribute("flags", "1")
-                .put_node(new StanzaNode.build("cert", Protocol.NS_DEVICELIST) { val = cert }));
+                .put_node(new StanzaNode.build("cert", Protocol.NS_DEVICELIST)
+                    .put_node(new StanzaNode.text(cert))));
 
         if (yield stream.get_module(Pubsub.Module.IDENTITY).publish(stream, null, Protocol.NS_DEVICELIST, "current", node, PUBLISH_OPTIONS)) {
             yield try_make_node_public(stream, Protocol.NS_DEVICELIST);
@@ -143,6 +164,13 @@ public class StreamModule : XmppStreamModule {
         Row? bundle_row = db.get_local_bundle(account);
         int? device_id = db.get_local_device_id(account);
         if (bundle_row == null || device_id == null) {
+            return;
+        }
+
+        string? dc_value = ((!) bundle_row)[db.bundle.device_certificate_base64];
+        if (dc_value == null || dc_value == "") {
+            warning("Refusing to publish x3dhpq bundle with empty device certificate for %s",
+                account.bare_jid.to_string());
             return;
         }
 

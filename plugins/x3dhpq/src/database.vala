@@ -304,31 +304,37 @@ public class Database : Qlite.Database {
         return (!) row;
     }
 
-    public string ensure_local_device_certificate(Account account) {
+    public string ensure_local_device_certificate(Account account) throws GLib.Error {
         Row row = get_required_local_identity(account);
         RowOption bundle_row = bundle.select()
             .with(bundle.account_id, "=", account.id)
             .with(bundle.bare_jid, "=", account.bare_jid.to_string())
             .with(bundle.device_id, "=", row[account_identity.device_id])
             .single().row();
-        if (bundle_row.is_present() && bundle_row[bundle.device_certificate_base64] != null) {
-            return bundle_row[bundle.device_certificate_base64];
+        // Treat an empty cached cert as "not yet issued"; a previous run that
+        // failed mid-issue could have persisted "" and the != null check would
+        // happily return it forever, causing publish_device_list to emit
+        // <cert/> empty and peers to skip our device. See log analysis 2026-05-03.
+        if (bundle_row.is_present()) {
+            string? cached = bundle_row[bundle.device_certificate_base64];
+            if (cached != null && cached != "") {
+                return cached;
+            }
         }
-        string certificate;
-        try {
-            Protocol.DeviceCertificate cert = Protocol.DeviceCertificate.issue(
-                (uint32) row[account_identity.device_id],
-                bytes_from_base64(row[account_identity.dik_pub_ed25519_base64]),
-                bytes_from_base64(row[account_identity.dik_pub_x25519_base64]),
-                bytes_from_base64(row[account_identity.dik_pub_mldsa_base64]),
-                bytes_from_base64(row[account_identity.aik_priv_ed25519_base64]),
-                bytes_from_base64(row[account_identity.aik_priv_mldsa_base64]),
-                1
-            );
-            certificate = Base64.encode(cert.marshal());
-        } catch (GLib.Error e) {
-            warning("Unable to issue x3dhpq device certificate for %s: %s", account.bare_jid.to_string(), e.message);
-            certificate = "";
+        Protocol.DeviceCertificate cert = Protocol.DeviceCertificate.issue(
+            (uint32) row[account_identity.device_id],
+            bytes_from_base64(row[account_identity.dik_pub_ed25519_base64]),
+            bytes_from_base64(row[account_identity.dik_pub_x25519_base64]),
+            bytes_from_base64(row[account_identity.dik_pub_mldsa_base64]),
+            bytes_from_base64(row[account_identity.aik_priv_ed25519_base64]),
+            bytes_from_base64(row[account_identity.aik_priv_mldsa_base64]),
+            1
+        );
+        string certificate = Base64.encode(cert.marshal());
+        if (certificate == "") {
+            // Defensive: should never happen because Base64.encode of a non-empty
+            // marshal is non-empty. If it ever does, throw rather than persist.
+            throw new IOError.FAILED("DeviceCertificate marshal produced empty base64");
         }
         bundle.upsert()
             .value(bundle.account_id, account.id, true)
@@ -348,7 +354,14 @@ public class Database : Qlite.Database {
     public void ensure_local_prekeys(Account account) {
         ensure_local_identity(account);
         Row row = get_required_local_identity(account);
-        string cert = ensure_local_device_certificate(account);
+        string cert;
+        try {
+            cert = ensure_local_device_certificate(account);
+        } catch (GLib.Error e) {
+            warning("Unable to issue x3dhpq device certificate for %s: %s — skipping prekey generation; will retry on next stream",
+                account.bare_jid.to_string(), e.message);
+            return;
+        }
 
         try {
             if (count_signed_pre_keys(account) == 0) {
