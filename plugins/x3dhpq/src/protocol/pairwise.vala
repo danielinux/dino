@@ -579,10 +579,26 @@ public void decrypt_payload(Bytes transport_key, Bytes payload_ciphertext, out s
     plaintext = (string) (uint8[]) bytes_to_uint8_array(clear);
 }
 
+// Like decrypt_payload but returns raw bytes — used for sender-chain announcements.
+public Bytes decrypt_payload_bytes(Bytes transport_key, Bytes payload_ciphertext) throws GLib.Error {
+    Bytes key = slice_bytes(transport_key, 0, 32);
+    Bytes nonce = slice_bytes(transport_key, 32, 12);
+    return global::X3dhpq.Crypto.aes256gcm_decrypt(key, nonce, payload_ciphertext);
+}
+
 public Bytes encrypt_payload_plaintext(string plaintext, Bytes transport_key) throws GLib.Error {
     Bytes key = slice_bytes(transport_key, 0, 32);
     Bytes nonce = slice_bytes(transport_key, 32, 12);
     return global::X3dhpq.Crypto.aes256gcm_encrypt(key, nonce, new Bytes((uint8[]) plaintext.data));
+}
+
+// Like encrypt_payload_plaintext but takes raw bytes (used for sender-chain
+// announcements where the payload is the binary marshal() of the
+// SenderChainAnnouncement, not a UTF-8 string).
+public Bytes encrypt_payload_bytes(Bytes plaintext, Bytes transport_key) throws GLib.Error {
+    Bytes key = slice_bytes(transport_key, 0, 32);
+    Bytes nonce = slice_bytes(transport_key, 32, 12);
+    return global::X3dhpq.Crypto.aes256gcm_encrypt(key, nonce, plaintext);
 }
 
 private bool should_do_checkpoint(SessionState state) {

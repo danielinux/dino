@@ -9,6 +9,8 @@ public const string NS_AUDIT = "urn:xmppqr:x3dhpq:audit:0";
 public const string NS_RECOVERY = "urn:xmppqr:x3dhpq:recovery:0";
 public const string NS_GROUP = "urn:xmppqr:x3dhpq:group:0";
 
+public const string PAYLOAD_TYPE_SENDER_CHAIN = "sender-chain";
+
 public string[] get_disco_features() {
     return {
         NS_X3DHPQ,

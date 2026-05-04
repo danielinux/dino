@@ -241,6 +241,14 @@ public class StreamModule : XmppStreamModule {
             db.store_remote_device(account, jid.bare_jid.to_string(), device_id, cert_node != null ? cert_node.get_string_content() : null);
         }
         db.store_device_list_payload(account, jid.bare_jid.to_string(), id, node.to_string());
+        // The published devicelist is authoritative — drop cached
+        // peer_device / bundle / pairwise_session rows for ids that are
+        // no longer present (peer regenerated). Otherwise we keep
+        // addressing pairwise envelopes (including sender-chain
+        // announcements) to ghost devices the peer no longer recognises.
+        if (!jid.bare_jid.equals(account.bare_jid)) {
+            db.prune_remote_devices_not_in(account, jid.bare_jid.to_string(), devices);
+        }
         device_list_loaded(jid, devices);
         return devices;
     }
@@ -281,6 +289,40 @@ public class StreamModule : XmppStreamModule {
         membership_entry_received(room_jid, id, payload);
     }
 
+    // Owner-side helper: sign and publish an AddMember or RemoveMember audit entry
+    // to the room's group:0 PEP node. seq and prev_hash must be tracked by the caller.
+    public async bool publish_audit_entry_for_action(
+        XmppStream stream,
+        Jid room_jid,
+        Protocol.MemberAuditAction action,
+        uint8[] aik_fp_raw_20,
+        uint32 epoch_after,
+        uint64 seq,
+        uint8[] prev_hash_32,
+        Bytes owner_aik_priv_ed,
+        Bytes owner_aik_priv_mldsa
+    ) {
+        uint8[] payload = Protocol.MemberAuditEntry.build_member_payload(aik_fp_raw_20, epoch_after);
+        Protocol.MemberAuditEntry entry = new Protocol.MemberAuditEntry();
+        entry.seq = seq;
+        entry.prev_hash = prev_hash_32;
+        entry.action = (uint8) action;
+        entry.payload = payload;
+        entry.timestamp = new DateTime.now_utc().to_unix();
+        try {
+            uint8[] sp = entry.signed_part();
+            entry.signature = bytes_to_uint8_array(
+                global::X3dhpq.Crypto.ed25519_sign(owner_aik_priv_ed, new Bytes(sp)));
+            entry.mldsa_signature = bytes_to_uint8_array(
+                global::X3dhpq.Crypto.mldsa65_sign(owner_aik_priv_mldsa, new Bytes(sp)));
+        } catch (GLib.Error e) {
+            warning("publish_audit_entry_for_action: signing failed: %s", e.message);
+            return false;
+        }
+        string b64 = Base64.encode(entry.marshal());
+        return yield publish_membership_entry(stream, room_jid, seq.to_string(), b64);
+    }
+
     // Subscribe to a MUC room's group:0 PEP node. Per Wave 5a of the server,
     // per-room pubsub hosts track explicit subscriptions in pep_subscriptions
     // rather than relying on caps +notify filtering, so an explicit subscribe
@@ -298,6 +340,42 @@ public class StreamModule : XmppStreamModule {
         } catch (Error e) {
             warning("subscribe to group:0 on %s failed: %s", room_jid.to_string(), e.message);
             return false;
+        }
+    }
+
+    // Fetch all current items from the per-room group:0 PEP node and emit
+    // membership_entry_received for each. XEP-0060 subscribers do not get an
+    // automatic backfill of items published before subscription, so we have
+    // to ask explicitly after MUC join — otherwise late joiners see an empty
+    // journal and refuse to encrypt.
+    public async void fetch_group_items(XmppStream stream, Jid room_jid) {
+        StanzaNode pubsub_node = new StanzaNode.build("pubsub", Pubsub.NS_URI).add_self_xmlns()
+            .put_node(new StanzaNode.build("items", Pubsub.NS_URI)
+                .put_attribute("node", Protocol.NS_GROUP));
+        Iq.Stanza iq = new Iq.Stanza.get(pubsub_node) { to = room_jid };
+        try {
+            Iq.Stanza result = yield stream.get_module(Iq.Module.IDENTITY).send_iq_async(stream, iq);
+            if (result.is_error()) {
+                return;
+            }
+            StanzaNode? items_node = result.stanza.get_deep_subnode(
+                Pubsub.NS_URI + ":pubsub", Pubsub.NS_URI + ":items");
+            if (items_node == null) {
+                return;
+            }
+            foreach (StanzaNode item in items_node.get_subnodes("item", Pubsub.NS_URI)) {
+                string? id = item.get_attribute("id");
+                StanzaNode? entry = item.get_subnode("membership-entry", Protocol.NS_GROUP);
+                if (entry == null) {
+                    continue;
+                }
+                string? payload = entry.get_string_content();
+                if (payload != null) {
+                    membership_entry_received(room_jid, id, payload);
+                }
+            }
+        } catch (Error e) {
+            warning("fetch group:0 items on %s failed: %s", room_jid.to_string(), e.message);
         }
     }
 

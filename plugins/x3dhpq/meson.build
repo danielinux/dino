@@ -23,8 +23,13 @@ sources = files(
     'src/encryption_preferences_entry.vala',
     'src/manager.vala',
     'src/plugin.vala',
+    'src/protocol/groupmsg.vala',
+    'src/protocol/groupsession.vala',
+    'src/protocol/groupshare.vala',
+    'src/protocol/membership_journal.vala',
     'src/protocol/pairwise.vala',
     'src/protocol/namespaces.vala',
+    'src/protocol/senderchain.vala',
     'src/register_plugin.vala',
     'src/stream_module.vala',
     'src/util.vala',
@@ -60,6 +65,8 @@ test_sources = [
     'tests/common.vala',
     'tests/testcase.vala',
     'tests/pairwise.vala',
+    'tests/groupsession.vala',
+    'tests/membership_journal.vala',
 ]
 
 exe_x3dhpq_test = executable(

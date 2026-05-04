@@ -5,7 +5,7 @@ using Xmpp;
 namespace Dino.Plugins.X3dhpq {
 
 public class Database : Qlite.Database {
-    private const int VERSION = 2;
+    private const int VERSION = 3;
 
     public class AccountIdentityTable : Table {
         public Column<int> id = new Column.Integer("id") { primary_key = true, auto_increment = true };
@@ -178,13 +178,32 @@ public class Database : Qlite.Database {
         public Column<int> epoch = new Column.Integer("epoch") { not_null = true };
         public Column<string?> sender_state_base64 = new Column.Text("sender_state_base64");
         public Column<string?> member_state_base64 = new Column.Text("member_state_base64");
+        public Column<string?> removed_aiks_json = new Column.Text("removed_aiks_json");
         public Column<long> created_at = new Column.Long("created_at") { not_null = true };
         public Column<long> updated_at = new Column.Long("updated_at") { not_null = true };
 
         internal GroupSessionTable(Database db) {
             base(db, "group_session");
-            init({ account_id, room_jid, epoch, sender_state_base64, member_state_base64, created_at, updated_at });
+            init({ account_id, room_jid, epoch, sender_state_base64, member_state_base64, removed_aiks_json, created_at, updated_at });
             unique({ account_id, room_jid, epoch });
+        }
+    }
+
+    public class MembershipJournalTable : Table {
+        public Column<int> account_id = new Column.Integer("account_id") { not_null = true };
+        public Column<string> room_jid = new Column.NonNullText("room_jid");
+        public Column<int> seq = new Column.Integer("seq") { not_null = true };
+        public Column<string?> prev_hash_hex = new Column.Text("prev_hash_hex");
+        public Column<int> action = new Column.Integer("action") { not_null = true };
+        public Column<string?> payload_base64 = new Column.Text("payload_base64");
+        public Column<string?> sig_ed_base64 = new Column.Text("sig_ed_base64");
+        public Column<string?> sig_mldsa_base64 = new Column.Text("sig_mldsa_base64");
+        public Column<long> created_at = new Column.Long("created_at") { not_null = true };
+
+        internal MembershipJournalTable(Database db) {
+            base(db, "membership_journal");
+            init({ account_id, room_jid, seq, prev_hash_hex, action, payload_base64, sig_ed_base64, sig_mldsa_base64, created_at });
+            unique({ account_id, room_jid, seq });
         }
     }
 
@@ -244,6 +263,7 @@ public class Database : Qlite.Database {
     public OneTimePreKeyTable one_time_pre_key { get; private set; }
     public PairwiseSessionTable pairwise_session { get; private set; }
     public GroupSessionTable group_session { get; private set; }
+    public MembershipJournalTable membership_journal { get; private set; }
     public AuditEntryTable audit_entry { get; private set; }
     public RecoveryBlobTable recovery_blob { get; private set; }
     public PairingSessionTable pairing_session { get; private set; }
@@ -260,10 +280,11 @@ public class Database : Qlite.Database {
         one_time_pre_key = new OneTimePreKeyTable(this);
         pairwise_session = new PairwiseSessionTable(this);
         group_session = new GroupSessionTable(this);
+        membership_journal = new MembershipJournalTable(this);
         audit_entry = new AuditEntryTable(this);
         recovery_blob = new RecoveryBlobTable(this);
         pairing_session = new PairingSessionTable(this);
-        init({ account_identity, peer_account_identity, peer_device, device_list, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, group_session, audit_entry, recovery_blob, pairing_session });
+        init({ account_identity, peer_account_identity, peer_device, device_list, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, group_session, membership_journal, audit_entry, recovery_blob, pairing_session });
     }
 
     public Row? get_local_identity(int account_id) {
@@ -542,6 +563,22 @@ public class Database : Qlite.Database {
             .perform();
     }
 
+    // One-shot recovery hook — drop every pairwise session for this account
+    // so the next outgoing pairwise message re-bootstraps via a prekey
+    // envelope. Used to recover from a peer that wiped its own session
+    // store: with no peer-side session, our cached session can't be
+    // decoded by the peer, leaving group sender-chain announcements
+    // stranded.
+    public int wipe_all_sessions(Account account) {
+        int n = (int) pairwise_session.select()
+            .with(pairwise_session.account_id, "=", account.id)
+            .count();
+        pairwise_session.delete()
+            .with(pairwise_session.account_id, "=", account.id)
+            .perform();
+        return n;
+    }
+
     public Protocol.SessionState? get_session(Account account, string bare_jid, int device_id) {
         Row? row = pairwise_session.select()
             .with(pairwise_session.account_id, "=", account.id)
@@ -612,6 +649,50 @@ public class Database : Qlite.Database {
             .count();
     }
 
+    // Find a peer's AIK pub halves by matching the raw 20-byte BLAKE2b-160
+    // fingerprint of the canonical (version | hasMldsa | ed25519 | mldsa)
+    // serialisation. Used to TOFU-bootstrap the room owner's identity from a
+    // membership-journal AddMember entry's payload.
+    public bool find_peer_account_identity_by_aik_fp(Account account, uint8[] aik_fp_raw_20,
+            out uint8[] out_aik_ed, out uint8[] out_aik_mldsa) {
+        out_aik_ed = {};
+        out_aik_mldsa = {};
+        if (aik_fp_raw_20.length != 20) return false;
+        var rows = peer_account_identity.select()
+            .with(peer_account_identity.account_id, "=", account.id);
+        foreach (Row r in rows) {
+            string? ed_b64 = r[peer_account_identity.aik_pub_ed25519_base64];
+            string? ml_b64 = r[peer_account_identity.aik_pub_mldsa_base64];
+            if (ed_b64 == null || ml_b64 == null) continue;
+            try {
+                Bytes ed = bytes_from_base64(ed_b64);
+                Bytes ml = bytes_from_base64(ml_b64);
+                uint8[] ed_arr = bytes_to_uint8_array(ed);
+                uint8[] ml_arr = bytes_to_uint8_array(ml);
+                // canonical: 0x00 0x01 0x01 | ed25519(32) | mldsa
+                int total = 3 + ed_arr.length + ml_arr.length;
+                uint8[] enc = new uint8[total];
+                enc[0] = 0; enc[1] = 1; enc[2] = 1;
+                Memory.copy((uint8*) enc + 3, ed_arr, ed_arr.length);
+                Memory.copy((uint8*) enc + 3 + ed_arr.length, ml_arr, ml_arr.length);
+                Bytes digest = global::X3dhpq.Crypto.blake2b160(new Bytes(enc));
+                unowned uint8[] dig = digest.get_data();
+                bool match = true;
+                for (int i = 0; i < 20; i++) {
+                    if (dig[i] != aik_fp_raw_20[i]) { match = false; break; }
+                }
+                if (match) {
+                    out_aik_ed = ed_arr;
+                    out_aik_mldsa = ml_arr;
+                    return true;
+                }
+            } catch (Error e) {
+                continue;
+            }
+        }
+        return false;
+    }
+
     public string? get_peer_aik_fingerprint(Account account, string bare_jid) {
         Row? row = get_peer_account_identity_row(account, bare_jid);
         if (row == null || ((!) row)[peer_account_identity.aik_pub_ed25519_base64] == null || ((!) row)[peer_account_identity.aik_pub_mldsa_base64] == null) {
@@ -661,6 +742,41 @@ public class Database : Qlite.Database {
             .value(device_list.signed_payload_base64, Base64.encode(string_to_bytes(payload)))
             .value(device_list.updated_at, (long) new DateTime.now_utc().to_unix())
             .perform();
+    }
+
+    // Drop every cached peer_device / bundle / pairwise_session row for
+    // (account, bare_jid) whose device id is NOT in keep_ids. Mirrors the
+    // Conversations-side prune so that when Conversations regenerates
+    // identity (resulting in a brand-new device id) we stop addressing
+    // pairwise envelopes — and group sender-chain announcements — to
+    // device ids that no longer exist on the peer.
+    public void prune_remote_devices_not_in(Account account, string bare_jid, Gee.Collection<int> keep_ids) {
+        // Snapshot existing rows then drop the stragglers individually.
+        Gee.ArrayList<int> all = new Gee.ArrayList<int>();
+        var rows = peer_device.select()
+            .with(peer_device.account_id, "=", account.id)
+            .with(peer_device.bare_jid, "=", bare_jid);
+        foreach (Row r in rows) {
+            all.add(r[peer_device.device_id]);
+        }
+        foreach (int existing in all) {
+            if (keep_ids.contains(existing)) continue;
+            peer_device.delete()
+                .with(peer_device.account_id, "=", account.id)
+                .with(peer_device.bare_jid, "=", bare_jid)
+                .with(peer_device.device_id, "=", existing)
+                .perform();
+            bundle.delete()
+                .with(bundle.account_id, "=", account.id)
+                .with(bundle.bare_jid, "=", bare_jid)
+                .with(bundle.device_id, "=", existing)
+                .perform();
+            pairwise_session.delete()
+                .with(pairwise_session.account_id, "=", account.id)
+                .with(pairwise_session.bare_jid, "=", bare_jid)
+                .with(pairwise_session.device_id, "=", existing)
+                .perform();
+        }
     }
 
     public void store_remote_device(Account account, string bare_jid, int device_id, string? certificate_base64 = null) {
@@ -823,6 +939,104 @@ public class Database : Qlite.Database {
             key.public_base64 = parts[1];
             target.add(key);
         }
+    }
+
+    public void store_group_session(Account account, string room_jid, Protocol.GroupSession gs) {
+        string send_state = gs.serialize_send_state();
+        string member_state = gs.serialize_member_state() + gs.serialize_recv_chains();
+        group_session.upsert()
+            .value(group_session.account_id, account.id, true)
+            .value(group_session.room_jid, room_jid, true)
+            .value(group_session.epoch, (int) gs.epoch, true)
+            .value(group_session.sender_state_base64, Base64.encode(string_to_bytes(send_state)))
+            .value(group_session.member_state_base64, Base64.encode(string_to_bytes(member_state)))
+            .value(group_session.removed_aiks_json, null)
+            .value(group_session.created_at, (long) new DateTime.now_utc().to_unix())
+            .value(group_session.updated_at, (long) new DateTime.now_utc().to_unix())
+            .perform();
+    }
+
+    public Protocol.GroupSession? load_group_session(Account account, string room_jid, uint8[] my_aik_pub_bytes, uint32 my_device_id) {
+        // Find the row with the highest epoch for this room.
+        Row? row = group_session.select()
+            .with(group_session.account_id, "=", account.id)
+            .with(group_session.room_jid, "=", room_jid)
+            .order_by(group_session.epoch, "DESC")
+            .single().row().inner;
+        if (row == null) return null;
+        string? ss64 = ((!) row)[group_session.sender_state_base64];
+        string? ms64 = ((!) row)[group_session.member_state_base64];
+        string send_state = ss64 != null ? (string)(Base64.decode(ss64)) : "";
+        string member_state = ms64 != null ? (string)(Base64.decode(ms64)) : "";
+        return Protocol.GroupSession.deserialize(room_jid, my_aik_pub_bytes, my_device_id, send_state, member_state);
+    }
+
+    public bool has_membership_journal(Account account, string room_jid) {
+        return membership_journal.select()
+            .with(membership_journal.account_id, "=", account.id)
+            .with(membership_journal.room_jid, "=", room_jid)
+            .count() > 0;
+    }
+
+    // Returns all stored journal entries for the given room ordered by seq.
+    // Caller is responsible for re-applying them to in-memory GroupSession.
+    public Gee.List<Protocol.MemberAuditEntry> list_membership_journal_entries(
+            Account account, string room_jid) {
+        Gee.ArrayList<Protocol.MemberAuditEntry> out_entries = new Gee.ArrayList<Protocol.MemberAuditEntry>();
+        var rows = membership_journal.select()
+            .with(membership_journal.account_id, "=", account.id)
+            .with(membership_journal.room_jid, "=", room_jid)
+            .order_by(membership_journal.seq, "ASC");
+        foreach (Row r in rows) {
+            try {
+                Protocol.MemberAuditEntry e = new Protocol.MemberAuditEntry();
+                e.seq = (uint64) r[membership_journal.seq];
+                // prev_hash hex → bytes
+                string ph_hex = r[membership_journal.prev_hash_hex];
+                e.prev_hash = new uint8[32];
+                if (ph_hex != null && ph_hex.length == 64) {
+                    for (int i = 0; i < 32; i++) {
+                        int hi = ph_hex.get_char(i * 2).digit_value();
+                        int lo = ph_hex.get_char(i * 2 + 1).digit_value();
+                        if (hi < 0 || lo < 0) { hi = 0; lo = 0; }
+                        e.prev_hash[i] = (uint8) ((hi << 4) | lo);
+                    }
+                }
+                e.action = (uint8) (int) r[membership_journal.action];
+                string p_b64 = r[membership_journal.payload_base64];
+                e.payload = (p_b64 != null) ? Base64.decode(p_b64) : new uint8[0];
+                e.signature = new uint8[0];
+                e.mldsa_signature = new uint8[0];
+                e.timestamp = 0;
+                out_entries.add(e);
+            } catch (Error err) {
+                continue;
+            }
+        }
+        return out_entries;
+    }
+
+    public void store_membership_journal_entry(Account account, string room_jid, Protocol.MemberAuditEntry entry) {
+        string prev_hash_hex = bytes_to_hex_string(entry.prev_hash);
+        membership_journal.upsert()
+            .value(membership_journal.account_id, account.id, true)
+            .value(membership_journal.room_jid, room_jid, true)
+            .value(membership_journal.seq, (int) entry.seq, true)
+            .value(membership_journal.prev_hash_hex, prev_hash_hex)
+            .value(membership_journal.action, (int) entry.action)
+            .value(membership_journal.payload_base64, Base64.encode(entry.payload))
+            .value(membership_journal.sig_ed_base64, Base64.encode(entry.signature))
+            .value(membership_journal.sig_mldsa_base64, Base64.encode(entry.mldsa_signature))
+            .value(membership_journal.created_at, (long) new DateTime.now_utc().to_unix())
+            .perform();
+    }
+
+    private string bytes_to_hex_string(uint8[] b) {
+        StringBuilder sb = new StringBuilder();
+        foreach (uint8 byte in b) {
+            sb.append_printf("%02x", byte);
+        }
+        return sb.str;
     }
 
     private void update_peer_identity(Account account, string bare_jid, string? aik_ed25519, string? aik_mldsa) {
