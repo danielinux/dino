@@ -10,6 +10,7 @@ public class ConversationManager : StreamInteractionModule, Object {
 
     public signal void conversation_activated(Conversation conversation);
     public signal void conversation_deactivated(Conversation conversation);
+    public signal void conversation_forgotten(Conversation conversation);
 
     private StreamInteractor stream_interactor;
     private Database db;
@@ -156,6 +157,17 @@ public class ConversationManager : StreamInteractionModule, Object {
         conversation_deactivated(conversation);
     }
 
+    public void forget_contact(Conversation conversation) {
+        if (conversation.active) {
+            conversation.active = false;
+            conversation_deactivated(conversation);
+        }
+
+        purge_conversation_rows(conversation);
+        conversation_forgotten(conversation);
+        remove_conversation(conversation);
+    }
+
     private void on_account_added(Account account) {
         conversations[account] = new HashMap<Jid, ArrayList<Conversation>>(Jid.hash_func, Jid.equals_func);
         foreach (Conversation conversation in db.get_conversations(account)) {
@@ -221,6 +233,114 @@ public class ConversationManager : StreamInteractionModule, Object {
         if (conversation.active) {
             conversation_activated(conversation);
         }
+    }
+
+    private void remove_conversation(Conversation conversation) {
+        Gee.List<Conversation>? conversation_list = conversations[conversation.account][conversation.counterpart];
+        if (conversation_list == null) {
+            return;
+        }
+
+        conversation_list.remove(conversation);
+        if (conversation_list.size == 0) {
+            conversations[conversation.account].unset(conversation.counterpart);
+        }
+    }
+
+    private void purge_conversation_rows(Conversation conversation) {
+        Gee.ArrayList<int> message_ids = new Gee.ArrayList<int>();
+        Gee.ArrayList<int> file_ids = new Gee.ArrayList<int>();
+        Gee.ArrayList<int> call_ids = new Gee.ArrayList<int>();
+        Gee.ArrayList<int> content_item_ids = new Gee.ArrayList<int>();
+
+        foreach (Qlite.Row row in db.content_item.select().with(db.content_item.conversation_id, "=", conversation.id)) {
+            int content_item_id = row[db.content_item.id];
+            int content_type = row[db.content_item.content_type];
+            int foreign_id = row[db.content_item.foreign_id];
+            content_item_ids.add(content_item_id);
+            switch (content_type) {
+                case 1:
+                    message_ids.add(foreign_id);
+                    break;
+                case 2:
+                    file_ids.add(foreign_id);
+                    break;
+                case 3:
+                    call_ids.add(foreign_id);
+                    break;
+            }
+        }
+
+        foreach (int content_item_id in content_item_ids) {
+            db.reaction.delete()
+                .with(db.reaction.content_item_id, "=", content_item_id)
+                .perform();
+        }
+
+        foreach (int message_id in message_ids) {
+            db.message_occupant_id.delete()
+                .with(db.message_occupant_id.message_id, "=", message_id)
+                .perform();
+            db.body_meta.delete()
+                .with(db.body_meta.message_id, "=", message_id)
+                .perform();
+            db.message_correction.delete()
+                .with(db.message_correction.message_id, "=", message_id)
+                .perform();
+            db.reply.delete()
+                .with(db.reply.message_id, "=", message_id)
+                .perform();
+            db.real_jid.delete()
+                .with(db.real_jid.message_id, "=", message_id)
+                .perform();
+            db.message.delete()
+                .with(db.message.id, "=", message_id)
+                .perform();
+        }
+
+        foreach (int file_id in file_ids) {
+            db.file_hashes.delete()
+                .with(db.file_hashes.id, "=", file_id)
+                .perform();
+            db.file_thumbnails.delete()
+                .with(db.file_thumbnails.id, "=", file_id)
+                .perform();
+            db.sfs_sources.delete()
+                .with(db.sfs_sources.file_transfer_id, "=", file_id)
+                .perform();
+            db.file_transfer.delete()
+                .with(db.file_transfer.id, "=", file_id)
+                .perform();
+        }
+
+        foreach (int call_id in call_ids) {
+            db.call_counterpart.delete()
+                .with(db.call_counterpart.call_id, "=", call_id)
+                .perform();
+            db.call.delete()
+                .with(db.call.id, "=", call_id)
+                .perform();
+        }
+
+        db.content_item.delete()
+            .with(db.content_item.conversation_id, "=", conversation.id)
+            .perform();
+        db.conversation_settings.delete()
+            .with(db.conversation_settings.conversation_id, "=", conversation.id)
+            .perform();
+        db.avatar.delete()
+            .with(db.avatar.account_id, "=", conversation.account.id)
+            .with(db.avatar.jid_id, "=", db.get_jid_id(conversation.counterpart))
+            .perform();
+        db.entity.delete()
+            .with(db.entity.account_id, "=", conversation.account.id)
+            .with(db.entity.jid_id, "=", db.get_jid_id(conversation.counterpart))
+            .perform();
+        db.conversation.delete()
+            .with(db.conversation.id, "=", conversation.id)
+            .perform();
+
+        stream_interactor.get_module(MessageStorage.IDENTITY).forget_conversation(conversation);
     }
 }
 

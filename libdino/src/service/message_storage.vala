@@ -226,6 +226,21 @@ public class MessageStorage : StreamInteractionModule, Object {
             return message.server_id;
         }
     }
+
+    public void forget_conversation(Conversation conversation) {
+        messages_by_stanza_id.unset(conversation);
+        messages_by_server_id.unset(conversation);
+        for (int index = message_refs.size - 1; index >= 0; index--) {
+            Message message = message_refs[index];
+            if (message.account.equals(conversation.account)
+                    && message.counterpart != null
+                    && message.counterpart.equals(conversation.counterpart)
+                    && message.type_ == Util.get_message_type_for_conversation(conversation)) {
+                messages_by_db_id.unset(message.id);
+                message_refs.remove_at(index);
+            }
+        }
+    }
 }
 
 }

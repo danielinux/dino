@@ -779,6 +779,29 @@ public class Database : Qlite.Database {
         }
     }
 
+    public void forget_peer(Account account, string bare_jid) {
+        device_list.delete()
+            .with(device_list.account_id, "=", account.id)
+            .with(device_list.bare_jid, "=", bare_jid)
+            .perform();
+        peer_account_identity.delete()
+            .with(peer_account_identity.account_id, "=", account.id)
+            .with(peer_account_identity.bare_jid, "=", bare_jid)
+            .perform();
+        peer_device.delete()
+            .with(peer_device.account_id, "=", account.id)
+            .with(peer_device.bare_jid, "=", bare_jid)
+            .perform();
+        bundle.delete()
+            .with(bundle.account_id, "=", account.id)
+            .with(bundle.bare_jid, "=", bare_jid)
+            .perform();
+        pairwise_session.delete()
+            .with(pairwise_session.account_id, "=", account.id)
+            .with(pairwise_session.bare_jid, "=", bare_jid)
+            .perform();
+    }
+
     public void store_remote_device(Account account, string bare_jid, int device_id, string? certificate_base64 = null) {
         peer_device.upsert()
             .value(peer_device.account_id, account.id, true)

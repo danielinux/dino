@@ -206,7 +206,8 @@ public class MucManager : StreamInteractionModule, Object {
 
     public void invite(Account account, Jid muc, Jid invitee) {
         XmppStream? stream = stream_interactor.get_stream(account);
-        if (stream != null) stream.get_module(Xep.Muc.Module.IDENTITY).invite(stream, muc.bare_jid, invitee.bare_jid);
+        if (stream == null) return;
+        stream.get_module(Xep.Muc.Module.IDENTITY).invite(stream, muc.bare_jid, invitee.bare_jid);
     }
 
     public void kick(Account account, Jid jid, string nick) {
@@ -217,6 +218,22 @@ public class MucManager : StreamInteractionModule, Object {
     public void change_affiliation(Account account, Jid jid, string nick, string role) {
         XmppStream? stream = stream_interactor.get_stream(account);
         if (stream != null) stream.get_module(Xep.Muc.Module.IDENTITY).change_affiliation.begin(stream, jid.bare_jid, null, nick, role);
+    }
+
+    public void change_affiliation_for_jid(Account account, Jid jid, Jid member_jid, string affiliation) {
+        XmppStream? stream = stream_interactor.get_stream(account);
+        if (stream != null) stream.get_module(Xep.Muc.Module.IDENTITY).change_affiliation.begin(stream, jid.bare_jid, member_jid.bare_jid, null, affiliation);
+    }
+
+    public async bool yield_change_affiliation_for_jid(Account account, Jid jid, Jid member_jid, string affiliation) {
+        XmppStream? stream = stream_interactor.get_stream(account);
+        if (stream == null) return false;
+        try {
+            yield stream.get_module(Xep.Muc.Module.IDENTITY).change_affiliation(stream, jid.bare_jid, member_jid.bare_jid, null, affiliation);
+            return true;
+        } catch (GLib.Error e) {
+            return false;
+        }
     }
 
     public void change_role(Account account, Jid jid, string nick, string role) {

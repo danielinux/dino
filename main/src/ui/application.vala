@@ -155,6 +155,15 @@ public class Dino.Ui.Application : Adw.Application, Dino.Application {
         });
         add_action(open_conversation_details_action);
 
+        SimpleAction accept_subscription_action = new SimpleAction("accept-subscription", VariantType.INT32);
+        accept_subscription_action.activate.connect((variant) => {
+            Conversation? conversation = stream_interactor.get_module(ConversationManager.IDENTITY).get_conversation_by_id(variant.get_int32());
+            if (conversation == null) return;
+            stream_interactor.get_module(PresenceManager.IDENTITY).approve_subscription(conversation.account, conversation.counterpart);
+            stream_interactor.get_module(PresenceManager.IDENTITY).request_subscription(conversation.account, conversation.counterpart);
+        });
+        add_action(accept_subscription_action);
+
         SimpleAction deny_subscription_action = new SimpleAction("deny-subscription", VariantType.INT32);
         deny_subscription_action.activate.connect((variant) => {
             Conversation? conversation = stream_interactor.get_module(ConversationManager.IDENTITY).get_conversation_by_id(variant.get_int32());

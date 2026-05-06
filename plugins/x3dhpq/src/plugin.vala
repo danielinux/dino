@@ -26,6 +26,11 @@ public class Plugin : RootInterface, Object {
         app.stream_interactor.get_module(ChatInteraction.IDENTITY).focused_in.connect((conversation) => {
             prefetch_and_refresh(conversation);
         });
+        app.stream_interactor.get_module(ConversationManager.IDENTITY).conversation_forgotten.connect((conversation) => {
+            if (conversation.type_ == Conversation.Type.CHAT || conversation.type_ == Conversation.Type.GROUPCHAT_PM) {
+                db.forget_peer(conversation.account, conversation.counterpart.bare_jid.to_string());
+            }
+        });
     }
 
     public void shutdown() { }

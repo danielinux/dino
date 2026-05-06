@@ -13,7 +13,7 @@ public class View : Popover {
     private Stack stack = new Stack() { vhomogeneous=false };
     private Box list_box = new Box(Orientation.VERTICAL, 1);
     private List? list = null;
-    private ListBox invite_list = new ListBox();
+    private ListBox? invite_list = null;
     private Box? jid_menu = null;
 
     private Jid? selected_jid;
@@ -28,11 +28,6 @@ public class View : Popover {
 
         this.show.connect(initialize_list);
 
-        invite_list.append(new ListRow.label("+", _("Invite")).get_widget());
-        invite_list.can_focus = false;
-        list_box.append(invite_list);
-        invite_list.row_activated.connect(on_invite_clicked);
-
         stack.add_named(list_box, "list");
         set_child(stack);
         stack.visible_child_name = "list";
@@ -44,7 +39,7 @@ public class View : Popover {
         stack.transition_type = StackTransitionType.NONE;
         stack.visible_child_name = "list";
         if (list != null) list.list_box.unselect_all();
-        invite_list.unselect_all();
+        if (invite_list != null) invite_list.unselect_all();
     }
 
     private void initialize_list() {
@@ -89,11 +84,30 @@ public class View : Popover {
 
         Jid? own_jid = stream_interactor.get_module(MucManager.IDENTITY).get_own_jid(conversation.counterpart, conversation.account);
         Xmpp.Xep.Muc.Role? role = stream_interactor.get_module(MucManager.IDENTITY).get_role(own_jid, conversation.account);
+        Xmpp.Xep.Muc.Affiliation? own_affiliation = own_jid != null ? stream_interactor.get_module(MucManager.IDENTITY).get_affiliation(conversation.counterpart, own_jid, conversation.account) : Xmpp.Xep.Muc.Affiliation.NONE;
 
+        bool can_invite = own_affiliation == Xmpp.Xep.Muc.Affiliation.ADMIN || own_affiliation == Xmpp.Xep.Muc.Affiliation.OWNER;
+        if (can_invite && invite_list == null) {
+            invite_list = new ListBox();
+            invite_list.append(new ListRow.label("+", _("Invite")).get_widget());
+            invite_list.can_focus = false;
+            invite_list.row_activated.connect((row) => {
+                invite_list.unselect_all();
+                invite_occupant();
+            });
+            list_box.append(invite_list);
+        }
         if (role ==  Xmpp.Xep.Muc.Role.MODERATOR && stream_interactor.get_module(MucManager.IDENTITY).kick_possible(conversation.account, jid)) {
             Button kick_button = new Button.with_label(_("Kick")) ;
             outer_box.append(kick_button);
             kick_button.clicked.connect(kick_button_clicked);
+        }
+        if (real_jid != null && (own_affiliation == Xmpp.Xep.Muc.Affiliation.ADMIN || own_affiliation == Xmpp.Xep.Muc.Affiliation.OWNER)) {
+            Button ban_button = new Button.with_label(_("Ban"));
+            outer_box.append(ban_button);
+            ban_button.clicked.connect(() => {
+                stream_interactor.get_module(MucManager.IDENTITY).change_affiliation_for_jid(conversation.account, conversation.counterpart, real_jid, "outcast");
+            });
         }
         if (stream_interactor.get_module(MucManager.IDENTITY).is_moderated_room(conversation.account, conversation.counterpart) && role ==  Xmpp.Xep.Muc.Role.MODERATOR){
             if (stream_interactor.get_module(MucManager.IDENTITY).get_role(selected_jid, conversation.account) ==  Xmpp.Xep.Muc.Role.VISITOR) {
@@ -139,7 +153,7 @@ public class View : Popover {
         stream_interactor.get_module(MucManager.IDENTITY).change_role(conversation.account, conversation.counterpart, selected_jid.resourcepart, role);
     }
 
-    private void on_invite_clicked() {
+    private void invite_occupant() {
         hide();
         Gee.List<Account> acc_list = new ArrayList<Account>(Account.equals_func);
         acc_list.add(conversation.account);
@@ -147,10 +161,21 @@ public class View : Popover {
         add_chat_dialog.set_transient_for((Window) get_root());
         add_chat_dialog.title = _("Invite to Conference");
         add_chat_dialog.ok_button.label = _("Invite");
-        add_chat_dialog.selected.connect((account, jid) => {
-            stream_interactor.get_module(MucManager.IDENTITY).invite(conversation.account, conversation.counterpart, jid);
+        add_chat_dialog.selected.connect( (account, invitee_jid) => {
+            invite_occupant_async(conversation.account, conversation.counterpart, invitee_jid, stream_interactor);
         });
         add_chat_dialog.present();
+    }
+
+    private async void invite_occupant_async(Account account, Jid muc_jid, Jid invitee_jid, StreamInteractor stream_interactor) {
+        var muc_manager = stream_interactor.get_module(MucManager.IDENTITY);
+        if (muc_manager.is_private_room(account, muc_jid)) {
+            bool success = yield muc_manager.yield_change_affiliation_for_jid(account, muc_jid, invitee_jid, "member");
+            if (!success) {
+                return;
+            }
+        }
+        muc_manager.invite(account, muc_jid, invitee_jid);
     }
 }
 

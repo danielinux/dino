@@ -87,7 +87,7 @@ public class AddConferenceDialog : Gtk.Dialog {
 
         select_fragment = new SelectJidFragment(stream_interactor, conference_list_box, stream_interactor.get_accounts());
         select_fragment.add_jid.connect((row) => {
-            AddGroupchatDialog dialog = new AddGroupchatDialog(stream_interactor);
+            AddGroupchatDialog dialog = new AddGroupchatDialog(stream_interactor, _("New Private Channel"), true);
             dialog.set_transient_for(this);
             dialog.present();
         });

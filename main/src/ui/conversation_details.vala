@@ -29,6 +29,7 @@ namespace Dino.Ui.ConversationDetails {
 
     public void bind_dialog(Model.ConversationDetails model, ViewModel.ConversationDetails view_model, StreamInteractor stream_interactor) {
         // Set some data once
+        view_model.conversation = model.conversation;
         view_model.avatar = new ViewModel.CompatAvatarPictureModel(stream_interactor).set_conversation(model.conversation);
         view_model.show_blocked = model.conversation.type_ == Conversation.Type.CHAT && stream_interactor.get_module(BlockingManager.IDENTITY).is_supported(model.conversation.account);
         view_model.members_sorted.set_model(model.members);
@@ -158,6 +159,145 @@ namespace Dino.Ui.ConversationDetails {
         binding.source.notify_property(binding.source_property);
     }
 
+    private void add_group_management_rows(ViewModel.ConversationDetails view_model, Conversation conversation, StreamInteractor stream_interactor) {
+        add_group_privacy_row(view_model, conversation, stream_interactor);
+
+        var muc_manager = stream_interactor.get_module(MucManager.IDENTITY);
+        Jid? own_jid = muc_manager.get_own_jid(conversation.counterpart, conversation.account);
+        if (own_jid != null) {
+            Xmpp.Xep.Muc.Affiliation own_affiliation = muc_manager.get_affiliation(conversation.counterpart, own_jid, conversation.account) ?? Xmpp.Xep.Muc.Affiliation.NONE;
+            if (own_affiliation == Xmpp.Xep.Muc.Affiliation.ADMIN || own_affiliation == Xmpp.Xep.Muc.Affiliation.OWNER) {
+                invite_to_room(view_model, conversation, stream_interactor);
+            }
+        }
+    }
+
+    private void invite_to_room(ViewModel.ConversationDetails view_model, Conversation conversation, StreamInteractor stream_interactor) {
+        var invite_row = new ViewModel.PreferencesRow.Button() {
+            title = _("Invitations"),
+            subtitle = stream_interactor.get_module(MucManager.IDENTITY).is_private_room(conversation.account, conversation.counterpart) ?
+                    _("Grant membership and invite a contact") :
+                    _("Invite a contact into this room"),
+            button_text = _("Invite")
+        };
+        invite_row.clicked.connect(() => {
+            select_contact_and_invite(view_model, conversation, stream_interactor);
+        });
+        view_model.settings_rows.append(invite_row);
+    }
+
+    private void select_contact_and_invite(ViewModel.ConversationDetails view_model, Conversation conversation, StreamInteractor stream_interactor) {
+        Gee.List<Account> acc_list = new ArrayList<Account>(Account.equals_func);
+        acc_list.add(conversation.account);
+        SelectContactDialog dialog = new SelectContactDialog(stream_interactor, acc_list);
+        dialog.set_transient_for((Window) ((GLib.Application.get_default()) as Application).active_window);
+        dialog.title = _("Invite to Conference");
+        dialog.ok_button.label = _("Invite");
+        dialog.selected.connect( (account, jid) => {
+            send_invite.begin(conversation, stream_interactor, jid);
+        });
+        dialog.present();
+    }
+
+    private async void send_invite(Conversation conversation, StreamInteractor stream_interactor, Jid jid) {
+        var muc_manager = stream_interactor.get_module(MucManager.IDENTITY);
+        if (muc_manager.is_private_room(conversation.account, conversation.counterpart)) {
+            bool success = yield muc_manager.yield_change_affiliation_for_jid(conversation.account, conversation.counterpart, jid, "member");
+            if (!success) {
+                return;
+            }
+        }
+        muc_manager.invite(conversation.account, conversation.counterpart, jid);
+    }
+
+    private void add_group_privacy_row(ViewModel.ConversationDetails view_model, Conversation conversation, StreamInteractor stream_interactor) {
+        var muc_manager = stream_interactor.get_module(MucManager.IDENTITY);
+        Jid? own_jid = muc_manager.get_own_jid(conversation.counterpart, conversation.account);
+        if (own_jid == null) return;
+
+        Xmpp.Xep.Muc.Affiliation own_affiliation = muc_manager.get_affiliation(conversation.counterpart, own_jid, conversation.account) ?? Xmpp.Xep.Muc.Affiliation.NONE;
+        if (own_affiliation != Xmpp.Xep.Muc.Affiliation.OWNER) return;
+
+        bool is_private = muc_manager.is_private_room(conversation.account, conversation.counterpart);
+        var privacy_row = new ViewModel.PreferencesRow.Button() {
+            title = _("Channel Type"),
+            subtitle = is_private ?
+                    _("Private channel: members only, hidden from public listings") :
+                    _("Public channel: discoverable and open to non-members"),
+            button_text = is_private ? _("Make Public") : _("Make Private")
+        };
+        privacy_row.clicked.connect(() => {
+            update_room_privacy.begin(view_model, conversation, stream_interactor, !is_private);
+        });
+        view_model.settings_rows.append(privacy_row);
+    }
+
+    private async void update_room_privacy(ViewModel.ConversationDetails view_model, Conversation conversation, StreamInteractor stream_interactor, bool private_room) {
+        Xep.DataForms.DataForm? data_form = yield stream_interactor.get_module(MucManager.IDENTITY).get_config_form(conversation.account, conversation.counterpart);
+        if (data_form == null) return;
+
+        foreach (Xep.DataForms.DataForm.Field field in data_form.fields) {
+            switch (field.var) {
+                case "muc#roomconfig_publicroom":
+                    if (field.type_ == Xep.DataForms.DataForm.Type.BOOLEAN) {
+                        ((Xep.DataForms.DataForm.BooleanField) field).value = !private_room;
+                    }
+                    break;
+                case "muc#roomconfig_membersonly":
+                    if (field.type_ == Xep.DataForms.DataForm.Type.BOOLEAN) {
+                        ((Xep.DataForms.DataForm.BooleanField) field).value = private_room;
+                    }
+                    break;
+                case "muc#roomconfig_whois":
+                    if (field.type_ == Xep.DataForms.DataForm.Type.LIST_SINGLE) {
+                        ((Xep.DataForms.DataForm.ListSingleField) field).value = private_room ? "anyone" : "moderators";
+                    }
+                    break;
+            }
+        }
+
+        yield stream_interactor.get_module(MucManager.IDENTITY).set_config_form(conversation.account, conversation.counterpart, data_form);
+        refresh_group_rows(view_model, conversation, stream_interactor);
+    }
+
+    private void refresh_group_rows(ViewModel.ConversationDetails view_model, Conversation conversation, StreamInteractor stream_interactor) {
+        while (view_model.settings_rows.get_n_items() > 0) {
+            view_model.settings_rows.remove(view_model.settings_rows.get_n_items() - 1);
+        }
+        add_group_management_rows(view_model, conversation, stream_interactor);
+    }
+
+    private void add_forget_contact_row(Dialog dialog, Conversation conversation, StreamInteractor stream_interactor) {
+        if (conversation.type_ != Conversation.Type.CHAT && conversation.type_ != Conversation.Type.GROUPCHAT_PM) {
+            return;
+        }
+
+        var forget_row = new ViewModel.PreferencesRow.Button() {
+            title = _("Forget contact"),
+            subtitle = _("Remove local messages, metadata, and encryption state for this JID"),
+            button_text = _("Forget")
+        };
+        forget_row.clicked.connect(() => {
+            var confirm = new Adw.AlertDialog(
+                _("Forget this contact?"),
+                _("This removes Dino's local history and cached encryption state for %s.")
+                    .printf(conversation.counterpart.bare_jid.to_string())
+            );
+            confirm.add_response("cancel", _("Cancel"));
+            confirm.add_response("forget", _("Forget"));
+            confirm.set_response_appearance("forget", Adw.ResponseAppearance.DESTRUCTIVE);
+            confirm.set_default_response("cancel");
+            confirm.set_close_response("cancel");
+            confirm.choose.begin(dialog, null, (obj, res) => {
+                if (confirm.choose.end(res) == "forget") {
+                    stream_interactor.get_module(ConversationManager.IDENTITY).forget_contact(conversation);
+                    dialog.close();
+                }
+            });
+        });
+        dialog.model.settings_rows.append(forget_row);
+    }
+
     public void set_about_rows(Model.ConversationDetails model, ViewModel.ConversationDetails view_model, StreamInteractor stream_interactor) {
         Conversation conversation = model.conversation;
         view_model.about_rows.append(new ViewModel.PreferencesRow.Text() {
@@ -193,6 +333,7 @@ namespace Dino.Ui.ConversationDetails {
             view_model.about_rows.append(time_row);
         }
         if (conversation.type_ == Conversation.Type.GROUPCHAT) {
+            add_group_management_rows(view_model, conversation, stream_interactor);
             var topic = stream_interactor.get_module(MucManager.IDENTITY).get_groupchat_subject(conversation.counterpart, conversation.account);
 
             Ui.ViewModel.PreferencesRow.Any preferences_row = null;
@@ -233,6 +374,7 @@ namespace Dino.Ui.ConversationDetails {
         bind_dialog(model, dialog.model, stream_interactor);
 
         set_about_rows(model, dialog.model, stream_interactor);
+        add_forget_contact_row(dialog, conversation, stream_interactor);
 
         dialog.closed.connect(() => {
             // Only send the config form if something was changed

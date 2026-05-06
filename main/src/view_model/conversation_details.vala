@@ -28,6 +28,7 @@ public class Dino.Ui.ViewModel.ConversationDetails : Object {
         OFF
     }
 
+    public Conversation conversation { get; set; }
     public ViewModel.CompatAvatarPictureModel avatar { get; set; }
     public string name { get; set; }
     public bool pinned { get; set; }

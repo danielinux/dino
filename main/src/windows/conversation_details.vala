@@ -171,17 +171,62 @@ namespace Dino.Ui.ConversationDetails {
             var list_view = new ListView(selection_model, item_factory) { single_click_activate = true };
             list_view.add_css_class("card");
             list_view.activate.connect((position) => {
-//                var widget = (Gtk.Widget) list_view.observe_children().get_item(position);
-//                var name_label = widget.get_template_child(Type.OBJECT, "name-label");
-//                print(widget.get_type().name());
-
-//                var popover = new Popover();
-//                popover.parent = widget;
-//                popover.popup();
-
-
                 var row_view_model = (Ui.Model.ConferenceMember) model.members_sorted.get_item(position);
-                print(@"$(position) $(row_view_model.name)\n");
+                if (row_view_model == null) return;
+
+                if (model.conversation == null || model.conversation.type_ != Conversation.Type.GROUPCHAT) return;
+
+                var app = (Application) GLib.Application.get_default();
+                var muc_manager = app.stream_interactor.get_module(MucManager.IDENTITY);
+                if (!muc_manager.is_private_room(model.conversation.account, model.conversation.counterpart)) return;
+                if (row_view_model.jid.equals(model.conversation.account.bare_jid)) return;
+
+                Jid? own_jid = muc_manager.get_own_jid(model.conversation.counterpart, model.conversation.account);
+                if (own_jid == null) return;
+                Xmpp.Xep.Muc.Affiliation own_affiliation = muc_manager.get_affiliation(model.conversation.counterpart, own_jid, model.conversation.account) ?? Xmpp.Xep.Muc.Affiliation.NONE;
+                Xmpp.Xep.Muc.Role own_role = muc_manager.get_role(own_jid, model.conversation.account) ?? Xmpp.Xep.Muc.Role.NONE;
+                Jid? occupant_jid = muc_manager.get_occupant_jid(model.conversation.account, model.conversation.counterpart, row_view_model.jid);
+                bool can_kick = occupant_jid != null && own_role == Xmpp.Xep.Muc.Role.MODERATOR && muc_manager.kick_possible(model.conversation.account, occupant_jid);
+                bool can_owner_admin = own_affiliation == Xmpp.Xep.Muc.Affiliation.OWNER;
+                bool can_member_ops = can_owner_admin || own_affiliation == Xmpp.Xep.Muc.Affiliation.ADMIN;
+                bool can_ban = can_member_ops;
+
+                var dialog = new Adw.AlertDialog(_("Manage member"), row_view_model.jid.to_string());
+                dialog.add_response("cancel", _("Cancel"));
+                if (can_kick) dialog.add_response("kick", _("Kick"));
+                if (can_ban) dialog.add_response("ban", _("Ban"));
+                if (can_member_ops && row_view_model.affiliation != Xmpp.Xep.Muc.Affiliation.NONE) dialog.add_response("none", _("Remove membership"));
+                if (can_member_ops && row_view_model.affiliation != Xmpp.Xep.Muc.Affiliation.MEMBER) dialog.add_response("member", _("Make member"));
+                if (can_owner_admin && row_view_model.affiliation != Xmpp.Xep.Muc.Affiliation.ADMIN) dialog.add_response("admin", _("Make admin"));
+                if (can_owner_admin && row_view_model.affiliation != Xmpp.Xep.Muc.Affiliation.OWNER) dialog.add_response("owner", _("Make owner"));
+                dialog.set_response_appearance("kick", Adw.ResponseAppearance.DESTRUCTIVE);
+                dialog.set_response_appearance("ban", Adw.ResponseAppearance.DESTRUCTIVE);
+                dialog.set_response_appearance("none", Adw.ResponseAppearance.DESTRUCTIVE);
+                dialog.choose.begin(this, null, (obj, res) => {
+                    string response = dialog.choose.end(res);
+                    switch (response) {
+                        case "kick":
+                            if (occupant_jid != null) {
+                                app.stream_interactor.get_module(MucManager.IDENTITY).kick(model.conversation.account, model.conversation.counterpart, occupant_jid.resourcepart);
+                            }
+                            break;
+                        case "ban":
+                            app.stream_interactor.get_module(MucManager.IDENTITY).change_affiliation_for_jid(model.conversation.account, model.conversation.counterpart, row_view_model.jid, "outcast");
+                            break;
+                        case "none":
+                            app.stream_interactor.get_module(MucManager.IDENTITY).change_affiliation_for_jid(model.conversation.account, model.conversation.counterpart, row_view_model.jid, "none");
+                            break;
+                        case "member":
+                            app.stream_interactor.get_module(MucManager.IDENTITY).change_affiliation_for_jid(model.conversation.account, model.conversation.counterpart, row_view_model.jid, "member");
+                            break;
+                        case "admin":
+                            app.stream_interactor.get_module(MucManager.IDENTITY).change_affiliation_for_jid(model.conversation.account, model.conversation.counterpart, row_view_model.jid, "admin");
+                            break;
+                        case "owner":
+                            app.stream_interactor.get_module(MucManager.IDENTITY).change_affiliation_for_jid(model.conversation.account, model.conversation.counterpart, row_view_model.jid, "owner");
+                            break;
+                    }
+                });
             });
 
             add_members_tab_element(list_view);

@@ -97,12 +97,16 @@ public class SubscriptionNotitication : Object {
         Button deny_button = new Button.with_label(_("Deny"));
         GLib.Application app = GLib.Application.get_default();
         accept_button.clicked.connect(() => {
-            app.activate_action("accept-subscription", conversation.id);
+            stream_interactor.get_module(PresenceManager.IDENTITY).approve_subscription(
+                conversation.account, conversation.counterpart);
+            stream_interactor.get_module(PresenceManager.IDENTITY).request_subscription(
+                conversation.account, conversation.counterpart);
             ((Dino.Ui.Application) app).window.conversation_view.chat_input.chat_text_view.text_view.grab_focus();
             clear_notification();
         });
         deny_button.clicked.connect(() => {
-            app.activate_action("deny-subscription", conversation.id);
+            stream_interactor.get_module(PresenceManager.IDENTITY).deny_subscription(
+                conversation.account, conversation.counterpart);
             ((Dino.Ui.Application) app).window.conversation_view.chat_input.chat_text_view.text_view.grab_focus();
             clear_notification();
         });
