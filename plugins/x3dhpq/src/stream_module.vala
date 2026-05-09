@@ -401,6 +401,15 @@ public class StreamModule : XmppStreamModule {
             stream, room_jid, Protocol.NS_GROUP, item_id, entry, PUBLISH_OPTIONS);
     }
 
+    // Publish an owner-generated (or server-generated) membership audit entry
+    // to a room's group:0 PEP node. This is a thin wire-publisher that mirrors
+    // the same path used by publish_audit_entry_for_action except it accepts a
+    // fully built MemberAuditEntry so callers can persist the same object locally.
+    public async bool publish_membership_audit_entry(XmppStream stream, Jid room_jid, Protocol.MemberAuditEntry entry) {
+        string b64 = Base64.encode(entry.marshal());
+        return yield publish_membership_entry(stream, room_jid, entry.seq.to_string(), b64);
+    }
+
     public override string get_ns() {
         return Protocol.NS_X3DHPQ;
     }

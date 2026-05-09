@@ -204,7 +204,15 @@ namespace Dino.Ui.ConversationDetails {
         if (muc_manager.is_private_room(conversation.account, conversation.counterpart)) {
             bool success = yield muc_manager.yield_change_affiliation_for_jid(conversation.account, conversation.counterpart, jid, "member");
             if (!success) {
+                show_group_error(_("Could not invite contact"), _("Dino could not grant membership for %s in this private channel.").printf(jid.to_string()));
                 return;
+            }
+            Application? app = GLib.Application.get_default() as Application;
+            if (app != null && app.plugin_registry.x3dhpq_group_manager != null) {
+                if (!(yield app.plugin_registry.x3dhpq_group_manager.add_private_group_member(conversation.account, conversation.counterpart, jid))) {
+                    show_group_error(_("Could not invite contact"), _("Dino could not publish x3dhpq membership data for %s in this private channel.").printf(jid.to_string()));
+                    return;
+                }
             }
         }
         muc_manager.invite(conversation.account, conversation.counterpart, jid);
@@ -219,6 +227,7 @@ namespace Dino.Ui.ConversationDetails {
         if (own_affiliation != Xmpp.Xep.Muc.Affiliation.OWNER) return;
 
         bool is_private = muc_manager.is_private_room(conversation.account, conversation.counterpart);
+        if (is_private) return;
         var privacy_row = new ViewModel.PreferencesRow.Button() {
             title = _("Channel Type"),
             subtitle = is_private ?
@@ -257,6 +266,17 @@ namespace Dino.Ui.ConversationDetails {
         }
 
         yield stream_interactor.get_module(MucManager.IDENTITY).set_config_form(conversation.account, conversation.counterpart, data_form);
+
+        if (private_room) {
+            conversation.encryption = Encryption.X3DHPQ;
+            Application? app = GLib.Application.get_default() as Application;
+            if (app != null && app.plugin_registry.x3dhpq_group_manager != null) {
+                if (!(yield app.plugin_registry.x3dhpq_group_manager.ensure_private_group_bootstrapped(conversation.account, conversation.counterpart))) {
+                    show_group_error(_("Could not make channel private"), _("Dino could not create the x3dhpq membership journal for this channel."));
+                }
+            }
+        }
+
         refresh_group_rows(view_model, conversation, stream_interactor);
     }
 
@@ -265,6 +285,19 @@ namespace Dino.Ui.ConversationDetails {
             view_model.settings_rows.remove(view_model.settings_rows.get_n_items() - 1);
         }
         add_group_management_rows(view_model, conversation, stream_interactor);
+    }
+
+    private void show_group_error(string title, string body) {
+        Window? window = (GLib.Application.get_default() as Application).active_window;
+        if (window == null) {
+            warning("%s: %s", title, body);
+            return;
+        }
+        var dialog = new Adw.AlertDialog(title, body);
+        dialog.add_response("close", _("Close"));
+        dialog.set_default_response("close");
+        dialog.set_close_response("close");
+        dialog.present(window);
     }
 
     private void add_forget_contact_row(Dialog dialog, Conversation conversation, StreamInteractor stream_interactor) {

@@ -4,17 +4,21 @@ using Dino.Entities;
 namespace Dino.Plugins.X3dhpq {
 
 public class Plugin : RootInterface, Object {
+    public static Plugin? instance;
+    public static Dino.Plugins.X3dhpq.Manager manager { get; private set; }
+
     public Dino.Application app;
     public Database db;
-    public Manager manager;
 
     private EncryptionListEntry list_entry;
     private ContactDetailsProvider contact_details_provider;
 
     public void registered(Dino.Application app) {
+        instance = this;
         this.app = app;
         this.db = new Database(Path.build_filename(Application.get_storage_dir(), "x3dhpq.db"));
-        this.manager = new Manager(app, db);
+        Plugin.manager = new Manager(app, db);
+        app.plugin_registry.x3dhpq_group_manager = Plugin.manager;
         this.list_entry = new EncryptionListEntry(this);
         this.contact_details_provider = new ContactDetailsProvider(this);
 

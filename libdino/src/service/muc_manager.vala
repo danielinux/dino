@@ -207,7 +207,11 @@ public class MucManager : StreamInteractionModule, Object {
     public void invite(Account account, Jid muc, Jid invitee) {
         XmppStream? stream = stream_interactor.get_stream(account);
         if (stream == null) return;
-        stream.get_module(Xep.Muc.Module.IDENTITY).invite(stream, muc.bare_jid, invitee.bare_jid);
+        if (is_private_room(account, muc.bare_jid)) {
+            stream.get_module(Xep.DirectMucInvitations.Module.IDENTITY).invite(stream, muc.bare_jid, invitee.bare_jid);
+        } else {
+            stream.get_module(Xep.Muc.Module.IDENTITY).invite(stream, muc.bare_jid, invitee.bare_jid);
+        }
     }
 
     public void kick(Account account, Jid jid, string nick) {

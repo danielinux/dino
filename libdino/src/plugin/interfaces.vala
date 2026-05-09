@@ -117,6 +117,11 @@ public interface VideoCallPlugin : Object {
     public abstract void dump_dot();
 }
 
+public interface X3dhpqGroupManager : Object {
+    public abstract async bool ensure_private_group_bootstrapped(Dino.Entities.Account account, Jid room_jid);
+    public abstract async bool add_private_group_member(Dino.Entities.Account account, Jid room_jid, Jid member_jid);
+}
+
 public interface VideoCallWidget : Object {
     public signal void resolution_changed(uint width, uint height);
     public abstract void display_stream(Xmpp.Xep.JingleRtp.Stream? stream, Jid jid);

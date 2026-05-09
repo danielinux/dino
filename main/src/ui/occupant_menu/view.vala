@@ -174,6 +174,12 @@ public class View : Popover {
             if (!success) {
                 return;
             }
+            Application? app = GLib.Application.get_default() as Application;
+            if (app != null && app.plugin_registry.x3dhpq_group_manager != null) {
+                if (!(yield app.plugin_registry.x3dhpq_group_manager.add_private_group_member(account, muc_jid, invitee_jid))) {
+                    return;
+                }
+            }
         }
         muc_manager.invite(account, muc_jid, invitee_jid);
     }

@@ -7,6 +7,7 @@ namespace Dino {
 public class PresenceManager : StreamInteractionModule, Object {
     public static ModuleIdentity<PresenceManager> IDENTITY = new ModuleIdentity<PresenceManager>("presence_manager");
     public string id { get { return IDENTITY.id; } }
+    private const string NICK_NS_URI = "http://jabber.org/protocol/nick";
 
     public signal void show_received(Jid jid, Account account);
     public signal void received_offline_presence(Jid jid, Account account);
@@ -53,7 +54,22 @@ public class PresenceManager : StreamInteractionModule, Object {
 
     public void request_subscription(Account account, Jid jid) {
         XmppStream stream = stream_interactor.get_stream(account);
-        if (stream != null) stream.get_module(Xmpp.Presence.Module.IDENTITY).request_subscription(stream, jid.bare_jid);
+        if (stream == null) return;
+
+        Presence.Stanza presence = new Presence.Stanza();
+        presence.to = jid.bare_jid;
+        presence.type_ = Presence.Stanza.TYPE_SUBSCRIBE;
+
+        string display_name = account.display_name;
+        if (display_name.length > 0) {
+            presence.stanza.put_node(
+                new StanzaNode.build("nick", NICK_NS_URI)
+                    .add_self_xmlns()
+                    .put_node(new StanzaNode.text(display_name))
+            );
+        }
+
+        stream.get_module(Xmpp.Presence.Module.IDENTITY).send_presence(stream, presence);
     }
 
     public void approve_subscription(Account account, Jid jid) {

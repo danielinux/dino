@@ -73,8 +73,11 @@ public class OmemoPreferencesWidget : Adw.PreferencesGroup {
         automatically_accept_new_row.notify["active"].connect((obj, _) => { on_auto_accept_toggled(((Adw.SwitchRow) obj).active); });
 
         encrypt_by_default_row.visible = account.bare_jid.equals_bare(jid);
-        encrypt_by_default_row.active = plugin.app.settings.get_default_encryption(account) != Encryption.NONE;
+        update_encrypt_by_default_row();
         encrypt_by_default_row.notify["active"].connect((obj, _) => { on_omemo_by_default_toggled(((Adw.SwitchRow) obj).active); });
+        plugin.app.settings.notify["default-private-x3dhpq"].connect(() => {
+            update_encrypt_by_default_row();
+        });
 
         Dino.Application? app = Application.get_default() as Dino.Application;
         if (app != null) {
@@ -251,9 +254,18 @@ public class OmemoPreferencesWidget : Adw.PreferencesGroup {
     }
 
     private bool on_omemo_by_default_toggled(bool active) {
+        if (active && plugin.app.settings.default_private_x3dhpq) {
+            plugin.app.settings.default_private_x3dhpq = false;
+        }
         var encryption_value = active ? Encryption.OMEMO : Encryption.NONE;
         plugin.app.settings.set_default_encryption(account, encryption_value);
         return false;
+    }
+
+    private void update_encrypt_by_default_row() {
+        encrypt_by_default_row.active =
+            !plugin.app.settings.default_private_x3dhpq &&
+            plugin.app.settings.get_default_encryption(account) == Encryption.OMEMO;
     }
 
     private void update_stored_trust(int response, Row device) {

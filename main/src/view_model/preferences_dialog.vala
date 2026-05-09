@@ -127,4 +127,3 @@ public class Dino.Ui.ViewModel.ChangePasswordDialog : Object {
         return res;
     }
 }
-

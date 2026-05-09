@@ -15,6 +15,7 @@ public class Registry {
         return (int)(a.order - b.order);
     });
     public VideoCallPlugin? video_call_plugin;
+    public X3dhpqGroupManager? x3dhpq_group_manager { get; set; default = null; }
 
     public bool register_encryption_list_entry(EncryptionListEntry entry) {
         lock(encryption_list_entries) {

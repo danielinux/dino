@@ -45,6 +45,11 @@ public class EncryptionListEntry : Plugins.EncryptionListEntry, Object {
                 return;
             }
         } else if (conversation.type_ == Conversation.Type.GROUPCHAT) {
+            string room_jid = conversation.counterpart.bare_jid.to_string();
+            if (!plugin.db.has_membership_journal(conversation.account, room_jid)) {
+                input_status_callback(new Plugins.InputFieldStatus("This private channel is missing x3dhpq membership state.", Plugins.InputFieldStatus.MessageType.ERROR, Plugins.InputFieldStatus.InputState.NO_SEND));
+                return;
+            }
             Gee.List<Xmpp.Jid>? members = plugin.app.stream_interactor.get_module(MucManager.IDENTITY).get_offline_members(conversation.counterpart, conversation.account);
             if (members == null) {
                 input_status_callback(new Plugins.InputFieldStatus("Group member list is not available yet.", Plugins.InputFieldStatus.MessageType.WARNING, Plugins.InputFieldStatus.InputState.NORMAL));
@@ -58,10 +63,45 @@ public class EncryptionListEntry : Plugins.EncryptionListEntry, Object {
                     input_status_callback(new Plugins.InputFieldStatus("A group member does not publish usable x3dhpq bundle data: %s".printf(member.to_string()), Plugins.InputFieldStatus.MessageType.ERROR, Plugins.InputFieldStatus.InputState.NO_SEND));
                     return;
                 }
+                uint8[] member_aik_fp_raw;
+                if (!plugin.db.get_peer_aik_fingerprint_raw(conversation.account, member.bare_jid.to_string(), out member_aik_fp_raw)) {
+                    input_status_callback(new Plugins.InputFieldStatus("A group member is missing x3dhpq identity data: %s".printf(member.to_string()), Plugins.InputFieldStatus.MessageType.ERROR, Plugins.InputFieldStatus.InputState.NO_SEND));
+                    return;
+                }
+                if (!is_active_member(conversation.account, room_jid, member_aik_fp_raw)) {
+                    input_status_callback(new Plugins.InputFieldStatus("A group member has not been added to this channel's x3dhpq membership journal: %s".printf(member.to_string()), Plugins.InputFieldStatus.MessageType.ERROR, Plugins.InputFieldStatus.InputState.NO_SEND));
+                    return;
+                }
             }
         }
 
         input_status_callback(new Plugins.InputFieldStatus("x3dhpq is ready for this conversation.", Plugins.InputFieldStatus.MessageType.INFO, Plugins.InputFieldStatus.InputState.NORMAL));
+    }
+
+    private bool is_active_member(Account account, string room_jid, uint8[] member_aik_fp_raw) {
+        bool is_active_member = false;
+        foreach (Protocol.MemberAuditEntry entry in plugin.db.list_membership_journal_entries(account, room_jid)) {
+            uint8[] aik_fp_raw;
+            uint32 epoch_after;
+            if (!Protocol.MemberAuditEntry.parse_member_payload(entry.payload, out aik_fp_raw, out epoch_after)) {
+                continue;
+            }
+            bool same_member = aik_fp_raw.length == member_aik_fp_raw.length;
+            for (int i = 0; same_member && i < aik_fp_raw.length; i++) {
+                if (aik_fp_raw[i] != member_aik_fp_raw[i]) {
+                    same_member = false;
+                }
+            }
+            if (!same_member) {
+                continue;
+            }
+            if (entry.action == (uint8) Protocol.MemberAuditAction.ADD_MEMBER) {
+                is_active_member = true;
+            } else if (entry.action == (uint8) Protocol.MemberAuditAction.REMOVE_MEMBER) {
+                is_active_member = false;
+            }
+        }
+        return is_active_member;
     }
 }
 

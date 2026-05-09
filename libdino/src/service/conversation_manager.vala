@@ -50,9 +50,12 @@ public class ConversationManager : StreamInteractionModule, Object {
         // Create a new converation
         Conversation conversation = new Conversation(jid, account, type);
         // Set encryption for conversation
-        if (type == Conversation.Type.CHAT ||
-                (type == Conversation.Type.GROUPCHAT && stream_interactor.get_module(MucManager.IDENTITY).is_private_room(account, jid))) {
-            conversation.encryption = Application.get_default().settings.get_default_encryption(account);
+        if (type == Conversation.Type.CHAT) {
+            conversation.encryption = Application.get_default().settings.default_private_x3dhpq ?
+                    Encryption.X3DHPQ :
+                    Application.get_default().settings.get_default_encryption(account);
+        } else if (type == Conversation.Type.GROUPCHAT && stream_interactor.get_module(MucManager.IDENTITY).is_private_room(account, jid)) {
+            conversation.encryption = Encryption.X3DHPQ;
         } else {
             conversation.encryption = Encryption.NONE;
         }

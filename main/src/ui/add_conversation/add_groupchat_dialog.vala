@@ -89,10 +89,26 @@ protected class AddGroupchatDialog : Gtk.Dialog {
                 }
                 if (join_result.newly_created && private_group_switch.active) {
                     yield configure_private_room(account, conference);
+
+                    // Force x3dhpq encryption for privacy
+                    Conversation? conversation = stream_interactor.get_module(ConversationManager.IDENTITY).get_conversation(room_jid.bare_jid, account, Conversation.Type.GROUPCHAT);
+                    if (conversation != null) {
+                        conversation.encryption = Encryption.X3DHPQ;
+                    }
+
+                    // Bootstrap membership journal
+                    Application? app = GLib.Application.get_default() as Application;
+                    if (app != null && app.plugin_registry.x3dhpq_group_manager != null) {
+                        yield app.plugin_registry.x3dhpq_group_manager.ensure_private_group_bootstrapped(account, conference.jid);
+                    }
                 }
             }
 
-            stream_interactor.get_module(MucManager.IDENTITY).add_bookmark(account, conference);
+            // join() already persists/updates the bookmark via set_autojoin().
+            // Adding it again here creates a duplicate entry for the same room.
+            if (!should_join) {
+                stream_interactor.get_module(MucManager.IDENTITY).add_bookmark(account, conference);
+            }
             close();
         } catch (Error e) {
             warning("Failed to create groupchat: %s", e.message);

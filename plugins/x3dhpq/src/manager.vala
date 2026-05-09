@@ -6,7 +6,7 @@ using Xmpp.Xep;
 
 namespace Dino.Plugins.X3dhpq {
 
-public class Manager : Object {
+public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     private Dino.Application app;
     private Database db;
     private HashMap<Entities.Message, Conversation> pending_messages = new HashMap<Entities.Message, Conversation>(Entities.Message.hash_func, Entities.Message.equals_func);
@@ -1053,6 +1053,145 @@ public class Manager : Object {
             Memory.copy((uint8*) buf + 35, mldsa_pub, mldsa_pub.length);
         }
         return buf;
+    }
+
+    // Bootstrap x3dhpq on a newly created private group.
+    // Publishes the genesis journal entry (seq=0 AddMember[self]) so that
+    // has_membership_journal() returns true immediately and the first
+    // outbound group message is not refused.
+    public async bool ensure_private_group_bootstrapped(Dino.Entities.Account account, Jid room_jid) {
+        XmppStream? stream = app.stream_interactor.get_stream(account);
+        StreamModule? module = app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
+        if (stream == null || module == null) {
+            return false;
+        }
+        string room_jid_str = room_jid.bare_jid.to_string();
+        if (db.has_membership_journal(account, room_jid_str)) {
+            return true;
+        }
+        db.ensure_local_identity(account);
+        db.ensure_local_prekeys(account);
+        uint8[] aik_ed = bytes_to_uint8_array(db.get_local_identity_bytes(account, db.account_identity.aik_pub_ed25519_base64));
+        uint8[] aik_mldsa = bytes_to_uint8_array(db.get_local_identity_bytes(account, db.account_identity.aik_pub_mldsa_base64));
+        uint8[] canonical_aik = Manager.build_canonical_aik_bytes_static(aik_ed, aik_mldsa);
+        uint8[] aik_fp_raw = null;
+        try {
+            Bytes fp_bytes = global::X3dhpq.Crypto.blake2b160(new Bytes(canonical_aik));
+            aik_fp_raw = bytes_to_uint8_array(fp_bytes);
+        } catch (GLib.Error e) {
+            return false;
+        }
+        try {
+            Protocol.MemberAuditEntry entry = new Protocol.MemberAuditEntry();
+            entry.seq = 0;
+            entry.prev_hash = new uint8[32];
+            entry.action = (uint8) Protocol.MemberAuditAction.ADD_MEMBER;
+            entry.payload = Protocol.MemberAuditEntry.build_member_payload(aik_fp_raw, 1);
+            entry.timestamp = new DateTime.now_utc().to_unix();
+            try {
+                uint8[] sp = entry.signed_part();
+                Bytes aik_priv_ed = bytes_from_base64((!) db.get_local_identity_string(account, db.account_identity.aik_priv_ed25519_base64));
+                Bytes aik_priv_mldsa = bytes_from_base64((!) db.get_local_identity_string(account, db.account_identity.aik_priv_mldsa_base64));
+                entry.signature = bytes_to_uint8_array(
+                    global::X3dhpq.Crypto.ed25519_sign(aik_priv_ed, new Bytes(sp)));
+                entry.mldsa_signature = bytes_to_uint8_array(
+                    global::X3dhpq.Crypto.mldsa65_sign(aik_priv_mldsa, new Bytes(sp)));
+            } catch (GLib.Error e) {
+                return false;
+            }
+            if (!yield module.publish_membership_audit_entry(stream, room_jid.bare_jid, entry)) {
+                return false;
+            }
+            db.store_membership_journal_entry(account, room_jid_str, entry);
+            module.subscribe_to_group_node.begin((!) stream, room_jid.bare_jid, (obj, res) => {
+                module.subscribe_to_group_node.end(res);
+                module.fetch_group_items.begin((!) stream, room_jid.bare_jid);
+            });
+            return true;
+        } catch (GLib.Error e) {
+            return false;
+        }
+    }
+
+    public async bool add_private_group_member(Dino.Entities.Account account, Jid room_jid, Jid member_jid) {
+        XmppStream? stream = app.stream_interactor.get_stream(account);
+        StreamModule? module = app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
+        if (stream == null || module == null) {
+            return false;
+        }
+        if (!yield ensure_private_group_bootstrapped(account, room_jid)) {
+            return false;
+        }
+        if (!(yield ensure_get_keys_for_jid(account, member_jid.bare_jid))) {
+            warning("x3dhpq member add failed for %s in %s: peer bundle unavailable",
+                member_jid.bare_jid.to_string(), room_jid.bare_jid.to_string());
+            return false;
+        }
+
+        uint8[] member_aik_fp_raw;
+        if (!db.get_peer_aik_fingerprint_raw(account, member_jid.bare_jid.to_string(), out member_aik_fp_raw)) {
+            warning("x3dhpq member add failed for %s in %s: peer AIK unavailable",
+                member_jid.bare_jid.to_string(), room_jid.bare_jid.to_string());
+            return false;
+        }
+
+        var entries = db.list_membership_journal_entries(account, room_jid.bare_jid.to_string());
+        bool is_active_member = false;
+        foreach (Protocol.MemberAuditEntry entry in entries) {
+            uint8[] aik_fp_raw;
+            uint32 epoch_after;
+            if (!Protocol.MemberAuditEntry.parse_member_payload(entry.payload, out aik_fp_raw, out epoch_after)) {
+                continue;
+            }
+            bool same_member = aik_fp_raw.length == member_aik_fp_raw.length;
+            for (int i = 0; same_member && i < aik_fp_raw.length; i++) {
+                if (aik_fp_raw[i] != member_aik_fp_raw[i]) same_member = false;
+            }
+            if (!same_member) continue;
+            if (entry.action == (uint8) Protocol.MemberAuditAction.ADD_MEMBER) {
+                is_active_member = true;
+            } else if (entry.action == (uint8) Protocol.MemberAuditAction.REMOVE_MEMBER) {
+                is_active_member = false;
+            }
+        }
+        if (is_active_member) {
+            return true;
+        }
+
+        uint64 next_seq = 0;
+        uint8[] prev_hash = new uint8[32];
+        if (entries.size > 0) {
+            Protocol.MemberAuditEntry last_entry = entries[entries.size - 1];
+            next_seq = last_entry.seq + 1;
+            prev_hash = last_entry.compute_hash();
+        }
+
+        Bytes owner_aik_priv_ed = bytes_from_base64((!) db.get_local_identity_string(account, db.account_identity.aik_priv_ed25519_base64));
+        Bytes owner_aik_priv_mldsa = bytes_from_base64((!) db.get_local_identity_string(account, db.account_identity.aik_priv_mldsa_base64));
+        Protocol.MemberAuditEntry stored_entry = new Protocol.MemberAuditEntry();
+        stored_entry.seq = next_seq;
+        stored_entry.prev_hash = prev_hash;
+        stored_entry.action = (uint8) Protocol.MemberAuditAction.ADD_MEMBER;
+        stored_entry.payload = Protocol.MemberAuditEntry.build_member_payload(member_aik_fp_raw, 1);
+        stored_entry.timestamp = new DateTime.now_utc().to_unix();
+        try {
+            uint8[] sp = stored_entry.signed_part();
+            stored_entry.signature = bytes_to_uint8_array(
+                global::X3dhpq.Crypto.ed25519_sign(owner_aik_priv_ed, new Bytes(sp)));
+            stored_entry.mldsa_signature = bytes_to_uint8_array(
+                global::X3dhpq.Crypto.mldsa65_sign(owner_aik_priv_mldsa, new Bytes(sp)));
+        } catch (GLib.Error e) {
+            warning("x3dhpq member add local signing failed for %s in %s: %s",
+                member_jid.bare_jid.to_string(), room_jid.bare_jid.to_string(), e.message);
+            return false;
+        }
+        if (!yield module.publish_membership_audit_entry(stream, room_jid.bare_jid, stored_entry)) {
+            warning("x3dhpq member add publish failed for %s in %s",
+                member_jid.bare_jid.to_string(), room_jid.bare_jid.to_string());
+            return false;
+        }
+        db.store_membership_journal_entry(account, room_jid.bare_jid.to_string(), stored_entry);
+        return true;
     }
 }
 

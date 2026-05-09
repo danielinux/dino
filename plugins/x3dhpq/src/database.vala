@@ -709,6 +709,32 @@ public class Database : Qlite.Database {
         }
     }
 
+    public bool get_peer_aik_fingerprint_raw(Account account, string bare_jid, out uint8[] fingerprint_raw) {
+        fingerprint_raw = {};
+        Row? row = get_peer_account_identity_row(account, bare_jid);
+        if (row == null || ((!) row)[peer_account_identity.aik_pub_ed25519_base64] == null || ((!) row)[peer_account_identity.aik_pub_mldsa_base64] == null) {
+            return false;
+        }
+        try {
+            Bytes ed25519 = bytes_from_base64(((!) row)[peer_account_identity.aik_pub_ed25519_base64]);
+            Bytes mldsa = bytes_from_base64(((!) row)[peer_account_identity.aik_pub_mldsa_base64]);
+            uint8[] ed25519_arr = bytes_to_uint8_array(ed25519);
+            uint8[] mldsa_arr = bytes_to_uint8_array(mldsa);
+            uint8[] encoded = new uint8[3 + ed25519_arr.length + mldsa_arr.length];
+            encoded[0] = 0;
+            encoded[1] = 1;
+            encoded[2] = 1;
+            Memory.copy((uint8*) encoded + 3, ed25519_arr, ed25519_arr.length);
+            Memory.copy((uint8*) encoded + 3 + ed25519_arr.length, mldsa_arr, mldsa_arr.length);
+            Bytes digest = global::X3dhpq.Crypto.blake2b160(new Bytes(encoded));
+            fingerprint_raw = bytes_to_uint8_array(digest);
+            return true;
+        } catch (GLib.Error e) {
+            warning("Unable to compute raw x3dhpq peer fingerprint for %s: %s", bare_jid, e.message);
+            return false;
+        }
+    }
+
     public Gee.List<Row> get_local_one_time_pre_keys(Account account) {
         Gee.ArrayList<Row> rows = new Gee.ArrayList<Row>();
         RowIterator iterator = one_time_pre_key.select().with(one_time_pre_key.account_id, "=", account.id).iterator();

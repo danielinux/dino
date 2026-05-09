@@ -18,6 +18,18 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
         }
 
         PreferencesGroup group = new PreferencesGroup() { title = "x3dhpq" };
+        var default_row = new SwitchRow() {
+            title = "Use x3dhpq by Default for Private Conversations",
+            subtitle = "Start new one-to-one conversations with x3dhpq selected and turn off OMEMO-by-default.",
+            use_underline = true
+        };
+        plugin.app.settings.bind_property(
+            "default-private-x3dhpq",
+            default_row,
+            "active",
+            BindingFlags.SYNC_CREATE | BindingFlags.BIDIRECTIONAL
+        );
+        group.add(default_row);
         string fingerprint = plugin.db.get_aik_fingerprint(account) ?? "Unavailable";
         int? device_id = plugin.db.get_local_device_id(account);
 
@@ -31,7 +43,7 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
         });
         group.add(new ActionRow() {
             title = "Status",
-            subtitle = "wolfSSL-backed keys, x3dhpq PEP publication, pairwise PQXDH sessions, and message envelopes are active. Audit, pairing/recovery, and dedicated group sender chains are still pending.",
+            subtitle = "wolfSSL-backed keys, x3dhpq PEP publication, pairwise PQXDH sessions, private-group membership journal handling, and dedicated group sender chains are active. Pairing/recovery flows and fuller audit UX are still pending.",
         });
 
         return group;
