@@ -45,6 +45,12 @@ public class StreamModule : XmppStreamModule {
     public signal void pair_message_received(uint8[] sid, Jid from_jid, Protocol.PairingMsg msg);
     // Emitted when a headline <verify-device> push arrives from the server.
     public signal void verify_device_received(Jid new_resource, uint device_id);
+    // Emitted when a <pair-hello> rendezvous item arrives via self-PEP +notify
+    // on our own pair:0 node (XEP §10.1a method B). Carries the joining device's
+    // full JID, its device-id, and the shared pairing sid (raw 32 bytes). The
+    // existing device reacts by initiating the pairing FSM (PAKE1) toward the
+    // full JID using this sid.
+    public signal void pair_hello_received(Jid new_full_jid, uint device_id, uint8[] sid);
     // Emitted for each verified account audit entry (action code + human detail).
     public signal void account_audit_event(int action, string detail);
 
@@ -79,6 +85,13 @@ public class StreamModule : XmppStreamModule {
         pubsub.add_filtered_notification(stream, Protocol.NS_GROUP, (stream, jid, id, node) => {
             handle_group_event(stream, jid, id, node);
         }, null, null);
+        // Self-PEP pairing rendezvous (XEP §10.1a method B). Registering the
+        // filtered notification also advertises `urn:xmppqr:x3dhpq:pair:0+notify`
+        // in our disco#info, so the server auto-subscribes the account's own
+        // resources and delivers a joining device's <pair-hello> to us.
+        pubsub.add_filtered_notification(stream, Protocol.NS_PAIR, (stream, jid, id, node) => {
+            handle_pair_hello_event(stream, jid, id, node);
+        }, null, null);
 
         attached_stream = stream;
         stream.get_module(Xmpp.MessageModule.IDENTITY).received_message.connect(on_received_message);
@@ -99,6 +112,7 @@ public class StreamModule : XmppStreamModule {
         pubsub.remove_filtered_notification(stream, Protocol.NS_BUNDLE);
         pubsub.remove_filtered_notification(stream, Protocol.NS_AUDIT);
         pubsub.remove_filtered_notification(stream, Protocol.NS_GROUP);
+        pubsub.remove_filtered_notification(stream, Protocol.NS_PAIR);
 
         stream.get_module(Xmpp.MessageModule.IDENTITY).received_message.disconnect(on_received_message);
         attached_stream = null;
@@ -582,6 +596,42 @@ public class StreamModule : XmppStreamModule {
             return;
         }
         membership_entry_received(room_jid, id, payload);
+    }
+
+    private void handle_pair_hello_event(XmppStream stream, Jid from, string? id, StanzaNode? item_node) {
+        // XEP §10.1a method B: a device on THIS account published a <pair-hello>
+        // rendezvous item to our own pair:0 PEP node, delivered here via self-PEP
+        // +notify. Only self-PEP is meaningful; ignore anything else.
+        if (!from.bare_jid.equals(account.bare_jid)) {
+            return;
+        }
+        if (item_node == null || item_node.name != "pair-hello") {
+            return;
+        }
+        string? full_jid_str  = item_node.get_attribute("full-jid");
+        string? device_id_str = item_node.get_attribute("device-id");
+        string? sid_b64url    = item_node.get_attribute("sid");
+        if (full_jid_str == null || device_id_str == null || sid_b64url == null) {
+            warning("handle_pair_hello_event: missing full-jid, device-id or sid attribute");
+            return;
+        }
+        Jid new_full_jid;
+        try {
+            new_full_jid = new Jid(full_jid_str);
+        } catch (InvalidJidError e) {
+            warning("handle_pair_hello_event: invalid full-jid '%s': %s", full_jid_str, e.message);
+            return;
+        }
+        // Ignore our own echo: the publishing (new) device also receives its own
+        // PEP event; only a different resource should act as the existing device.
+        Bind.Flag? bind_flag = stream.get_flag(Bind.Flag.IDENTITY);
+        Jid? my_jid = bind_flag != null ? bind_flag.my_jid : null;
+        if (my_jid != null && my_jid.equals(new_full_jid)) {
+            return;
+        }
+        uint device_id = (uint) int64.parse(device_id_str);
+        uint8[] sid = base64url_decode(sid_b64url);
+        pair_hello_received(new_full_jid, device_id, sid);
     }
 
     // Owner-side helper: sign and publish an AddMember or RemoveMember audit entry
