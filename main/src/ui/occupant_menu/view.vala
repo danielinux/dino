@@ -144,7 +144,29 @@ public class View : Popover {
     private void kick_button_clicked() {
         if (selected_jid == null) return;
 
-        stream_interactor.get_module(MucManager.IDENTITY).kick(conversation.account, conversation.counterpart, selected_jid.resourcepart);
+        Jid occupant = selected_jid;
+        stream_interactor.get_module(MucManager.IDENTITY).kick(conversation.account, conversation.counterpart, occupant.resourcepart);
+        // For x3dhpq private channels, kicking must also revoke the member from
+        // the cryptographic membership journal and rotate the group epoch so
+        // the removed device can no longer read future group messages.
+        remove_x3dhpq_member.begin(occupant);
+    }
+
+    private async void remove_x3dhpq_member(Jid occupant) {
+        var muc_manager = stream_interactor.get_module(MucManager.IDENTITY);
+        if (!muc_manager.is_private_room(conversation.account, conversation.counterpart)) {
+            return;
+        }
+        Jid? real_jid = muc_manager.get_real_jid(occupant, conversation.account);
+        if (real_jid == null) {
+            return;
+        }
+        Application? app = GLib.Application.get_default() as Application;
+        if (app == null || app.plugin_registry.x3dhpq_group_manager == null) {
+            return;
+        }
+        yield app.plugin_registry.x3dhpq_group_manager.remove_private_group_member(
+            conversation.account, conversation.counterpart, real_jid.bare_jid);
     }
 
     private void voice_button_clicked(string role) {

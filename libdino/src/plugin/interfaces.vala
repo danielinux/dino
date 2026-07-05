@@ -120,6 +120,7 @@ public interface VideoCallPlugin : Object {
 public interface X3dhpqGroupManager : Object {
     public abstract async bool ensure_private_group_bootstrapped(Dino.Entities.Account account, Jid room_jid);
     public abstract async bool add_private_group_member(Dino.Entities.Account account, Jid room_jid, Jid member_jid);
+    public abstract async bool remove_private_group_member(Dino.Entities.Account account, Jid room_jid, Jid member_jid);
 }
 
 public interface VideoCallWidget : Object {
