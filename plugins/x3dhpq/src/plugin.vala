@@ -66,8 +66,20 @@ public class Plugin : RootInterface, Object {
             return false;
         }
 
+        // Fast pre-check: Entity Caps advertises the x3dhpq feature.
         Dino.EntityInfo entity_info = app.stream_interactor.get_module(Dino.EntityInfo.IDENTITY);
-        return entity_info.has_feature_offline(conversation.account, conversation.counterpart, Protocol.NS_X3DHPQ);
+        if (entity_info.has_feature_offline(conversation.account, conversation.counterpart, Protocol.NS_X3DHPQ)) {
+            return true;
+        }
+
+        // Definitive capability signal (XEP §15.3, matching the reference):
+        // the presence of a published, usable devicelist. Entity Caps can be
+        // absent or stale (peer offline, caps not yet fetched, disco cache miss)
+        // even when the peer actively publishes x3dhpq keys, so a cached
+        // devicelist carrying at least one device is authoritative.
+        string bare = conversation.counterpart.bare_jid.to_string();
+        return db.has_remote_device_list(conversation.account, bare)
+            && db.get_remote_device_ids(conversation.account, bare).size > 0;
     }
 }
 
