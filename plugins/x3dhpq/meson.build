@@ -26,13 +26,21 @@ sources = files(
     'src/protocol/groupmsg.vala',
     'src/protocol/groupsession.vala',
     'src/protocol/groupshare.vala',
+    'src/protocol/account_audit.vala',
     'src/protocol/membership_journal.vala',
+    'src/protocol/pairing_msg.vala',
     'src/protocol/pairwise.vala',
+    'src/protocol/cpace.vala',
+    'src/protocol/pairing_code.vala',
+    'src/protocol/pairing.vala',
     'src/protocol/namespaces.vala',
     'src/protocol/senderchain.vala',
     'src/register_plugin.vala',
     'src/stream_module.vala',
     'src/util.vala',
+    'src/ui/self_devices_widget.vala',
+    'src/ui/pair_new_device_dialog.vala',
+    'src/ui/pair_to_existing_dialog.vala',
     'src/native/wolfssl.vala',
     'src/native/wolfssl_helper.c',
 )
@@ -67,6 +75,11 @@ test_sources = [
     'tests/pairwise.vala',
     'tests/groupsession.vala',
     'tests/membership_journal.vala',
+    'tests/pairing_code.vala',
+    'tests/pairing_msg.vala',
+    'tests/cpace.vala',
+    'tests/account_audit.vala',
+    'tests/pairing.vala',
 ]
 
 exe_x3dhpq_test = executable(

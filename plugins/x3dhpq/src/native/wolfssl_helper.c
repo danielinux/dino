@@ -11,6 +11,7 @@
 #include <wolfssl/wolfcrypt/error-crypt.h>
 #include <wolfssl/wolfcrypt/hash.h>
 #include <wolfssl/wolfcrypt/hmac.h>
+#include <wolfssl/wolfcrypt/integer.h>
 #include <wolfssl/wolfcrypt/pwdbased.h>
 #include <wolfssl/wolfcrypt/random.h>
 #include <wolfssl/wolfcrypt/wc_mlkem.h>
@@ -827,4 +828,294 @@ x3dhpq_wolfssl_aes256gcm_encrypt(GBytes* key, GBytes* nonce, GBytes* plaintext, 
 GBytes*
 x3dhpq_wolfssl_aes256gcm_decrypt(GBytes* key, GBytes* nonce, GBytes* ciphertext_and_tag, GBytes* aad, GError** error) {
     return aes_256_gcm_common(FALSE, key, nonce, ciphertext_and_tag, aad, error);
+}
+
+/* ---------------------------------------------------------------------------
+ * hash_to_curve_x25519: curve25519_XMD:SHA-512_ELL2_NU_ per RFC 9380 §6.7.
+ *
+ * expand_message_xmd(msg, dst, 48) → 48-byte uniform bytes
+ * u = OS2IP(bytes) mod p, where p = 2^255 - 19
+ * x = Elligator2 map_to_curve(u)
+ * return little-endian 32-byte encoding of x
+ * ---------------------------------------------------------------------------*/
+
+/* expand_message_xmd with SHA-512 (b_in_bytes=64, s_in_bytes=128).
+ * RFC 9380 §5.4.1.  lenInBytes must be <= 64 (one output block). */
+static int
+expand_message_xmd_sha512(const guchar* msg, gsize msg_len,
+                           const guchar* dst, gsize dst_len,
+                           guchar* out, gsize len_in_bytes)
+{
+    /* DST prime = DST || I2OSP(len(DST), 1) */
+    guchar dst_prime[256];
+    gsize dst_prime_len;
+    guchar z_pad[128]; /* SHA-512 block size */
+    guchar len_i_b[2];
+    guchar b0[WC_SHA512_DIGEST_SIZE];
+    guchar b1[WC_SHA512_DIGEST_SIZE];
+    int rc;
+
+    if (dst_len > 255) {
+        return BAD_FUNC_ARG;
+    }
+    memcpy(dst_prime, dst, dst_len);
+    dst_prime[dst_len] = (guchar) dst_len;
+    dst_prime_len = dst_len + 1;
+
+    memset(z_pad, 0, sizeof(z_pad));
+
+    len_i_b[0] = (guchar)(len_in_bytes >> 8);
+    len_i_b[1] = (guchar) len_in_bytes;
+
+    /* b0 = SHA-512(Z_pad || msg || l_i_b_str || 0x00 || DST_prime) */
+    {
+        wc_Sha512 sha;
+        rc = wc_InitSha512(&sha);
+        if (rc == 0) rc = wc_Sha512Update(&sha, z_pad, sizeof(z_pad));
+        if (rc == 0) rc = wc_Sha512Update(&sha, msg, (word32) msg_len);
+        if (rc == 0) rc = wc_Sha512Update(&sha, len_i_b, 2);
+        if (rc == 0) rc = wc_Sha512Update(&sha, (guchar*)"\x00", 1);
+        if (rc == 0) rc = wc_Sha512Update(&sha, dst_prime, (word32) dst_prime_len);
+        if (rc == 0) rc = wc_Sha512Final(&sha, b0);
+        wc_Sha512Free(&sha);
+    }
+    if (rc != 0) return rc;
+
+    /* b1 = SHA-512(b0 || 0x01 || DST_prime) */
+    {
+        wc_Sha512 sha;
+        rc = wc_InitSha512(&sha);
+        if (rc == 0) rc = wc_Sha512Update(&sha, b0, sizeof(b0));
+        if (rc == 0) rc = wc_Sha512Update(&sha, (guchar*)"\x01", 1);
+        if (rc == 0) rc = wc_Sha512Update(&sha, dst_prime, (word32) dst_prime_len);
+        if (rc == 0) rc = wc_Sha512Final(&sha, b1);
+        wc_Sha512Free(&sha);
+    }
+    if (rc != 0) return rc;
+
+    /* We only need len_in_bytes=48 which fits in one 64-byte block. */
+    if (len_in_bytes > (gsize) WC_SHA512_DIGEST_SIZE) {
+        return BAD_FUNC_ARG;
+    }
+    memcpy(out, b1, len_in_bytes);
+    return 0;
+}
+
+/* p = 2^255 - 19 big-endian */
+static const guchar p25519_be[32] = {
+    0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xed,
+};
+
+/* is_square_gfp: Euler's criterion — returns 1 if u is a quadratic residue mod p */
+static int
+is_square_gfp(mp_int* u, mp_int* p, mp_int* p_minus1_over2, mp_int* tmp)
+{
+    int rc = mp_exptmod(u, p_minus1_over2, p, tmp);
+    if (rc != 0) return -1;
+    /* square if result is 0 or 1 */
+    if (mp_iszero(tmp) == MP_YES) return 1;
+    if (mp_cmp_d(tmp, 1) == MP_EQ) return 1;
+    return 0;
+}
+
+GBytes*
+x3dhpq_wolfssl_hash_to_curve_x25519(GBytes* msg, GBytes* dst, GError** error)
+{
+    gsize msg_len = 0;
+    gsize dst_len = 0;
+    const guchar* msg_data = bytes_data(msg, &msg_len);
+    const guchar* dst_data = bytes_data(dst, &dst_len);
+
+    guchar uniform[48];
+    int rc;
+
+    /* Step 1: expand_message_xmd(msg, dst, 48) */
+    rc = expand_message_xmd_sha512(msg_data, msg_len, dst_data, dst_len, uniform, 48);
+    if (rc != 0) {
+        set_wc_error(error, rc, "hash_to_curve: expand_message_xmd failed");
+        return NULL;
+    }
+
+    /* Set up mp_int variables */
+    mp_int p, exp, u, tv1, tv2, denom, x1, x1sq, gx1, t, x, neg_a, tmp;
+    /* A = 486662 */
+    const mp_digit A_DIGIT = 486662;
+
+    rc  = mp_init(&p);
+    rc |= mp_init(&exp);
+    rc |= mp_init(&u);
+    rc |= mp_init(&tv1);
+    rc |= mp_init(&tv2);
+    rc |= mp_init(&denom);
+    rc |= mp_init(&x1);
+    rc |= mp_init(&x1sq);
+    rc |= mp_init(&gx1);
+    rc |= mp_init(&t);
+    rc |= mp_init(&x);
+    rc |= mp_init(&neg_a);
+    rc |= mp_init(&tmp);
+    if (rc != 0) {
+        set_wc_error(error, rc, "hash_to_curve: mp_init failed");
+        goto cleanup;
+    }
+
+    /* Load p = 2^255 - 19 */
+    rc = mp_read_unsigned_bin(&p, p25519_be, 32);
+    if (rc != 0) {
+        set_wc_error(error, rc, "hash_to_curve: mp_read p failed");
+        goto cleanup;
+    }
+
+    /* (p - 1) / 2 for Euler criterion — computed as p >> 1 (p is odd so this is exact) */
+    /* We use mp_mod then exptmod: actually build (p-1)/2 via submod + divide */
+    /* Simpler: read from known big-endian constant. p-1 = 2^255-20, /2 = 2^254-10.
+     * 2^254-10 big-endian: [0x3f,0xff,...,0xff,0xf6] */
+    {
+        static const guchar p_m1_o2_be[32] = {
+            0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf6,
+        };
+        rc = mp_read_unsigned_bin(&exp, p_m1_o2_be, 32);
+        if (rc != 0) {
+            set_wc_error(error, rc, "hash_to_curve: mp_read exp failed");
+            goto cleanup;
+        }
+    }
+
+    /* Step 2: u = OS2IP(uniform[0:48]) mod p
+     * The 48-byte big-endian value is already the right length. */
+    rc = mp_read_unsigned_bin(&u, uniform, 48);
+    if (rc != 0) {
+        set_wc_error(error, rc, "hash_to_curve: mp_read u failed");
+        goto cleanup;
+    }
+    rc = mp_mod(&u, &p, &u);
+    if (rc != 0) {
+        set_wc_error(error, rc, "hash_to_curve: mp_mod u failed");
+        goto cleanup;
+    }
+
+    /* Step 3: Elligator2 map_to_curve
+     * tv1 = u^2 mod p */
+    rc = mp_mulmod(&u, &u, &p, &tv1);
+    if (rc != 0) { set_wc_error(error, rc, "hash_to_curve: tv1 failed"); goto cleanup; }
+
+    /* tv2 = Z * tv1 mod p, Z=2 => tv2 = 2*tv1 mod p */
+    rc = mp_addmod(&tv1, &tv1, &p, &tv2);
+    if (rc != 0) { set_wc_error(error, rc, "hash_to_curve: tv2 failed"); goto cleanup; }
+
+    /* denom = 1 + tv2 mod p */
+    rc = mp_set(&tmp, 1);
+    if (rc != 0) { set_wc_error(error, rc, "hash_to_curve: mp_set 1 failed"); goto cleanup; }
+    rc = mp_addmod(&tmp, &tv2, &p, &denom);
+    if (rc != 0) { set_wc_error(error, rc, "hash_to_curve: denom failed"); goto cleanup; }
+
+    /* neg_a = (-A) mod p = p - A */
+    rc = mp_set(&neg_a, A_DIGIT);
+    if (rc != 0) { set_wc_error(error, rc, "hash_to_curve: mp_set A failed"); goto cleanup; }
+    rc = mp_submod(&p, &neg_a, &p, &neg_a);
+    if (rc != 0) { set_wc_error(error, rc, "hash_to_curve: neg_a failed"); goto cleanup; }
+
+    if (mp_iszero(&denom) == MP_YES) {
+        /* Special case: x1 = A */
+        rc = mp_set(&x1, A_DIGIT);
+        if (rc != 0) { set_wc_error(error, rc, "hash_to_curve: mp_set x1=A failed"); goto cleanup; }
+    } else {
+        /* x1 = (-A) * inv(denom) mod p */
+        rc = mp_invmod(&denom, &p, &t);
+        if (rc != 0) { set_wc_error(error, rc, "hash_to_curve: mp_invmod failed"); goto cleanup; }
+        rc = mp_mulmod(&neg_a, &t, &p, &x1);
+        if (rc != 0) { set_wc_error(error, rc, "hash_to_curve: x1 mulmod failed"); goto cleanup; }
+    }
+
+    /* x1sq = x1^2 mod p */
+    rc = mp_mulmod(&x1, &x1, &p, &x1sq);
+    if (rc != 0) { set_wc_error(error, rc, "hash_to_curve: x1sq failed"); goto cleanup; }
+
+    /* gx1 = x1^3 + A*x1^2 + x1 mod p
+     *      = x1sq*x1 + A*x1sq + x1 */
+    rc = mp_mulmod(&x1sq, &x1, &p, &gx1);   /* x1^3 */
+    if (rc != 0) { set_wc_error(error, rc, "hash_to_curve: gx1 x^3 failed"); goto cleanup; }
+
+    rc = mp_set(&t, A_DIGIT);
+    if (rc != 0) { set_wc_error(error, rc, "hash_to_curve: mp_set A for gx1 failed"); goto cleanup; }
+    rc = mp_mulmod(&t, &x1sq, &p, &t);      /* A*x1^2 */
+    if (rc != 0) { set_wc_error(error, rc, "hash_to_curve: A*x1sq failed"); goto cleanup; }
+    rc = mp_addmod(&gx1, &t, &p, &gx1);     /* x1^3 + A*x1^2 */
+    if (rc != 0) { set_wc_error(error, rc, "hash_to_curve: gx1 +A*x1sq failed"); goto cleanup; }
+    rc = mp_addmod(&gx1, &x1, &p, &gx1);   /* + x1 */
+    if (rc != 0) { set_wc_error(error, rc, "hash_to_curve: gx1 +x1 failed"); goto cleanup; }
+
+    /* if gx1 is a quadratic residue: x = x1, else x = -A - x1 mod p */
+    {
+        int sq = is_square_gfp(&gx1, &p, &exp, &tmp);
+        if (sq < 0) { set_wc_error(error, -1, "hash_to_curve: is_square failed"); goto cleanup; }
+        if (sq) {
+            rc = mp_copy(&x1, &x);
+            if (rc != 0) { set_wc_error(error, rc, "hash_to_curve: mp_copy x1 failed"); goto cleanup; }
+        } else {
+            /* x = -A - x1 mod p = (p - A - x1) mod p */
+            /* neg_a is already p - A */
+            rc = mp_submod(&neg_a, &x1, &p, &x);
+            if (rc != 0) { set_wc_error(error, rc, "hash_to_curve: x2 submod failed"); goto cleanup; }
+        }
+    }
+
+    /* Step 4: encode x as 32-byte little-endian */
+    {
+        guchar x_be[32];
+        guchar* out_buf;
+        int i;
+
+        /* mp_to_unsigned_bin writes big-endian; we need little-endian */
+        /* First get the big-endian bytes padded to 32 bytes */
+        rc = mp_to_unsigned_bin_len(&x, x_be, 32);
+        if (rc != 0) {
+            set_wc_error(error, rc, "hash_to_curve: mp_to_unsigned_bin_len failed");
+            goto cleanup;
+        }
+
+        out_buf = g_malloc(32);
+        /* Reverse byte order: big-endian → little-endian */
+        for (i = 0; i < 32; i++) {
+            out_buf[i] = x_be[31 - i];
+        }
+
+        mp_clear(&p);
+        mp_clear(&exp);
+        mp_clear(&u);
+        mp_clear(&tv1);
+        mp_clear(&tv2);
+        mp_clear(&denom);
+        mp_clear(&x1);
+        mp_clear(&x1sq);
+        mp_clear(&gx1);
+        mp_clear(&t);
+        mp_clear(&x);
+        mp_clear(&neg_a);
+        mp_clear(&tmp);
+
+        return new_bytes_take(out_buf, 32);
+    }
+
+cleanup:
+    mp_clear(&p);
+    mp_clear(&exp);
+    mp_clear(&u);
+    mp_clear(&tv1);
+    mp_clear(&tv2);
+    mp_clear(&denom);
+    mp_clear(&x1);
+    mp_clear(&x1sq);
+    mp_clear(&gx1);
+    mp_clear(&t);
+    mp_clear(&x);
+    mp_clear(&neg_a);
+    mp_clear(&tmp);
+    return NULL;
 }

@@ -146,7 +146,7 @@ private static uint8[] join_arrays(uint8[] a, uint8[] b) {
             Crypto.generate_mldsa65(out dik_pub_mldsa, out dik_priv_mldsa);
             device_certificate = DeviceCertificate.issue(1, dik_pub_ed25519, dik_pub_x25519, dik_pub_mldsa, aik_priv_ed25519, aik_priv_mldsa, 1);
             Crypto.generate_x25519(out spk_pub_x25519, out spk_priv_x25519);
-            spk_signature_ed25519 = Crypto.ed25519_sign(dik_priv_ed25519, new Bytes(Pairwise.join_arrays(Pairwise.u32be(spk_id), Pairwise.bytes_to_array(spk_pub_x25519))));
+            spk_signature_ed25519 = Crypto.ed25519_sign(dik_priv_ed25519, spk_pub_x25519);
             Crypto.generate_mlkem768(out kem_pub, out kem_priv);
             Crypto.generate_x25519(out opk_pub_x25519, out opk_priv_x25519);
         }

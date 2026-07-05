@@ -5,7 +5,7 @@ using Xmpp;
 namespace Dino.Plugins.X3dhpq {
 
 public class Database : Qlite.Database {
-    private const int VERSION = 3;
+    private const int VERSION = 4;
 
     public class AccountIdentityTable : Table {
         public Column<int> id = new Column.Integer("id") { primary_key = true, auto_increment = true };
@@ -238,19 +238,38 @@ public class Database : Qlite.Database {
     }
 
     public class PairingSessionTable : Table {
+        // Columns retired at schema version 4; kept for migration bookkeeping only.
+        public Column<int> _v3_account_id = new Column.Integer("account_id") { not_null = true, max_version = 3 };
+        public Column<string> _v3_session_id = new Column.NonNullText("session_id") { max_version = 3 };
+        public Column<string?> _v3_peer_resource = new Column.Text("peer_resource") { max_version = 3 };
+        public Column<string> _v3_state = new Column.NonNullText("state") { default = "created", max_version = 3 };
+        public Column<string?> _v3_transcript_base64 = new Column.Text("transcript_base64") { max_version = 3 };
+        public Column<long> _v3_created_at = new Column.Long("created_at") { not_null = true, max_version = 3 };
+        public Column<long> _v3_updated_at = new Column.Long("updated_at") { not_null = true, max_version = 3 };
+
         public Column<int> account_id = new Column.Integer("account_id") { not_null = true };
-        public Column<string> session_id = new Column.NonNullText("session_id");
-        public Column<string?> peer_resource = new Column.Text("peer_resource");
-        public Column<string> state = new Column.NonNullText("state") { default = "created" };
-        public Column<string?> transcript_base64 = new Column.Text("transcript_base64");
-        public Column<long> created_at = new Column.Long("created_at") { not_null = true };
-        public Column<long> updated_at = new Column.Long("updated_at") { not_null = true };
+        public Column<string> sid = new Column.NonNullText("sid") { primary_key = true };
+        public Column<int> role = new Column.Integer("role") { not_null = true };
+        public Column<string> peer_full_jid = new Column.NonNullText("peer_full_jid");
+        public Column<string> code = new Column.NonNullText("code");
+        public Column<long> started_at = new Column.Long("started_at") { not_null = true };
+        public Column<string?> state_blob = new Column.Text("state_blob");
 
         internal PairingSessionTable(Database db) {
             base(db, "pairing_session");
-            init({ account_id, session_id, peer_resource, state, transcript_base64, created_at, updated_at });
-            unique({ account_id, session_id });
+            init({ _v3_account_id, _v3_session_id, _v3_peer_resource, _v3_state, _v3_transcript_base64, _v3_created_at, _v3_updated_at,
+                   account_id, sid, role, peer_full_jid, code, started_at, state_blob });
         }
+    }
+
+    public class PairingSessionRow {
+        public int account_id;
+        public uint8[] sid;
+        public int role;
+        public string peer_full_jid;
+        public string code;
+        public int64 started_at;
+        public uint8[]? state_blob;
     }
 
     public AccountIdentityTable account_identity { get; private set; }
@@ -805,6 +824,28 @@ public class Database : Qlite.Database {
         }
     }
 
+    // Locally remove a single peer-device entry (and its bundle/session) for
+    // (account, bare_jid). Used by the self-devices "Remove" UX; does NOT
+    // republish a versioned devicelist. Caller is responsible for pruning the
+    // local device id from any subsequent devicelist re-publish.
+    public void remove_peer_device(Account account, string bare_jid, int device_id) {
+        peer_device.delete()
+            .with(peer_device.account_id, "=", account.id)
+            .with(peer_device.bare_jid, "=", bare_jid)
+            .with(peer_device.device_id, "=", device_id)
+            .perform();
+        bundle.delete()
+            .with(bundle.account_id, "=", account.id)
+            .with(bundle.bare_jid, "=", bare_jid)
+            .with(bundle.device_id, "=", device_id)
+            .perform();
+        pairwise_session.delete()
+            .with(pairwise_session.account_id, "=", account.id)
+            .with(pairwise_session.bare_jid, "=", bare_jid)
+            .with(pairwise_session.device_id, "=", device_id)
+            .perform();
+    }
+
     public void forget_peer(Account account, string bare_jid) {
         device_list.delete()
             .with(device_list.account_id, "=", account.id)
@@ -1125,6 +1166,66 @@ public class Database : Qlite.Database {
             .value(peer_account_identity.created_at, created_at)
             .value(peer_account_identity.updated_at, (long) new DateTime.now_utc().to_unix())
             .perform();
+    }
+
+    public override void migrate(long old_version) {
+        if (old_version < 4) {
+            try {
+                exec("DROP TABLE IF EXISTS pairing_session");
+                exec("CREATE TABLE pairing_session (account_id INTEGER NOT NULL, sid TEXT NOT NULL PRIMARY KEY, role INTEGER NOT NULL, peer_full_jid TEXT NOT NULL, code TEXT NOT NULL, started_at INTEGER NOT NULL, state_blob TEXT)");
+            } catch (Error e) {
+                error("x3dhpq migrate pairing_session: %s", e.message);
+            }
+        }
+    }
+
+    public void persist_pairing_session(int account_id, uint8[] sid, int role, string peer_full_jid, string code, int64 started_at, uint8[]? state_blob) {
+        pairing_session.upsert()
+            .value(pairing_session.sid, Base64.encode(sid), true)
+            .value(pairing_session.account_id, account_id)
+            .value(pairing_session.role, role)
+            .value(pairing_session.peer_full_jid, peer_full_jid)
+            .value(pairing_session.code, code)
+            .value(pairing_session.started_at, (long) started_at)
+            .value(pairing_session.state_blob, state_blob != null ? Base64.encode(state_blob) : null)
+            .perform();
+    }
+
+    public bool load_pairing_session(uint8[] sid, out PairingSessionRow row) {
+        row = new PairingSessionRow();
+        string sid_b64 = Base64.encode(sid);
+        Row? r = pairing_session.row_with(pairing_session.sid, sid_b64).inner;
+        if (r == null) return false;
+        row.account_id = ((!) r)[pairing_session.account_id];
+        row.sid = Base64.decode(((!) r)[pairing_session.sid]);
+        row.role = ((!) r)[pairing_session.role];
+        row.peer_full_jid = ((!) r)[pairing_session.peer_full_jid];
+        row.code = ((!) r)[pairing_session.code];
+        row.started_at = (int64) ((!) r)[pairing_session.started_at];
+        string? sb = ((!) r)[pairing_session.state_blob];
+        row.state_blob = sb != null ? Base64.decode(sb) : null;
+        return true;
+    }
+
+    public void update_pairing_state(uint8[] sid, uint8[] state_blob) {
+        pairing_session.update()
+            .with(pairing_session.sid, "=", Base64.encode(sid))
+            .set(pairing_session.state_blob, Base64.encode(state_blob))
+            .perform();
+    }
+
+    public void delete_pairing_session(uint8[] sid) {
+        pairing_session.delete()
+            .with(pairing_session.sid, "=", Base64.encode(sid))
+            .perform();
+    }
+
+    public void sweep_expired_pairing_sessions(int64 now_unix, int ttl_seconds = 60) {
+        try {
+            exec(@"DELETE FROM pairing_session WHERE started_at + $ttl_seconds < $now_unix");
+        } catch (Error e) {
+            warning("x3dhpq sweep_expired_pairing_sessions: %s", e.message);
+        }
     }
 }
 

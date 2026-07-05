@@ -51,6 +51,9 @@ public static extern Bytes sha256(Bytes message) throws GLib.Error;
 [CCode (cheader_filename = "native/wolfssl_helper.h", cname = "x3dhpq_wolfssl_sha512")]
 public static extern Bytes sha512(Bytes message) throws GLib.Error;
 
+[CCode (cheader_filename = "native/wolfssl_helper.h", cname = "x3dhpq_wolfssl_hash_to_curve_x25519")]
+public static extern Bytes hash_to_curve_x25519(Bytes msg, Bytes dst) throws GLib.Error;
+
 [CCode (cheader_filename = "native/wolfssl_helper.h", cname = "x3dhpq_wolfssl_blake2b160")]
 public static extern Bytes blake2b160(Bytes message) throws GLib.Error;
 

@@ -32,4 +32,6 @@ GBytes* x3dhpq_wolfssl_scrypt(GBytes* password, GBytes* salt, guint64 cost, guin
 GBytes* x3dhpq_wolfssl_aes256gcm_encrypt(GBytes* key, GBytes* nonce, GBytes* plaintext, GBytes* aad, GError** error);
 GBytes* x3dhpq_wolfssl_aes256gcm_decrypt(GBytes* key, GBytes* nonce, GBytes* ciphertext_and_tag, GBytes* aad, GError** error);
 
+GBytes* x3dhpq_wolfssl_hash_to_curve_x25519(GBytes* msg, GBytes* dst, GError** error);
+
 #endif

@@ -1,5 +1,6 @@
 using Adw;
 using Dino.Entities;
+using Xmpp;
 
 namespace Dino.Plugins.X3dhpq {
 
@@ -30,23 +31,29 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
             BindingFlags.SYNC_CREATE | BindingFlags.BIDIRECTIONAL
         );
         group.add(default_row);
-        string fingerprint = plugin.db.get_aik_fingerprint(account) ?? "Unavailable";
-        int? device_id = plugin.db.get_local_device_id(account);
 
-        group.add(new ActionRow() {
-            title = "Account fingerprint",
-            subtitle = fingerprint,
+        var devices_widget = new UI.SelfDevicesWidget(plugin.db, account);
+        devices_widget.add_device_requested.connect(() => {
+            launch_pair_dialog(account, devices_widget);
         });
-        group.add(new ActionRow() {
-            title = "Local device id",
-            subtitle = device_id != null ? ((!) device_id).to_string() : "Unavailable",
-        });
-        group.add(new ActionRow() {
-            title = "Status",
-            subtitle = "wolfSSL-backed keys, x3dhpq PEP publication, pairwise PQXDH sessions, private-group membership journal handling, and dedicated group sender chains are active. Pairing/recovery flows and fuller audit UX are still pending.",
-        });
+        group.add(devices_widget);
 
         return group;
+    }
+
+    private void launch_pair_dialog(Account account, Gtk.Widget anchor) {
+        StreamModule? module = plugin.app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
+        if (module == null) {
+            warning("x3dhpq: no StreamModule for account; cannot open pair dialog");
+            return;
+        }
+        XmppStream? stream = plugin.app.stream_interactor.get_stream(account);
+
+        Gtk.Root? root = anchor.get_root();
+        Gtk.Window? parent = (root as Gtk.Window);
+
+        var dialog = new UI.PairNewDeviceDialog(parent, plugin.db, account, module, stream);
+        dialog.present();
     }
 }
 

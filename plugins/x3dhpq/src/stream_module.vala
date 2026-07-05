@@ -6,12 +6,32 @@ using Xmpp.Xep;
 
 namespace Dino.Plugins.X3dhpq {
 
+// Lightweight record that tracks an active pairing session registered by the UI dialogs.
+private class PairSessionRecord {
+    public Jid peer_bare;
+    public int role;
+    public PairSessionRecord(Jid peer_bare, int role) {
+        this.peer_bare = peer_bare;
+        this.role = role;
+    }
+}
+
 public class StreamModule : XmppStreamModule {
     public static Xmpp.ModuleIdentity<StreamModule> IDENTITY = new Xmpp.ModuleIdentity<StreamModule>(Protocol.NS_X3DHPQ, "x3dhpq_stream_module");
     private static Pubsub.PublishOptions PUBLISH_OPTIONS = new Pubsub.PublishOptions()
         .set_persist_items(true)
         .set_access_model(Pubsub.ACCESS_MODEL_OPEN);
     private HashMap<Jid, Future<ArrayList<int>>> active_devicelist_requests = new HashMap<Jid, Future<ArrayList<int>>>(Jid.hash_func, Jid.equals_func);
+
+    // pair stanza step counters keyed by base64(sid)
+    private HashMap<string, uint> pair_step_counters = new HashMap<string, uint>();
+    // active pairing sessions registered by the UI dialogs
+    private HashMap<string, PairSessionRecord> pair_sessions = new HashMap<string, PairSessionRecord>();
+    // per-account audit chain verifier (lazily initialised on first audit event)
+    private Protocol.AccountAuditChain? audit_chain = null;
+
+    // XmppStream reference stored at attach() for message-received connection
+    private XmppStream? attached_stream = null;
 
     private Account account;
     private Database db;
@@ -20,6 +40,13 @@ public class StreamModule : XmppStreamModule {
     public signal void bundle_fetched(Jid jid, int device_id, StanzaNode bundle);
     public signal void audit_entry_received(Jid from, string? id, string b64_payload);
     public signal void membership_entry_received(Jid room_jid, string? id, string b64_payload);
+
+    // Emitted when a <pair> message arrives from a peer.
+    public signal void pair_message_received(uint8[] sid, Jid from_jid, Protocol.PairingMsg msg);
+    // Emitted when a headline <verify-device> push arrives from the server.
+    public signal void verify_device_received(Jid new_resource, uint device_id);
+    // Emitted for each verified account audit entry (action code + human detail).
+    public signal void account_audit_event(int action, string detail);
 
     public StreamModule(Account account, Database db) {
         this.account = account;
@@ -52,6 +79,9 @@ public class StreamModule : XmppStreamModule {
         pubsub.add_filtered_notification(stream, Protocol.NS_GROUP, (stream, jid, id, node) => {
             handle_group_event(stream, jid, id, node);
         }, null, null);
+
+        attached_stream = stream;
+        stream.get_module(Xmpp.MessageModule.IDENTITY).received_message.connect(on_received_message);
     }
 
     public override void detach(XmppStream stream) {
@@ -69,6 +99,9 @@ public class StreamModule : XmppStreamModule {
         pubsub.remove_filtered_notification(stream, Protocol.NS_BUNDLE);
         pubsub.remove_filtered_notification(stream, Protocol.NS_AUDIT);
         pubsub.remove_filtered_notification(stream, Protocol.NS_GROUP);
+
+        stream.get_module(Xmpp.MessageModule.IDENTITY).received_message.disconnect(on_received_message);
+        attached_stream = null;
     }
 
     public async void publish_current_state(XmppStream stream) {
@@ -269,13 +302,48 @@ public class StreamModule : XmppStreamModule {
 
     private void handle_audit_event(XmppStream stream, Jid from, string? id, StanzaNode? item_node) {
         // X3DHPQ XEP §11. Server is transport-only; client verifies the chain.
-        // Until full audit-chain verification lands, surface the opaque payload
-        // so higher layers (manager / UI) can store and inspect it.
+        // Surface the opaque payload so higher layers can store and inspect it,
+        // and also route through AccountAuditChain for verification.
         string? payload = item_node != null ? item_node.get_string_content() : null;
         if (payload == null) {
             return;
         }
         audit_entry_received(from, id, payload);
+
+        // Route through AccountAuditChain if we have local AIK material.
+        // The chain is lazily created the first time an audit event arrives.
+        uint8[] raw = Base64.decode(payload);
+        Protocol.AuditEntry? entry = Protocol.AuditEntry.unmarshal(raw);
+        if (entry == null) {
+            warning("handle_audit_event: failed to unmarshal AuditEntry from %s", from.to_string());
+            return;
+        }
+        Row? identity_row = db.get_local_identity(account.id);
+        if (identity_row == null) {
+            return;
+        }
+        string? aik_ed_b64   = identity_row[db.account_identity.aik_pub_ed25519_base64];
+        string? aik_ml_b64   = identity_row[db.account_identity.aik_pub_mldsa_base64];
+        if (aik_ed_b64 == null || aik_ml_b64 == null) {
+            return;
+        }
+        Bytes aik_ed  = bytes_from_base64(aik_ed_b64);
+        Bytes aik_ml  = bytes_from_base64(aik_ml_b64);
+
+        if (audit_chain == null) {
+            audit_chain = new Protocol.AccountAuditChain(db);
+            audit_chain.audit_entry_observed.connect((action, detail) => {
+                account_audit_event(action, detail);
+            });
+        }
+
+        var entries = new Gee.ArrayList<Protocol.AuditEntry>();
+        entries.add(entry);
+        try {
+            audit_chain.verify_and_apply(account.id, aik_ed, aik_ml, entries);
+        } catch (Protocol.AccountAuditError e) {
+            warning("handle_audit_event: chain verification failed: %s", e.message);
+        }
     }
 
     private void handle_group_event(XmppStream stream, Jid room_jid, string? id, StanzaNode? item_node) {
@@ -408,6 +476,147 @@ public class StreamModule : XmppStreamModule {
     public async bool publish_membership_audit_entry(XmppStream stream, Jid room_jid, Protocol.MemberAuditEntry entry) {
         string b64 = Base64.encode(entry.marshal());
         return yield publish_membership_entry(stream, room_jid, entry.seq.to_string(), b64);
+    }
+
+    // ── New public API ─────────────────────────────────────────────────────────
+
+    // Register an active pairing session so the inbound message handler can
+    // route <pair> messages to the correct dialog. The actual FSM lives in the
+    // dialog; this just stores the mapping.
+    public void register_pair_session(uint8[] sid, Jid peer_bare, int role) {
+        string key = Base64.encode(sid);
+        pair_sessions[key] = new PairSessionRecord(peer_bare, role);
+    }
+
+    // Send a <pair> chat message to peer carrying the marshalled PairingMsg.
+    // Uses the currently attached XmppStream. The step counter per sid is
+    // incremented on each call. This method is non-async (fire-and-forget)
+    // so the UI dialogs can call it without yield.
+    public void send_pair_stanza(Jid peer, uint8[] sid, Protocol.PairingMsg msg) {
+        XmppStream? stream = attached_stream;
+        if (stream == null) {
+            warning("send_pair_stanza: no attached stream");
+            return;
+        }
+        string sid_b64 = Base64.encode(sid);
+        uint step = pair_step_counters.has_key(sid_b64) ? pair_step_counters[sid_b64] : 0;
+        pair_step_counters[sid_b64] = step + 1;
+
+        StanzaNode pair_node = new StanzaNode.build("pair", Protocol.NS_PAIR)
+            .add_self_xmlns()
+            .put_attribute("sid", sid_b64)
+            .put_attribute("step", step.to_string())
+            .put_node(new StanzaNode.text(Base64.encode(msg.marshal())));
+
+        Xmpp.MessageStanza stanza = new Xmpp.MessageStanza();
+        stanza.to = peer;
+        stanza.type_ = Xmpp.MessageStanza.TYPE_CHAT;
+        stanza.stanza.put_node(pair_node);
+        stream.get_module(Xmpp.MessageModule.IDENTITY).send_message.begin(stream, stanza);
+    }
+
+    // Send a verify-device IQ-set to the server using the currently attached stream.
+    // Returns the peers count from <peers count='N'/> in the result,
+    // or -1 on <not-acceptable/> or other errors.
+    public async int send_verify_device_iq(uint device_id) {
+        XmppStream? stream = attached_stream;
+        if (stream == null) {
+            warning("send_verify_device_iq: no attached stream");
+            return -1;
+        }
+
+        StanzaNode verify_node = new StanzaNode.build("verify-device", Protocol.NS_PAIR)
+            .add_self_xmlns()
+            .put_attribute("device-id", device_id.to_string())
+            .put_attribute("transport", "message");
+
+        Iq.Stanza iq = new Iq.Stanza.set(verify_node);
+        // No `to` set — server fills in (own account).
+
+        Iq.Stanza result;
+        try {
+            result = yield stream.get_module(Iq.Module.IDENTITY).send_iq_async(stream, iq);
+        } catch (Error e) {
+            warning("send_verify_device_iq: IQ send failed: %s", e.message);
+            return -1;
+        }
+
+        if (result.is_error()) {
+            ErrorStanza? err = result.get_error();
+            if (err != null && err.condition == ErrorStanza.CONDITION_NOT_ACCEPTABLE) {
+                return -1;
+            }
+            warning("send_verify_device_iq: unexpected IQ error: %s",
+                err != null ? err.condition : "unknown");
+            return -1;
+        }
+
+        StanzaNode? peers_node = result.stanza.get_subnode("peers", Protocol.NS_PAIR);
+        if (peers_node == null) {
+            warning("send_verify_device_iq: result has no <peers/> child");
+            return -1;
+        }
+        return int.parse(peers_node.get_attribute("count") ?? "-1");
+    }
+
+    // ── Inbound message handler ────────────────────────────────────────────────
+
+    private void on_received_message(XmppStream stream, Xmpp.MessageStanza message) {
+        // Handle inbound <pair xmlns='urn:xmppqr:x3dhpq:pair:0'> in chat messages.
+        StanzaNode? pair_node = message.stanza.get_subnode("pair", Protocol.NS_PAIR);
+        if (pair_node != null && message.type_ == Xmpp.MessageStanza.TYPE_CHAT) {
+            handle_pair_message(message.from, pair_node);
+            return;
+        }
+
+        // Handle inbound <verify-device/> in headline messages.
+        if (message.type_ == Xmpp.MessageStanza.TYPE_HEADLINE) {
+            StanzaNode? vd_node = message.stanza.get_subnode("verify-device", Protocol.NS_PAIR);
+            if (vd_node != null) {
+                handle_verify_device_headline(vd_node);
+                return;
+            }
+        }
+    }
+
+    private void handle_pair_message(Jid from, StanzaNode pair_node) {
+        string? sid_b64  = pair_node.get_attribute("sid");
+        string? body_b64 = pair_node.get_string_content();
+        if (sid_b64 == null || body_b64 == null) {
+            warning("handle_pair_message: missing sid or body from %s", from.to_string());
+            return;
+        }
+
+        uint8[] sid = Base64.decode(sid_b64);
+        uint8[] raw = Base64.decode(body_b64);
+
+        Protocol.PairingMsg msg;
+        try {
+            msg = Protocol.PairingMsg.unmarshal(raw);
+        } catch (Protocol.PairingMsgError e) {
+            warning("handle_pair_message: unmarshal failed from %s: %s", from.to_string(), e.message);
+            return;
+        }
+
+        pair_message_received(sid, from, msg);
+    }
+
+    private void handle_verify_device_headline(StanzaNode vd_node) {
+        string? new_resource_str = vd_node.get_attribute("new-resource");
+        string? device_id_str   = vd_node.get_attribute("device-id");
+        if (new_resource_str == null || device_id_str == null) {
+            warning("handle_verify_device_headline: missing new-resource or device-id attribute");
+            return;
+        }
+        Jid? new_resource = null;
+        try {
+            new_resource = new Jid(new_resource_str);
+        } catch (InvalidJidError e) {
+            warning("handle_verify_device_headline: invalid JID '%s': %s", new_resource_str, e.message);
+            return;
+        }
+        uint device_id = (uint) int.parse(device_id_str);
+        verify_device_received((!) new_resource, device_id);
     }
 
     public override string get_ns() {
