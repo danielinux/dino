@@ -22,7 +22,7 @@ public class PairNewDeviceDialog : Gtk.Window {
 
     private Gtk.Label status_label;
 
-    private ulong verify_handler_id;
+    private ulong pair_hello_handler_id;
     private ulong msg_handler_id;
 
     private Protocol.PairingExisting? existing;
@@ -172,11 +172,13 @@ public class PairNewDeviceDialog : Gtk.Window {
     }
 
     private void wire_signals() {
-        // verify_device_received: the server notifies us that a new device with
-        // the given resource has been verified. We use this as the trigger to
-        // start the pairing exchange with the new device.
-        verify_handler_id = stream_module.verify_device_received.connect((new_resource, device_id) => {
-            on_verify_device_received(new_resource);
+        // pair_hello_received: a joining device published a <pair-hello> to the
+        // account's own pair:0 PEP node (XEP §10.1a method B), delivered to us
+        // via self-PEP +notify. This is the serverless rendezvous trigger that
+        // replaces the old server-pushed <verify-device> headline: we learn the
+        // new device's full JID and the shared sid, then send PAKE1.
+        pair_hello_handler_id = stream_module.pair_hello_received.connect((new_full_jid, device_id, hello_sid) => {
+            on_pair_hello_received(new_full_jid, hello_sid);
         });
 
         // pair_message_received: carries subsequent FSM messages matched by sid.
@@ -194,18 +196,23 @@ public class PairNewDeviceDialog : Gtk.Window {
         return true;
     }
 
-    private void on_verify_device_received(Jid new_resource) {
+    private void on_pair_hello_received(Jid new_full_jid, uint8[] hello_sid) {
         if (aik == null) {
             set_status("Failed: local identity key not available");
             pairing_failed("local identity key not available");
             return;
         }
-        peer_jid = new_resource;
+        // Adopt the sid carried in the joining device's <pair-hello>. In the
+        // self-PEP rendezvous (method B) the NEW device generates the sid, so
+        // the existing device MUST use that value for the CPace transcript (and
+        // the <pair> stanza matching) to line up on both sides.
+        sid = hello_sid;
+        peer_jid = new_full_jid;
         try {
             existing = new Protocol.PairingExisting((!) aik, code, sid, opts);
             Protocol.PairingMsg? pake1 = ((!) existing).step(null);
             if (pake1 != null) {
-                stream_module.send_pair_stanza(new_resource, sid, (!) pake1);
+                stream_module.send_pair_stanza(new_full_jid, sid, (!) pake1);
             }
             set_status("Verifying…");
         } catch (GLib.Error e) {
@@ -249,9 +256,9 @@ public class PairNewDeviceDialog : Gtk.Window {
     }
 
     private void disconnect_signals() {
-        if (verify_handler_id != 0) {
-            stream_module.disconnect(verify_handler_id);
-            verify_handler_id = 0;
+        if (pair_hello_handler_id != 0) {
+            stream_module.disconnect(pair_hello_handler_id);
+            pair_hello_handler_id = 0;
         }
         if (msg_handler_id != 0) {
             stream_module.disconnect(msg_handler_id);

@@ -43,8 +43,6 @@ public class StreamModule : XmppStreamModule {
 
     // Emitted when a <pair> message arrives from a peer.
     public signal void pair_message_received(uint8[] sid, Jid from_jid, Protocol.PairingMsg msg);
-    // Emitted when a headline <verify-device> push arrives from the server.
-    public signal void verify_device_received(Jid new_resource, uint device_id);
     // Emitted when a <pair-hello> rendezvous item arrives via self-PEP +notify
     // on our own pair:0 node (XEP §10.1a method B). Carries the joining device's
     // full JID, its device-id, and the shared pairing sid (raw 32 bytes). The
@@ -813,67 +811,17 @@ public class StreamModule : XmppStreamModule {
             stream, null, Protocol.NS_PAIR, "current", hello, options);
     }
 
-    // Send a verify-device IQ-set to the server using the currently attached stream.
-    // Returns the peers count from <peers count='N'/> in the result,
-    // or -1 on <not-acceptable/> or other errors.
-    public async int send_verify_device_iq(uint device_id) {
-        XmppStream? stream = attached_stream;
-        if (stream == null) {
-            warning("send_verify_device_iq: no attached stream");
-            return -1;
-        }
-
-        StanzaNode verify_node = new StanzaNode.build("verify-device", Protocol.NS_PAIR)
-            .add_self_xmlns()
-            .put_attribute("device-id", device_id.to_string())
-            .put_attribute("transport", "message");
-
-        Iq.Stanza iq = new Iq.Stanza.set(verify_node);
-        // No `to` set — server fills in (own account).
-
-        Iq.Stanza result;
-        try {
-            result = yield stream.get_module(Iq.Module.IDENTITY).send_iq_async(stream, iq);
-        } catch (Error e) {
-            warning("send_verify_device_iq: IQ send failed: %s", e.message);
-            return -1;
-        }
-
-        if (result.is_error()) {
-            ErrorStanza? err = result.get_error();
-            if (err != null && err.condition == ErrorStanza.CONDITION_NOT_ACCEPTABLE) {
-                return -1;
-            }
-            warning("send_verify_device_iq: unexpected IQ error: %s",
-                err != null ? err.condition : "unknown");
-            return -1;
-        }
-
-        StanzaNode? peers_node = result.stanza.get_subnode("peers", Protocol.NS_PAIR);
-        if (peers_node == null) {
-            warning("send_verify_device_iq: result has no <peers/> child");
-            return -1;
-        }
-        return int.parse(peers_node.get_attribute("count") ?? "-1");
-    }
-
     // ── Inbound message handler ────────────────────────────────────────────────
 
     private void on_received_message(XmppStream stream, Xmpp.MessageStanza message) {
         // Handle inbound <pair xmlns='urn:xmppqr:x3dhpq:pair:0'> in chat messages.
+        // Pairing rendezvous no longer depends on a server-pushed <verify-device>
+        // headline: the existing device is triggered by a self-PEP <pair-hello>
+        // (see handle_pair_hello_event / pair_hello_received, XEP §10.1a).
         StanzaNode? pair_node = message.stanza.get_subnode("pair", Protocol.NS_PAIR);
         if (pair_node != null && message.type_ == Xmpp.MessageStanza.TYPE_CHAT) {
             handle_pair_message(message.from, pair_node);
             return;
-        }
-
-        // Handle inbound <verify-device/> in headline messages.
-        if (message.type_ == Xmpp.MessageStanza.TYPE_HEADLINE) {
-            StanzaNode? vd_node = message.stanza.get_subnode("verify-device", Protocol.NS_PAIR);
-            if (vd_node != null) {
-                handle_verify_device_headline(vd_node);
-                return;
-            }
         }
     }
 
@@ -897,24 +845,6 @@ public class StreamModule : XmppStreamModule {
         }
 
         pair_message_received(sid, from, msg);
-    }
-
-    private void handle_verify_device_headline(StanzaNode vd_node) {
-        string? new_resource_str = vd_node.get_attribute("new-resource");
-        string? device_id_str   = vd_node.get_attribute("device-id");
-        if (new_resource_str == null || device_id_str == null) {
-            warning("handle_verify_device_headline: missing new-resource or device-id attribute");
-            return;
-        }
-        Jid? new_resource = null;
-        try {
-            new_resource = new Jid(new_resource_str);
-        } catch (InvalidJidError e) {
-            warning("handle_verify_device_headline: invalid JID '%s': %s", new_resource_str, e.message);
-            return;
-        }
-        uint device_id = (uint) int.parse(device_id_str);
-        verify_device_received((!) new_resource, device_id);
     }
 
     public override string get_ns() {
