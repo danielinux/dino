@@ -286,6 +286,26 @@ public class PairToExistingDialog : Adw.Window {
 
         set_status("Waiting for existing device to respond…");
 
+        // Rendezvous (XEP §10.1a method B): publish a self-addressed
+        // <pair-hello> to our own pair:0 PEP node so an existing device on this
+        // account learns our full JID + sid via +notify and initiates the FSM
+        // toward us (sending PAKE1 first). Carries no secret material — the
+        // pairing code travels only out-of-band.
+        if (active_stream != null) {
+            XmppStream stream = (!) active_stream;
+            int? local_device_id = db.get_local_device_id(account);
+            Xmpp.Bind.Flag? bind_flag = stream.get_flag(Xmpp.Bind.Flag.IDENTITY);
+            Jid? my_full_jid = bind_flag != null ? bind_flag.my_jid : null;
+            if (local_device_id != null && my_full_jid != null) {
+                stream_module.publish_pair_hello.begin(
+                    stream, (uint32) (!) local_device_id, ((!) my_full_jid).to_string(), sid);
+            } else {
+                warning("PairToExistingDialog: cannot publish pair-hello (device id or full JID unavailable)");
+            }
+        } else {
+            warning("PairToExistingDialog: no active stream; cannot publish pair-hello");
+        }
+
         // PairingNew INIT step requires the initiator to send the first message;
         // in the protocol, the *existing* device (PairingExisting) sends PAKE1
         // and the *new* device (PairingNew) responds.  We therefore do NOT call

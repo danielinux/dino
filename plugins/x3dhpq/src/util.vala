@@ -8,6 +8,44 @@ internal Bytes bytes_from_base64(string data) {
     return new Bytes(Base64.decode(data));
 }
 
+// base64url without padding (RFC 4648 §5), used for the pairing `sid` on the
+// wire (XEP §10.1a: QR payload and <pair-hello> `sid` attribute).
+internal string base64url_encode(uint8[] data) {
+    string b64 = Base64.encode(data);
+    var sb = new StringBuilder();
+    for (int i = 0; i < b64.length; i++) {
+        char c = b64[i];
+        if (c == '+') {
+            sb.append_c('-');
+        } else if (c == '/') {
+            sb.append_c('_');
+        } else if (c == '=') {
+            // strip padding
+        } else {
+            sb.append_c(c);
+        }
+    }
+    return sb.str;
+}
+
+internal uint8[] base64url_decode(string data) {
+    var sb = new StringBuilder();
+    for (int i = 0; i < data.length; i++) {
+        char c = data[i];
+        if (c == '-') {
+            sb.append_c('+');
+        } else if (c == '_') {
+            sb.append_c('/');
+        } else {
+            sb.append_c(c);
+        }
+    }
+    while (sb.len % 4 != 0) {
+        sb.append_c('=');
+    }
+    return Base64.decode(sb.str);
+}
+
 internal uint8[] bytes_to_uint8_array(Bytes bytes) {
     size_t len = bytes.get_size();
     unowned uint8[] source = bytes.get_data();

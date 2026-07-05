@@ -744,6 +744,25 @@ public class StreamModule : XmppStreamModule {
         stream.get_module(Xmpp.MessageModule.IDENTITY).send_message.begin(stream, stanza);
     }
 
+    // Publish a self-addressed <pair-hello> rendezvous item to the account's OWN
+    // pair:0 PEP node (XEP §10.1a method B). It carries addressing only —
+    // device-id, full-jid, sid — and NO secret material (the pairing code stays
+    // out-of-band). Published to item 'current' with whitelist (owner-only)
+    // access so only the account's own resources receive it via +notify; an
+    // existing device on this account then initiates the pairing FSM toward us.
+    public async bool publish_pair_hello(XmppStream stream, uint32 device_id, string full_jid, uint8[] sid) {
+        StanzaNode hello = new StanzaNode.build("pair-hello", Protocol.NS_PAIR)
+            .add_self_xmlns()
+            .put_attribute("device-id", device_id.to_string())
+            .put_attribute("full-jid", full_jid)
+            .put_attribute("sid", base64url_encode(sid));
+        Pubsub.PublishOptions options = new Pubsub.PublishOptions()
+            .set_persist_items(true)
+            .set_access_model(Pubsub.ACCESS_MODEL_WHITELIST);
+        return yield stream.get_module(Pubsub.Module.IDENTITY).publish(
+            stream, null, Protocol.NS_PAIR, "current", hello, options);
+    }
+
     // Send a verify-device IQ-set to the server using the currently attached stream.
     // Returns the peers count from <peers count='N'/> in the result,
     // or -1 on <not-acceptable/> or other errors.
