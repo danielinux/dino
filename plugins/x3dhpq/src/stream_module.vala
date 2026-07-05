@@ -600,24 +600,36 @@ public class StreamModule : XmppStreamModule {
         // XEP §10.1a method B: a device on THIS account published a <pair-hello>
         // rendezvous item to our own pair:0 PEP node, delivered here via self-PEP
         // +notify. Only self-PEP is meaningful; ignore anything else.
+        if (item_node == null) {
+            return;
+        }
+        handle_pair_hello_node(stream, from, item_node);
+    }
+
+    // Shared parse+guard+emit logic for the <pair-hello> rendezvous element
+    // (XEP §10.1a), used by both self-PEP delivery (method B, via
+    // handle_pair_hello_event) and directed <message> delivery (method A, via
+    // on_received_message) so a directed <pair-hello> produces byte-identical
+    // downstream behavior to a self-PEP one.
+    private void handle_pair_hello_node(XmppStream stream, Jid from, StanzaNode item_node) {
         if (!from.bare_jid.equals(account.bare_jid)) {
             return;
         }
-        if (item_node == null || item_node.name != "pair-hello") {
+        if (item_node.name != "pair-hello") {
             return;
         }
         string? full_jid_str  = item_node.get_attribute("full-jid");
         string? device_id_str = item_node.get_attribute("device-id");
         string? sid_b64url    = item_node.get_attribute("sid");
         if (full_jid_str == null || device_id_str == null || sid_b64url == null) {
-            warning("handle_pair_hello_event: missing full-jid, device-id or sid attribute");
+            warning("handle_pair_hello_node: missing full-jid, device-id or sid attribute");
             return;
         }
         Jid new_full_jid;
         try {
             new_full_jid = new Jid(full_jid_str);
         } catch (InvalidJidError e) {
-            warning("handle_pair_hello_event: invalid full-jid '%s': %s", full_jid_str, e.message);
+            warning("handle_pair_hello_node: invalid full-jid '%s': %s", full_jid_str, e.message);
             return;
         }
         // Ignore our own echo: the publishing (new) device also receives its own
@@ -821,6 +833,15 @@ public class StreamModule : XmppStreamModule {
         StanzaNode? pair_node = message.stanza.get_subnode("pair", Protocol.NS_PAIR);
         if (pair_node != null && message.type_ == Xmpp.MessageStanza.TYPE_CHAT) {
             handle_pair_message(message.from, pair_node);
+            return;
+        }
+        // XEP §10.1a method A: <pair-hello> delivered as a directed message when
+        // this device displayed the QR and a peer device scanned it, rather than
+        // via self-PEP (method B). Shares handle_pair_hello_node so the outcome
+        // is identical regardless of transport.
+        StanzaNode? pair_hello_node = message.stanza.get_subnode("pair-hello", Protocol.NS_PAIR);
+        if (pair_hello_node != null) {
+            handle_pair_hello_node(stream, message.from, pair_hello_node);
             return;
         }
     }
