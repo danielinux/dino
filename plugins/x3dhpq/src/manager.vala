@@ -1391,6 +1391,75 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         }
         return true;
     }
+
+    // Revoke one of the account's own devices (§8.6). Publishes a RemoveDevice
+    // audit entry (action=2, payload uint32_BE(device_id); §11.4) to the account
+    // audit node, tears down local session/bundle/prekey state for that device,
+    // and republishes our signed devicelist so any content change propagates.
+    //
+    // NOTE: under dino's current publish model each device publishes a devicelist
+    // containing ONLY its own device id, so "republishing the list with the device
+    // omitted" is inherently a no-op for a *different* device — the removed id was
+    // never present in our own published list. The authoritative teardown for
+    // peers is the inbound signed-devicelist prune (StreamModule.parse_device_list),
+    // which already fires on the signed, version-advanced accept path.
+    public async bool remove_own_device(Dino.Entities.Account account, uint32 device_id) {
+        XmppStream? stream = app.stream_interactor.get_stream(account);
+        StreamModule? module = app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
+        if (stream == null || module == null) {
+            return false;
+        }
+
+        // Derive the account audit chain tail (seq + prev_hash) from locally
+        // persisted entries; an empty chain starts at the genesis anchor.
+        var entries = db.list_account_audit_entries(account);
+        uint64 next_seq = 0;
+        uint8[] prev_hash = new uint8[32];
+        if (entries.size > 0) {
+            Protocol.AuditEntry last = entries[entries.size - 1];
+            next_seq = last.seq + 1;
+            prev_hash = last.compute_hash();
+        }
+
+        Protocol.AuditEntry entry = new Protocol.AuditEntry();
+        entry.seq = next_seq;
+        entry.prev_hash = prev_hash;
+        entry.action = (uint8) Protocol.AccountAuditAction.REMOVE_DEVICE;
+        // payload = uint32_BE(device_id)  (layout D)
+        uint8[] payload = new uint8[4];
+        payload[0] = (uint8)(device_id >> 24);
+        payload[1] = (uint8)(device_id >> 16);
+        payload[2] = (uint8)(device_id >> 8);
+        payload[3] = (uint8) device_id;
+        entry.payload = payload;
+        entry.timestamp = new DateTime.now_utc().to_unix();
+        try {
+            uint8[] sp = entry.signed_part();
+            Bytes aik_priv_ed = bytes_from_base64((!) db.get_local_identity_string(account, db.account_identity.aik_priv_ed25519_base64));
+            Bytes aik_priv_mldsa = bytes_from_base64((!) db.get_local_identity_string(account, db.account_identity.aik_priv_mldsa_base64));
+            entry.signature = bytes_to_uint8_array(
+                global::X3dhpq.Crypto.ed25519_sign(aik_priv_ed, new Bytes(sp)));
+            entry.mldsa_signature = bytes_to_uint8_array(
+                global::X3dhpq.Crypto.mldsa65_sign(aik_priv_mldsa, new Bytes(sp)));
+        } catch (GLib.Error e) {
+            warning("x3dhpq remove_own_device: signing failed for device %u: %s", device_id, e.message);
+            return false;
+        }
+
+        if (!yield module.publish_audit_entry(stream, next_seq.to_string(), Base64.encode(entry.marshal()))) {
+            warning("x3dhpq remove_own_device: audit publish failed for device %u", device_id);
+            return false;
+        }
+        db.store_account_audit_entry(account, entry);
+
+        // Local teardown: drop the removed device's session/bundle/prekey state.
+        db.remove_peer_device(account, account.bare_jid.to_string(), (int) device_id);
+
+        // Republish our signed devicelist (item ③ machinery); a content-unchanged
+        // republish reuses the current version, a changed one bumps it (§8.2).
+        yield module.publish_current_state(stream);
+        return true;
+    }
 }
 
 }

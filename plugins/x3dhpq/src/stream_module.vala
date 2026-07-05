@@ -561,6 +561,12 @@ public class StreamModule : XmppStreamModule {
         entries.add(entry);
         try {
             audit_chain.verify_and_apply(account.id, aik_ed, aik_ml, entries);
+            // Persist verified entries for OUR OWN account so the local audit-chain
+            // tail (seq + prev_hash) is known when we later append a
+            // locally-originated entry such as RemoveDevice (§8.6/§11.4).
+            if (from.bare_jid.equals(account.bare_jid)) {
+                db.store_account_audit_entry(account, entry);
+            }
         } catch (Protocol.AccountAuditError e) {
             warning("handle_audit_event: chain verification failed: %s", e.message);
         }

@@ -163,7 +163,7 @@ public class SelfDevicesWidget : Gtk.Box {
     private void confirm_and_remove(int device_id) {
         var dialog = new Adw.AlertDialog(
             "Remove device %s?".printf(((uint32) device_id).to_string()),
-            "The device will be removed from this client's list. The device will reappear if it re-publishes its bundle. To revoke a compromised device, also publish a new versioned devicelist without it (not yet implemented)."
+            "The device will be revoked: a signed RemoveDevice record is published to your account's audit chain and the local session, bundle and pre-key state for it are torn down. Contacts drop it when they see it disappear from a signed, version-advanced devicelist."
         );
         dialog.add_response("cancel", "Cancel");
         dialog.add_response("remove", "Remove");
@@ -172,8 +172,10 @@ public class SelfDevicesWidget : Gtk.Box {
         dialog.close_response = "cancel";
         dialog.response.connect((id) => {
             if (id == "remove") {
-                db.remove_peer_device(account, account.bare_jid.to_string(), device_id);
-                refresh();
+                Plugin.manager.remove_own_device.begin(account, (uint32) device_id, (obj, res) => {
+                    Plugin.manager.remove_own_device.end(res);
+                    refresh();
+                });
             }
         });
         dialog.present(this);

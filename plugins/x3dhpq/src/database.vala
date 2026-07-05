@@ -1265,6 +1265,35 @@ public class Database : Qlite.Database {
         return sb.str;
     }
 
+    // Account audit chain (§11) persisted rows for our own account, ordered by
+    // seq ascending. Used to derive the chain tail (seq + prev_hash) when we
+    // append a new locally-originated entry (e.g. RemoveDevice, §8.6).
+    public Gee.List<Protocol.AuditEntry> list_account_audit_entries(Account account) {
+        var parsed = new Gee.ArrayList<Protocol.AuditEntry>();
+        var rows = audit_entry.select()
+            .with(audit_entry.account_id, "=", account.id)
+            .with(audit_entry.bare_jid, "=", account.bare_jid.to_string());
+        foreach (Row r in rows) {
+            string? b64 = r[audit_entry.entry_base64];
+            if (b64 == null) continue;
+            Protocol.AuditEntry? e = Protocol.AuditEntry.unmarshal(Base64.decode((!) b64));
+            if (e != null) parsed.add(e);
+        }
+        parsed.sort((a, b) => (a.seq < b.seq) ? -1 : (a.seq > b.seq ? 1 : 0));
+        return parsed;
+    }
+
+    public void store_account_audit_entry(Account account, Protocol.AuditEntry entry) {
+        audit_entry.upsert()
+            .value(audit_entry.account_id, account.id, true)
+            .value(audit_entry.bare_jid, account.bare_jid.to_string(), true)
+            .value(audit_entry.item_id, entry.seq.to_string(), true)
+            .value(audit_entry.entry_base64, Base64.encode(entry.marshal()))
+            .value(audit_entry.previous_hash_hex, bytes_to_hex_string(entry.prev_hash))
+            .value(audit_entry.created_at, (long) new DateTime.now_utc().to_unix())
+            .perform();
+    }
+
     private void update_peer_identity(Account account, string bare_jid, string? aik_ed25519, string? aik_mldsa) {
         Row? existing = get_peer_account_identity_row(account, bare_jid);
         string trust_state = "unverified";
