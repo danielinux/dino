@@ -70,12 +70,26 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         var entries = db.list_membership_journal_entries(account, room_jid_str);
         int added = 0;
         int skipped_not_found = 0;
+        // Derived-epoch counter for the §13.5 SHOULD-level cross-check: genesis
+        // (first entry) lands on epoch 0, every subsequent entry rotates once.
+        uint32 derived_epoch = 0;
+        int entry_index = 0;
         foreach (Protocol.MemberAuditEntry e in entries) {
             uint8[] aik_fp_raw;
             uint32 epoch_after;
             if (!Protocol.MemberAuditEntry.parse_member_payload(e.payload, out aik_fp_raw, out epoch_after)) {
+                entry_index++;
                 continue;
             }
+            uint32 expected_epoch = (entry_index == 0) ? 0 : derived_epoch + 1;
+            if (epoch_after != expected_epoch) {
+                // SHOULD-level: log and keep going (interop robustness); the
+                // replay-derived epoch is authoritative, not the wire value.
+                warning("rebuild journal: epoch_after mismatch at seq=%llu: wire=%u derived=%u",
+                    e.seq, epoch_after, expected_epoch);
+            }
+            derived_epoch = expected_epoch;
+            entry_index++;
             uint8[] aik_ed;
             uint8[] aik_mldsa;
             if (!db.find_peer_account_identity_by_aik_fp(account, aik_fp_raw, out aik_ed, out aik_mldsa)) {
@@ -1131,7 +1145,8 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             entry.seq = 0;
             entry.prev_hash = new uint8[32];
             entry.action = (uint8) Protocol.MemberAuditAction.ADD_MEMBER;
-            entry.payload = Protocol.MemberAuditEntry.build_member_payload(aik_fp_raw, 1);
+            // Genesis AddMember establishes epoch 0 and does NOT rotate (§13.1a).
+            entry.payload = Protocol.MemberAuditEntry.build_member_payload(aik_fp_raw, 0);
             entry.timestamp = new DateTime.now_utc().to_unix();
             try {
                 uint8[] sp = entry.signed_part();
@@ -1205,10 +1220,22 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
 
         uint64 next_seq = 0;
         uint8[] prev_hash = new uint8[32];
+        // Derive the post-application epoch per XEP §13.1a/§13.5: the genesis
+        // AddMember establishes epoch 0 and does NOT rotate; every subsequent
+        // add/remove rotates exactly once, so epoch_after = previousEpoch + 1
+        // (== seq for a strictly linear journal). MUST NOT be hardcoded.
+        uint32 epoch_after = 0;
         if (entries.size > 0) {
             Protocol.MemberAuditEntry last_entry = entries[entries.size - 1];
             next_seq = last_entry.seq + 1;
             prev_hash = last_entry.compute_hash();
+            uint8[] last_fp;
+            uint32 last_epoch;
+            if (Protocol.MemberAuditEntry.parse_member_payload(last_entry.payload, out last_fp, out last_epoch)) {
+                epoch_after = last_epoch + 1;
+            } else {
+                epoch_after = (uint32) next_seq;
+            }
         }
 
         Bytes owner_aik_priv_ed = bytes_from_base64((!) db.get_local_identity_string(account, db.account_identity.aik_priv_ed25519_base64));
@@ -1217,7 +1244,7 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         stored_entry.seq = next_seq;
         stored_entry.prev_hash = prev_hash;
         stored_entry.action = (uint8) Protocol.MemberAuditAction.ADD_MEMBER;
-        stored_entry.payload = Protocol.MemberAuditEntry.build_member_payload(member_aik_fp_raw, 1);
+        stored_entry.payload = Protocol.MemberAuditEntry.build_member_payload(member_aik_fp_raw, epoch_after);
         stored_entry.timestamp = new DateTime.now_utc().to_unix();
         try {
             uint8[] sp = stored_entry.signed_part();
@@ -1291,10 +1318,22 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
 
         uint64 next_seq = 0;
         uint8[] prev_hash = new uint8[32];
+        // Derive the post-application epoch per XEP §13.1a/§13.5: the genesis
+        // AddMember establishes epoch 0 and does NOT rotate; every subsequent
+        // add/remove rotates exactly once, so epoch_after = previousEpoch + 1
+        // (== seq for a strictly linear journal). MUST NOT be hardcoded.
+        uint32 epoch_after = 0;
         if (entries.size > 0) {
             Protocol.MemberAuditEntry last_entry = entries[entries.size - 1];
             next_seq = last_entry.seq + 1;
             prev_hash = last_entry.compute_hash();
+            uint8[] last_fp;
+            uint32 last_epoch;
+            if (Protocol.MemberAuditEntry.parse_member_payload(last_entry.payload, out last_fp, out last_epoch)) {
+                epoch_after = last_epoch + 1;
+            } else {
+                epoch_after = (uint32) next_seq;
+            }
         }
 
         Bytes owner_aik_priv_ed = bytes_from_base64((!) db.get_local_identity_string(account, db.account_identity.aik_priv_ed25519_base64));
@@ -1303,8 +1342,7 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         stored_entry.seq = next_seq;
         stored_entry.prev_hash = prev_hash;
         stored_entry.action = (uint8) Protocol.MemberAuditAction.REMOVE_MEMBER;
-        // epoch_after=1 mirrors the single-epoch MVP payload used by AddMember.
-        stored_entry.payload = Protocol.MemberAuditEntry.build_member_payload(member_aik_fp_raw, 1);
+        stored_entry.payload = Protocol.MemberAuditEntry.build_member_payload(member_aik_fp_raw, epoch_after);
         stored_entry.timestamp = new DateTime.now_utc().to_unix();
         try {
             uint8[] sp = stored_entry.signed_part();
