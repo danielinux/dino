@@ -5,7 +5,7 @@ using Xmpp;
 namespace Dino.Plugins.X3dhpq {
 
 public class Database : Qlite.Database {
-    private const int VERSION = 4;
+    private const int VERSION = 5;
 
     public class AccountIdentityTable : Table {
         public Column<int> id = new Column.Integer("id") { primary_key = true, auto_increment = true };
@@ -60,10 +60,14 @@ public class Database : Qlite.Database {
         public Column<bool> active = new Column.BoolInt("active") { default = "1" };
         public Column<long> created_at = new Column.Long("created_at") { not_null = true };
         public Column<long> updated_at = new Column.Long("updated_at") { not_null = true };
+        // First-seen device added_at (unix seconds) as carried on the signed
+        // devicelist wire (XEP §8.4). Needed so the receiver can reconstruct the
+        // exact SignedPart (§8.3). Added at schema v5.
+        public Column<long> added_at = new Column.Long("added_at") { min_version = 5, default = "0" };
 
         internal PeerDeviceTable(Database db) {
             base(db, "peer_device");
-            init({ account_id, bare_jid, device_id, dik_pub_ed25519_base64, dik_pub_x25519_base64, dik_pub_mldsa_base64, certificate_base64, active, created_at, updated_at });
+            init({ account_id, bare_jid, device_id, dik_pub_ed25519_base64, dik_pub_x25519_base64, dik_pub_mldsa_base64, certificate_base64, active, created_at, updated_at, added_at });
             unique({ account_id, bare_jid, device_id });
         }
     }
@@ -869,7 +873,23 @@ public class Database : Qlite.Database {
             .perform();
     }
 
-    public void store_remote_device(Account account, string bare_jid, int device_id, string? certificate_base64 = null) {
+    public void store_remote_device(Account account, string bare_jid, int device_id, string? certificate_base64 = null, long added_at = 0) {
+        // Preserve the earliest known added_at (first-seen) for this device id:
+        // once a peer has published a device with a given added_at we keep it so
+        // the reconstructed SignedPart stays stable even if a later republish
+        // (mistakenly) carries a different value.
+        long effective_added_at = added_at;
+        RowOption existing = peer_device.select()
+            .with(peer_device.account_id, "=", account.id)
+            .with(peer_device.bare_jid, "=", bare_jid)
+            .with(peer_device.device_id, "=", device_id)
+            .single().row();
+        if (existing.is_present()) {
+            long prev = existing[peer_device.added_at];
+            if (prev > 0) {
+                effective_added_at = prev;
+            }
+        }
         peer_device.upsert()
             .value(peer_device.account_id, account.id, true)
             .value(peer_device.bare_jid, bare_jid, true)
@@ -878,7 +898,20 @@ public class Database : Qlite.Database {
             .value(peer_device.active, true)
             .value(peer_device.updated_at, (long) new DateTime.now_utc().to_unix())
             .value(peer_device.created_at, (long) new DateTime.now_utc().to_unix())
+            .value(peer_device.added_at, effective_added_at)
             .perform();
+    }
+
+    // First-seen creation time of the local device's own identity (unix
+    // seconds). Used as the stable `added_at` for the account's own device on
+    // the signed devicelist so routine self-republishes reproduce byte-identical
+    // SignedPart bytes (XEP §8.2–§8.4).
+    public long get_local_device_created_at(Account account) {
+        Row? row = get_local_identity(account.id);
+        if (row == null) {
+            return (long) new DateTime.now_utc().to_unix();
+        }
+        return ((!) row)[account_identity.created_at];
     }
 
     public void store_bundle_payload(Account account, string bare_jid, int device_id, StanzaNode bundle_node) {

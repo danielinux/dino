@@ -177,12 +177,14 @@ public class StreamModule : XmppStreamModule {
         // is ignored during serialization — only sub_nodes are rendered, so
         // `{ val = cert }` produces `<cert/>` empty on the wire. publish_bundle
         // below already does the right thing for <dc>; we mirror that pattern.
+        long added_at = db.get_local_device_created_at(account);
         StanzaNode node = new StanzaNode.build("devicelist", Protocol.NS_DEVICELIST)
             .add_self_xmlns()
             .put_attribute("version", "1")
             .put_attribute("issued-at", ((long) new DateTime.now_utc().to_unix()).to_string())
             .put_node(new StanzaNode.build("device", Protocol.NS_DEVICELIST)
                 .put_attribute("id", ((!) device_id).to_string())
+                .put_attribute("added-at", added_at.to_string())
                 .put_attribute("flags", "1")
                 .put_node(new StanzaNode.build("cert", Protocol.NS_DEVICELIST)
                     .put_node(new StanzaNode.text(cert))));
@@ -271,7 +273,14 @@ public class StreamModule : XmppStreamModule {
             int device_id = device_node.get_attribute_int("id");
             devices.add(device_id);
             StanzaNode? cert_node = device_node.get_subnode("cert", Protocol.NS_DEVICELIST);
-            db.store_remote_device(account, jid.bare_jid.to_string(), device_id, cert_node != null ? cert_node.get_string_content() : null);
+            // XEP §8.4: carry per-device added-at so the signed SignedPart (§8.3)
+            // can be reconstructed. Absent (legacy peer) => 0.
+            string? added_at_str = device_node.get_attribute("added-at");
+            long added_at = 0;
+            if (added_at_str != null) {
+                added_at = (long) int64.parse((!) added_at_str);
+            }
+            db.store_remote_device(account, jid.bare_jid.to_string(), device_id, cert_node != null ? cert_node.get_string_content() : null, added_at);
         }
         db.store_device_list_payload(account, jid.bare_jid.to_string(), id, node.to_string());
         // The published devicelist is authoritative — drop cached
