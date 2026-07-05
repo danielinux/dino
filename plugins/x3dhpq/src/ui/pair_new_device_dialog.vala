@@ -138,9 +138,19 @@ public class PairNewDeviceDialog : Gtk.Window {
     }
 
     private string build_qr_uri() {
-        string bare_jid = account.bare_jid.to_string();
+        // XEP §10.1a method A: the QR carries this (existing) device's FULL JID
+        // — including the resource — so a scanning device can address it
+        // directly and start the FSM. Fall back to the bare JID only if the
+        // bound resource is not yet available.
+        string jid_str = account.bare_jid.to_string();
+        if (active_stream != null) {
+            Xmpp.Bind.Flag? bind_flag = ((!) active_stream).get_flag(Xmpp.Bind.Flag.IDENTITY);
+            if (bind_flag != null && bind_flag.my_jid != null) {
+                jid_str = ((!) bind_flag.my_jid).to_string();
+            }
+        }
         string b64_sid = base64url_encode(sid);
-        return @"xmppqr-pair:$bare_jid?code=$code&sid=$b64_sid";
+        return @"xmppqr-pair:$jid_str?code=$code&sid=$b64_sid";
     }
 
     private static string base64url_encode(uint8[] data) {
