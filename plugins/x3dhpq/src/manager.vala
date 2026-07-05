@@ -23,8 +23,9 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     }
 
     // Subscribe to the room's X3DHPQ membership-journal PEP node when MUC info
-    // is settled. Per Wave 5a server policy, per-room pubsub hosts require an
-    // explicit subscribe IQ; caps-based +notify filtering does not apply.
+    // is settled. A room-hosted pubsub node is not the account's own PEP
+    // service, so Entity Caps +notify does not cover it; a standard XEP-0060
+    // explicit <subscribe> IQ is used instead. Works against stock servers.
     private void on_room_info_updated(Account account, Jid muc_jid) {
         XmppStream? stream = app.stream_interactor.get_stream(account);
         StreamModule? module = app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);

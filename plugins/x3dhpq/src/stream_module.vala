@@ -347,9 +347,10 @@ public class StreamModule : XmppStreamModule {
     }
 
     private void handle_group_event(XmppStream stream, Jid room_jid, string? id, StanzaNode? item_node) {
-        // X3DHPQ XEP §13.8. Per-room PEP membership journal hosted on the room JID.
-        // Server enforces 16 KiB / 200-item caps and owner-only publish; clients
-        // verify the entry's signature against the room owner's AIK.
+        // X3DHPQ XEP §13.8. Per-room PEP membership journal hosted on the room
+        // JID via standard XEP-0060. Correctness does NOT depend on any server
+        // affiliation/size enforcement: clients verify each entry's hybrid
+        // signature against the room owner's AIK (see Manager.on_membership_entry_received).
         string? payload = item_node != null ? item_node.get_string_content() : null;
         if (payload == null) {
             return;
@@ -391,10 +392,11 @@ public class StreamModule : XmppStreamModule {
         return yield publish_membership_entry(stream, room_jid, seq.to_string(), b64);
     }
 
-    // Subscribe to a MUC room's group:0 PEP node. Per Wave 5a of the server,
-    // per-room pubsub hosts track explicit subscriptions in pep_subscriptions
-    // rather than relying on caps +notify filtering, so an explicit subscribe
-    // IQ is required after MUC join.
+    // Subscribe to a MUC room's group:0 PEP node with a standard XEP-0060
+    // <subscribe> IQ. We subscribe explicitly (rather than relying on Entity
+    // Caps +notify) because a room-hosted pubsub node is not the account's own
+    // PEP service, so caps-based auto-notification does not cover it; this is
+    // standard XEP-0060 and works against stock Prosody/ejabberd.
     public async bool subscribe_to_group_node(XmppStream stream, Jid room_jid) {
         string subscriber = account.bare_jid.to_string();
         StanzaNode pubsub_node = new StanzaNode.build("pubsub", Pubsub.NS_URI).add_self_xmlns()
@@ -459,8 +461,9 @@ public class StreamModule : XmppStreamModule {
     }
 
     // Publish an opaque, owner-signed membership entry to a room's group:0 PEP
-    // node. The server enforces affiliation >= owner; admins/members get
-    // <forbidden/>. Items > 16 KiB are rejected with <not-acceptable/>.
+    // node using standard XEP-0060 publish. Authenticity is enforced entirely
+    // client-side via the entry's hybrid AIK signature; we do not rely on the
+    // server restricting who may publish or on any item-size cap.
     public async bool publish_membership_entry(XmppStream stream, Jid room_jid, string item_id, string base64_payload) {
         StanzaNode entry = new StanzaNode.build("membership-entry", Protocol.NS_GROUP)
             .add_self_xmlns()
