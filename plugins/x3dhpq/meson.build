@@ -27,6 +27,7 @@ sources = files(
     'src/protocol/groupsession.vala',
     'src/protocol/groupshare.vala',
     'src/protocol/account_audit.vala',
+    'src/protocol/devicelist.vala',
     'src/protocol/membership_journal.vala',
     'src/protocol/pairing_msg.vala',
     'src/protocol/pairwise.vala',

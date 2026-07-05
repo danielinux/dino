@@ -5,7 +5,7 @@ using Xmpp;
 namespace Dino.Plugins.X3dhpq {
 
 public class Database : Qlite.Database {
-    private const int VERSION = 5;
+    private const int VERSION = 6;
 
     public class AccountIdentityTable : Table {
         public Column<int> id = new Column.Integer("id") { primary_key = true, auto_increment = true };
@@ -78,10 +78,21 @@ public class Database : Qlite.Database {
         public Column<string?> item_id = new Column.Text("item_id");
         public Column<string?> signed_payload_base64 = new Column.Text("signed_payload_base64");
         public Column<long> updated_at = new Column.Long("updated_at") { not_null = true };
+        // Monotonic devicelist version (XEP §8.2). For the account's own row this
+        // is the persisted per-account counter; for a peer row it is the highest
+        // version accepted so far (rollback guard). Added at schema v6.
+        public Column<long> list_version = new Column.Long("list_version") { min_version = 6, default = "0" };
+        // Whether a hybrid-SIGNED list has ever been accepted for this jid. Once
+        // true, unsigned/older lists MUST be rejected (transitional rule §8.5).
+        public Column<bool> signed_accepted = new Column.BoolInt("signed_accepted") { min_version = 6, default = "0" };
+        // Canonical device-set key (id|added_at|flags|cert per device, sorted).
+        // Excludes issued_at/version so we can tell whether the *content* changed
+        // (own version bump; §8.2) and detect same-version forks (§8.5). Added v6.
+        public Column<string?> content_key = new Column.Text("content_key") { min_version = 6 };
 
         internal DeviceListTable(Database db) {
             base(db, "device_list");
-            init({ account_id, bare_jid, item_id, signed_payload_base64, updated_at });
+            init({ account_id, bare_jid, item_id, signed_payload_base64, updated_at, list_version, signed_accepted, content_key });
             unique({ account_id, bare_jid });
         }
     }
@@ -732,6 +743,25 @@ public class Database : Qlite.Database {
         }
     }
 
+    // Fetch a peer's AIK public halves (raw bytes) by bare JID. Returns false if
+    // the peer AIK is not yet known (first contact — caller should defer the
+    // devicelist signature gate per §8.5).
+    public bool get_peer_aik_pubs(Account account, string bare_jid, out Bytes aik_ed, out Bytes aik_mldsa) {
+        aik_ed = new Bytes(new uint8[0]);
+        aik_mldsa = new Bytes(new uint8[0]);
+        Row? row = get_peer_account_identity_row(account, bare_jid);
+        if (row == null || ((!) row)[peer_account_identity.aik_pub_ed25519_base64] == null || ((!) row)[peer_account_identity.aik_pub_mldsa_base64] == null) {
+            return false;
+        }
+        try {
+            aik_ed = bytes_from_base64(((!) row)[peer_account_identity.aik_pub_ed25519_base64]);
+            aik_mldsa = bytes_from_base64(((!) row)[peer_account_identity.aik_pub_mldsa_base64]);
+            return true;
+        } catch (GLib.Error e) {
+            return false;
+        }
+    }
+
     public bool get_peer_aik_fingerprint_raw(Account account, string bare_jid, out uint8[] fingerprint_raw) {
         fingerprint_raw = {};
         Row? row = get_peer_account_identity_row(account, bare_jid);
@@ -783,14 +813,87 @@ public class Database : Qlite.Database {
             .perform();
     }
 
-    public void store_device_list_payload(Account account, string bare_jid, string? item_id, string payload) {
+    public void store_device_list_payload(Account account, string bare_jid, string? item_id, string payload,
+            long list_version = -1, bool signed_accepted = false, string? content_key = null) {
+        // Preserve the current version/signed flag/content_key when the caller
+        // passes the sentinels so legacy call sites that do not track versioning
+        // do not clobber the columns.
+        long effective_version = list_version;
+        bool effective_signed = signed_accepted;
+        string? effective_content_key = content_key;
+        RowOption existing = device_list.select()
+            .with(device_list.account_id, "=", account.id)
+            .with(device_list.bare_jid, "=", bare_jid)
+            .single().row();
+        if (existing.is_present()) {
+            if (list_version < 0) {
+                effective_version = existing[device_list.list_version];
+            }
+            // signed_accepted is sticky: once a signed list has been accepted for
+            // this jid it MUST stay accepted (downgrade protection §8.5).
+            if (existing[device_list.signed_accepted]) {
+                effective_signed = true;
+            }
+            if (content_key == null) {
+                effective_content_key = existing[device_list.content_key];
+            }
+        } else if (list_version < 0) {
+            effective_version = 0;
+        }
         device_list.upsert()
             .value(device_list.account_id, account.id, true)
             .value(device_list.bare_jid, bare_jid, true)
             .value(device_list.item_id, item_id)
             .value(device_list.signed_payload_base64, Base64.encode(string_to_bytes(payload)))
             .value(device_list.updated_at, (long) new DateTime.now_utc().to_unix())
+            .value(device_list.list_version, effective_version)
+            .value(device_list.signed_accepted, effective_signed)
+            .value(device_list.content_key, effective_content_key)
             .perform();
+    }
+
+    public string? get_device_list_content_key(Account account, string bare_jid) {
+        RowOption row = get_device_list_row(account, bare_jid);
+        if (!row.is_present()) {
+            return null;
+        }
+        return row[device_list.content_key];
+    }
+
+    public RowOption get_device_list_row(Account account, string bare_jid) {
+        return device_list.select()
+            .with(device_list.account_id, "=", account.id)
+            .with(device_list.bare_jid, "=", bare_jid)
+            .single().row();
+    }
+
+    // Decoded devicelist XML previously stored for (account, bare_jid), or null.
+    public string? get_device_list_payload_xml(Account account, string bare_jid) {
+        RowOption row = get_device_list_row(account, bare_jid);
+        if (!row.is_present()) {
+            return null;
+        }
+        string? b64 = row[device_list.signed_payload_base64];
+        if (b64 == null) {
+            return null;
+        }
+        return (string) Base64.decode((!) b64);
+    }
+
+    public long get_device_list_version(Account account, string bare_jid) {
+        RowOption row = get_device_list_row(account, bare_jid);
+        if (!row.is_present()) {
+            return 0;
+        }
+        return row[device_list.list_version];
+    }
+
+    public bool get_device_list_signed_accepted(Account account, string bare_jid) {
+        RowOption row = get_device_list_row(account, bare_jid);
+        if (!row.is_present()) {
+            return false;
+        }
+        return row[device_list.signed_accepted];
     }
 
     // Drop every cached peer_device / bundle / pairwise_session row for

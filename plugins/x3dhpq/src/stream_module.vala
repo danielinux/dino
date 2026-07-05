@@ -172,27 +172,82 @@ public class StreamModule : XmppStreamModule {
                 account.bare_jid.to_string());
             return;
         }
-        // The cert string MUST be added as a text sub-node, not via the `val`
-        // initialiser. For an element StanzaNode (built via .build()), `val`
-        // is ignored during serialization — only sub_nodes are rendered, so
-        // `{ val = cert }` produces `<cert/>` empty on the wire. publish_bundle
-        // below already does the right thing for <dc>; we mirror that pattern.
         long added_at = db.get_local_device_created_at(account);
+        uint8 flags = 1;
+        string own_jid = account.bare_jid.to_string();
+
+        // Version rule (§8.2): the version is a persisted, monotonic per-account
+        // counter incremented ONLY when the list *content* changes. A routine
+        // self-republish (same devices) MUST reuse the current version.
+        string content_key = build_device_content_key_single((uint32)(!) device_id, (int64) added_at, flags, cert);
+        long prev_version = db.get_device_list_version(account, own_jid);
+        string? prev_content_key = db.get_device_list_content_key(account, own_jid);
+        long version;
+        if (prev_content_key != null && prev_content_key == content_key) {
+            version = prev_version > 0 ? prev_version : 1;
+        } else {
+            version = prev_version + 1;   // first publish: 0 + 1 = 1
+        }
+        long issued_at = (long) new DateTime.now_utc().to_unix();
+
+        // Compute the SignedPart (layout A) and hybrid-sign it with the AIK.
+        var devices = new Gee.ArrayList<Protocol.DeviceListDevice>();
+        var dld = new Protocol.DeviceListDevice();
+        dld.device_id = (uint32)(!) device_id;
+        dld.added_at = added_at;
+        dld.flags = flags;
+        try {
+            dld.cert_bytes = bytes_to_uint8_array(bytes_from_base64(cert));
+        } catch (GLib.Error e) {
+            warning("publish_device_list: cert base64 decode failed: %s", e.message);
+            return;
+        }
+        devices.add(dld);
+        uint8[] sp = Protocol.DeviceListSigned.signed_part((uint64) version, issued_at, devices);
+        string sig_b64;
+        string mldsa_sig_b64;
+        try {
+            Bytes aik_priv_ed = bytes_from_base64((!) db.get_local_identity_string(account, db.account_identity.aik_priv_ed25519_base64));
+            Bytes aik_priv_mldsa = bytes_from_base64((!) db.get_local_identity_string(account, db.account_identity.aik_priv_mldsa_base64));
+            sig_b64 = Base64.encode(bytes_to_uint8_array(global::X3dhpq.Crypto.ed25519_sign(aik_priv_ed, new Bytes(sp))));
+            mldsa_sig_b64 = Base64.encode(bytes_to_uint8_array(global::X3dhpq.Crypto.mldsa65_sign(aik_priv_mldsa, new Bytes(sp))));
+        } catch (GLib.Error e) {
+            warning("publish_device_list: hybrid signing failed for %s: %s", own_jid, e.message);
+            return;
+        }
+
+        // The cert/sig strings MUST be added as text sub-nodes, not via the `val`
+        // initialiser (which is ignored for element StanzaNodes on serialization).
+        // <sig>/<mldsa-sig> are children of <devicelist> (siblings of <device>) so
+        // they survive PEP item delivery, which hands the receiver only the first
+        // item child (the <devicelist> element).
         StanzaNode node = new StanzaNode.build("devicelist", Protocol.NS_DEVICELIST)
             .add_self_xmlns()
-            .put_attribute("version", "1")
-            .put_attribute("issued-at", ((long) new DateTime.now_utc().to_unix()).to_string())
+            .put_attribute("version", version.to_string())
+            .put_attribute("issued-at", issued_at.to_string())
             .put_node(new StanzaNode.build("device", Protocol.NS_DEVICELIST)
                 .put_attribute("id", ((!) device_id).to_string())
                 .put_attribute("added-at", added_at.to_string())
-                .put_attribute("flags", "1")
+                .put_attribute("flags", flags.to_string())
                 .put_node(new StanzaNode.build("cert", Protocol.NS_DEVICELIST)
-                    .put_node(new StanzaNode.text(cert))));
+                    .put_node(new StanzaNode.text(cert))))
+            .put_node(new StanzaNode.build("sig", Protocol.NS_DEVICELIST)
+                .put_node(new StanzaNode.text(sig_b64)))
+            .put_node(new StanzaNode.build("mldsa-sig", Protocol.NS_DEVICELIST)
+                .put_node(new StanzaNode.text(mldsa_sig_b64)));
 
         if (yield stream.get_module(Pubsub.Module.IDENTITY).publish(stream, null, Protocol.NS_DEVICELIST, "current", node, PUBLISH_OPTIONS)) {
             yield try_make_node_public(stream, Protocol.NS_DEVICELIST);
-            db.store_device_list_payload(account, account.bare_jid.to_string(), "current", node.to_string());
+            db.store_device_list_payload(account, own_jid, "current", node.to_string(), version, true, content_key);
         }
+    }
+
+    // Canonical device-set key for one device: "id|added_at|flags|cert". For a
+    // multi-device list the caller joins the per-device keys sorted by id with
+    // ';'. Used to decide own-version bumps (§8.2) and detect same-version forks
+    // (§8.5); deliberately excludes version/issued_at.
+    private static string build_device_content_key_single(uint32 device_id, int64 added_at, uint8 flags, string cert_b64) {
+        return @"$device_id|$added_at|$flags|$cert_b64";
     }
 
     private async void publish_bundle(XmppStream stream) {
@@ -269,30 +324,186 @@ public class StreamModule : XmppStreamModule {
     private ArrayList<int> parse_device_list(XmppStream stream, Jid jid, string? id, StanzaNode? node_) {
         ArrayList<int> devices = new ArrayList<int>();
         StanzaNode node = node_ ?? new StanzaNode.build("devicelist", Protocol.NS_DEVICELIST).add_self_xmlns();
+        string bare = jid.bare_jid.to_string();
+        bool is_self = jid.bare_jid.equals(account.bare_jid);
+
+        // Collect device entries once; keep cert base64 + added_at for storage.
+        var entries = new Gee.ArrayList<Protocol.DeviceListDevice>();
+        var cert_by_id = new Gee.HashMap<int, string?>();
+        var added_by_id = new Gee.HashMap<int, long?>();
         foreach (StanzaNode device_node in node.get_subnodes("device", Protocol.NS_DEVICELIST)) {
             int device_id = device_node.get_attribute_int("id");
-            devices.add(device_id);
             StanzaNode? cert_node = device_node.get_subnode("cert", Protocol.NS_DEVICELIST);
-            // XEP §8.4: carry per-device added-at so the signed SignedPart (§8.3)
-            // can be reconstructed. Absent (legacy peer) => 0.
+            string? cert_b64 = cert_node != null ? cert_node.get_string_content() : null;
+            // XEP §8.4: added-at is part of the signed input (§8.3). Absent
+            // (legacy peer) => 0.
             string? added_at_str = device_node.get_attribute("added-at");
-            long added_at = 0;
-            if (added_at_str != null) {
-                added_at = (long) int64.parse((!) added_at_str);
+            long added_at = added_at_str != null ? (long) int64.parse((!) added_at_str) : 0;
+            int flags = device_node.get_attribute_int("flags");
+            if (flags < 0) flags = 0;
+            var e = new Protocol.DeviceListDevice();
+            e.device_id = (uint32) device_id;
+            e.added_at = added_at;
+            e.flags = (uint8) flags;
+            try {
+                e.cert_bytes = cert_b64 != null ? bytes_to_uint8_array(bytes_from_base64(cert_b64)) : new uint8[0];
+            } catch (GLib.Error err) {
+                e.cert_bytes = new uint8[0];
             }
-            db.store_remote_device(account, jid.bare_jid.to_string(), device_id, cert_node != null ? cert_node.get_string_content() : null, added_at);
+            entries.add(e);
+            cert_by_id[device_id] = cert_b64;
+            added_by_id[device_id] = added_at;
         }
-        db.store_device_list_payload(account, jid.bare_jid.to_string(), id, node.to_string());
-        // The published devicelist is authoritative — drop cached
-        // peer_device / bundle / pairwise_session rows for ids that are
-        // no longer present (peer regenerated). Otherwise we keep
-        // addressing pairwise envelopes (including sender-chain
-        // announcements) to ghost devices the peer no longer recognises.
-        if (!jid.bare_jid.equals(account.bare_jid)) {
-            db.prune_remote_devices_not_in(account, jid.bare_jid.to_string(), devices);
+
+        // Canonical content key (sorted by device_id), excluding version/issued_at.
+        entries.sort((a, b) => (a.device_id < b.device_id) ? -1 : (a.device_id > b.device_id ? 1 : 0));
+        StringBuilder ck = new StringBuilder();
+        foreach (Protocol.DeviceListDevice e in entries) {
+            if (ck.len > 0) ck.append(";");
+            ck.append(build_device_content_key_single(e.device_id, e.added_at, e.flags, Base64.encode(e.cert_bytes)));
         }
+        string content_key = ck.str;
+
+        // The account's own devicelist echo: version/content are maintained by
+        // publish_device_list; just refresh the stored payload (sentinels keep
+        // the version/signed/content columns intact) and surface the ids.
+        if (!is_self) {
+            long accepted_version;
+            bool accepted_signed;
+            bool accept = verify_inbound_devicelist(jid, node, entries, content_key,
+                out accepted_version, out accepted_signed);
+            if (!accept) {
+                // Rejected (rollback/fork/bad-sig/downgrade). Keep the last good
+                // state and surface the previously verified device ids.
+                foreach (int existing_id in db.get_remote_device_ids(account, bare)) {
+                    devices.add(existing_id);
+                }
+                return devices;
+            }
+            foreach (Protocol.DeviceListDevice e in entries) {
+                int did = (int) e.device_id;
+                devices.add(did);
+                db.store_remote_device(account, bare, did, cert_by_id[did], added_by_id[did] ?? 0);
+            }
+            db.store_device_list_payload(account, bare, id, node.to_string(),
+                accepted_version, accepted_signed, content_key);
+            // The published devicelist is authoritative — drop cached peer_device
+            // / bundle / pairwise_session rows for ids no longer present (§8.6).
+            db.prune_remote_devices_not_in(account, bare, devices);
+            device_list_loaded(jid, devices);
+            return devices;
+        }
+
+        foreach (Protocol.DeviceListDevice e in entries) {
+            int did = (int) e.device_id;
+            devices.add(did);
+            db.store_remote_device(account, bare, did, cert_by_id[did], added_by_id[did] ?? 0);
+        }
+        db.store_device_list_payload(account, bare, id, node.to_string());
         device_list_loaded(jid, devices);
         return devices;
+    }
+
+    // Apply the §8.5 verification/version gate for an inbound peer devicelist.
+    // Returns true to ACCEPT (caller stores devices + version + content); false
+    // to REJECT (caller keeps the last good state). On accept, out_version /
+    // out_signed carry the version and the sticky signed flag to persist.
+    private bool verify_inbound_devicelist(Jid jid, StanzaNode node,
+            Gee.List<Protocol.DeviceListDevice> entries, string content_key,
+            out long out_version, out bool out_signed) {
+        string bare = jid.bare_jid.to_string();
+        long version = (long) int64.parse(node.get_attribute("version") ?? "0");
+        long issued_at = (long) int64.parse(node.get_attribute("issued-at") ?? "0");
+        out_version = version;
+        out_signed = false;
+
+        StanzaNode? sig_node = node.get_subnode("sig", Protocol.NS_DEVICELIST);
+        StanzaNode? mldsa_node = node.get_subnode("mldsa-sig", Protocol.NS_DEVICELIST);
+        string? sig_b64 = sig_node != null ? sig_node.get_string_content() : null;
+        string? mldsa_b64 = mldsa_node != null ? mldsa_node.get_string_content() : null;
+        bool has_sig = sig_b64 != null && sig_b64 != "" && mldsa_b64 != null && mldsa_b64 != "";
+
+        long last_version = db.get_device_list_version(account, bare);
+        bool signed_before = db.get_device_list_signed_accepted(account, bare);
+        string? last_content_key = db.get_device_list_content_key(account, bare);
+
+        // Transitional rule (§8.5): an unsigned list is acceptable ONLY if we have
+        // never yet accepted a signed list for this account. Once signed, an
+        // unsigned list is a downgrade attempt and MUST be rejected.
+        if (!has_sig) {
+            if (signed_before) {
+                warning("x3dhpq devicelist from %s rejected: unsigned after a signed list was accepted (downgrade)", bare);
+                return false;
+            }
+            out_signed = false;
+            return true;   // legacy unsigned peer, provisionally accepted
+        }
+
+        // Signed path: we need the peer AIK to verify. First contact (AIK unknown)
+        // — defer the gate rather than hard-fail so we can still learn the peer.
+        Bytes aik_ed;
+        Bytes aik_mldsa;
+        if (!db.get_peer_aik_pubs(account, bare, out aik_ed, out aik_mldsa)) {
+            out_signed = false;   // do not arm the signed gate until AIK is known
+            return true;
+        }
+
+        // Reconstruct the SignedPart (§8.3) and verify BOTH AIK signatures (§7.7).
+        uint8[] sp = Protocol.DeviceListSigned.signed_part((uint64) version, issued_at, entries);
+        try {
+            Bytes ed_sig = bytes_from_base64((!) sig_b64);
+            Bytes ml_sig = bytes_from_base64((!) mldsa_b64);
+            bool ok = global::X3dhpq.Crypto.ed25519_verify(aik_ed, new Bytes(sp), ed_sig)
+                   && global::X3dhpq.Crypto.mldsa65_verify(aik_mldsa, new Bytes(sp), ml_sig);
+            if (!ok) {
+                warning("x3dhpq devicelist from %s rejected: AIK signature does not verify", bare);
+                return false;
+            }
+        } catch (GLib.Error e) {
+            warning("x3dhpq devicelist from %s rejected: signature decode/verify error: %s", bare, e.message);
+            return false;
+        }
+
+        // Clock-skew guard (§8.5): issued_at more than 300s in the future.
+        long now = (long) new DateTime.now_utc().to_unix();
+        if (issued_at > now + 300) {
+            warning("x3dhpq devicelist from %s rejected: issued_at too far in the future", bare);
+            return false;
+        }
+
+        // Version rules (§8.5): reject rollback and same-version forks.
+        if (version < last_version) {
+            warning("x3dhpq devicelist from %s rejected: version %ld < last seen %ld (rollback)", bare, version, last_version);
+            return false;
+        }
+        if (version == last_version) {
+            if (signed_before && last_content_key != null && last_content_key != content_key) {
+                warning("x3dhpq devicelist from %s rejected: same version %ld but different content (fork)", bare, version);
+                return false;
+            }
+            out_signed = true;   // idempotent no-op / first signed at this version
+            return true;
+        }
+
+        // version > last_version: verify each embedded DC against the AIK (§7.3).
+        foreach (Protocol.DeviceListDevice e in entries) {
+            Protocol.DeviceCertificate? dc = Protocol.DeviceCertificate.unmarshal(new Bytes(e.cert_bytes));
+            if (dc == null) {
+                warning("x3dhpq devicelist from %s rejected: undecodable DC for device %u", bare, e.device_id);
+                return false;
+            }
+            try {
+                if (!dc.verify(aik_ed, aik_mldsa)) {
+                    warning("x3dhpq devicelist from %s rejected: DC for device %u fails AIK verification", bare, e.device_id);
+                    return false;
+                }
+            } catch (GLib.Error err) {
+                warning("x3dhpq devicelist from %s rejected: DC verify error for device %u: %s", bare, e.device_id, err.message);
+                return false;
+            }
+        }
+        out_signed = true;
+        return true;
     }
 
     private void parse_bundle(XmppStream stream, Jid jid, int device_id, StanzaNode? node) {
