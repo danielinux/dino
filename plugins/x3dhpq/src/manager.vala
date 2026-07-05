@@ -976,9 +976,50 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         try {
             gs.accept_sender_chain(ann);
             db.store_group_session(account, room_jid_str, gs);
+            // A sender chain was just installed. Group messages that arrived
+            // while we lacked this recv chain were dropped ("no recv chain"),
+            // so trigger a MUC MAM catch-up to have them re-delivered and now
+            // decrypt. Mirrors PQonversations
+            // GroupCryptoService.triggerMamCatchupAfterChain.
+            trigger_group_mam_catchup(account, room_jid_str);
         } catch (GLib.Error e) {
             warning("x3dhpq accept_sender_chain failed for %s: %s", room_jid_str, e.message);
         }
+    }
+
+    // Per-room guard so we don't fan out overlapping MAM catch-up queries when
+    // several sender-chain announcements land in quick succession.
+    private Gee.HashSet<string> group_mam_catchup_in_flight = new Gee.HashSet<string>();
+
+    // Kick off a MUC (XEP-0313) MAM catch-up for the given room via Dino core's
+    // HistorySync. Idempotent per (account, room): a query already in flight is
+    // not re-issued.
+    private void trigger_group_mam_catchup(Dino.Entities.Account account, string room_jid_str) {
+        string key = "%d/%s".printf(account.id, room_jid_str);
+        if (group_mam_catchup_in_flight.contains(key)) {
+            return;
+        }
+        Jid room_jid;
+        try {
+            room_jid = new Jid(room_jid_str);
+        } catch (InvalidJidError e) {
+            return;
+        }
+        MessageProcessor? mp = app.stream_interactor.get_module(MessageProcessor.IDENTITY);
+        if (mp == null || mp.history_sync == null) {
+            return;
+        }
+        unowned HistorySync history_sync = mp.history_sync;
+        Conversation? conversation = app.stream_interactor.get_module(ConversationManager.IDENTITY)
+            .get_conversation(room_jid.bare_jid, account, Conversation.Type.GROUPCHAT);
+        DateTime until = (conversation != null && conversation.active_last_changed != null)
+            ? conversation.active_last_changed.add(-TimeSpan.DAY * 5)
+            : new DateTime.from_unix_utc(0);
+        group_mam_catchup_in_flight.add(key);
+        history_sync.fetch_everything.begin(account, room_jid.bare_jid, null, until, (_, res) => {
+            history_sync.fetch_everything.end(res);
+            group_mam_catchup_in_flight.remove(key);
+        });
     }
 
     private bool decrypt_group_message(Entities.Message message, Xmpp.MessageStanza stanza, Conversation conversation, StanzaNode group_env) {
