@@ -203,7 +203,15 @@ namespace Dino.Ui.ConversationDetails {
         Jid? own_jid = muc_manager.get_own_jid(conversation.counterpart, conversation.account);
         if (own_jid != null) {
             Xmpp.Xep.Muc.Affiliation own_affiliation = muc_manager.get_affiliation(conversation.counterpart, own_jid, conversation.account) ?? Xmpp.Xep.Muc.Affiliation.NONE;
-            if (own_affiliation == Xmpp.Xep.Muc.Affiliation.ADMIN || own_affiliation == Xmpp.Xep.Muc.Affiliation.OWNER) {
+            // In a secret post-quantum (members-only) group only the owner can
+            // manage membership, because the x3dhpq membership journal must be
+            // signed by the room owner's AIK. In public rooms admins may also
+            // invite. Non-owners see the member list but get no invite control.
+            bool is_private = muc_manager.is_private_room(conversation.account, conversation.counterpart);
+            bool can_invite = is_private ?
+                    own_affiliation == Xmpp.Xep.Muc.Affiliation.OWNER :
+                    (own_affiliation == Xmpp.Xep.Muc.Affiliation.ADMIN || own_affiliation == Xmpp.Xep.Muc.Affiliation.OWNER);
+            if (can_invite) {
                 invite_to_room(view_model, conversation, stream_interactor);
             }
         }
@@ -239,12 +247,20 @@ namespace Dino.Ui.ConversationDetails {
     private async void send_invite(Conversation conversation, StreamInteractor stream_interactor, Jid jid) {
         var muc_manager = stream_interactor.get_module(MucManager.IDENTITY);
         if (muc_manager.is_private_room(conversation.account, conversation.counterpart)) {
+            Application? app = GLib.Application.get_default() as Application;
+            // Pre-flight: a secret post-quantum group can only include contacts
+            // that publish an x3dhpq devicelist. Surface a clear message rather
+            // than letting the membership-journal add fail silently.
+            if (app != null && app.plugin_registry.x3dhpq_group_manager != null &&
+                    !app.plugin_registry.x3dhpq_group_manager.member_has_x3dhpq(conversation.account, jid)) {
+                show_group_error(_("Could not invite contact"), _("%s isn’t using a post-quantum client, so they can’t join this secret group.").printf(jid.to_string()));
+                return;
+            }
             bool success = yield muc_manager.yield_change_affiliation_for_jid(conversation.account, conversation.counterpart, jid, "member");
             if (!success) {
                 show_group_error(_("Could not invite contact"), _("Dino could not grant membership for %s in this private channel.").printf(jid.to_string()));
                 return;
             }
-            Application? app = GLib.Application.get_default() as Application;
             if (app != null && app.plugin_registry.x3dhpq_group_manager != null) {
                 if (!(yield app.plugin_registry.x3dhpq_group_manager.add_private_group_member(conversation.account, conversation.counterpart, jid))) {
                     show_group_error(_("Could not invite contact"), _("Dino could not publish x3dhpq membership data for %s in this private channel.").printf(jid.to_string()));
@@ -403,6 +419,12 @@ namespace Dino.Ui.ConversationDetails {
             view_model.about_rows.append(time_row);
         }
         if (conversation.type_ == Conversation.Type.GROUPCHAT) {
+            if (stream_interactor.get_module(MucManager.IDENTITY).is_private_room(conversation.account, conversation.counterpart)) {
+                view_model.about_rows.append(new ViewModel.PreferencesRow.Text() {
+                    title = _("Secret Post-Quantum Group"),
+                    text = _("Invite-only and end-to-end post-quantum encrypted. Only the owner can add or remove members.")
+                });
+            }
             add_group_management_rows(view_model, conversation, stream_interactor);
             var topic = stream_interactor.get_module(MucManager.IDENTITY).get_groupchat_subject(conversation.counterpart, conversation.account);
 
