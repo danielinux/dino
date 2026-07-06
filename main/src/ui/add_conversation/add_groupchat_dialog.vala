@@ -19,19 +19,35 @@ protected class AddGroupchatDialog : Gtk.Dialog {
     [GtkChild] private unowned Entry nick_entry;
     [GtkChild] private unowned Entry password_entry;
     [GtkChild] private unowned Switch private_group_switch;
+    [GtkChild] private unowned Label jid_label;
+    [GtkChild] private unowned Label nick_label;
+    [GtkChild] private unowned Label password_label;
+    [GtkChild] private unowned Label private_group_label;
+    [GtkChild] private unowned Label alias_label;
+    [GtkChild] private unowned Box secret_header;
+    [GtkChild] private unowned Label secret_header_subtitle;
 
     private StreamInteractor stream_interactor;
     private bool alias_entry_changed = false;
+    // When true, this dialog only ever creates an invite-only, non-anonymous,
+    // persistent, x3dhpq-encrypted "Secret Post-Quantum Group". The JID is
+    // auto-generated on the account's MUC service and encryption is always on.
+    private bool secret_pq_mode = false;
 
-    public AddGroupchatDialog(StreamInteractor stream_interactor, string? title = null, bool private_group_default = true) {
+    public AddGroupchatDialog(StreamInteractor stream_interactor, string? title = null, bool private_group_default = true, bool secret_pq_mode = false) {
         Object(use_header_bar : 1);
         this.stream_interactor = stream_interactor;
-        this.title = title ?? _("New Channel");
-        ok_button.label = _("Create");
+        this.secret_pq_mode = secret_pq_mode;
+        this.title = title ?? (secret_pq_mode ? _("New Secret Post-Quantum Group") : _("New Channel"));
+        ok_button.label = secret_pq_mode ? _("Create Secret Group") : _("Create");
         ok_button.add_css_class("suggested-action"); // TODO why doesn't it work in XML
         accounts_stack.set_visible_child_name("combobox");
         account_combobox.initialize(stream_interactor);
-        private_group_switch.active = private_group_default;
+        private_group_switch.active = secret_pq_mode || private_group_default;
+
+        if (secret_pq_mode) {
+            setup_secret_pq_mode();
+        }
 
         cancel_button.clicked.connect(() => { close(); });
         ok_button.clicked.connect(() => { on_ok_button_clicked.begin(); });
@@ -39,6 +55,54 @@ protected class AddGroupchatDialog : Gtk.Dialog {
         jid_entry.changed.connect(on_jid_key_release);
         nick_entry.changed.connect(check_ok);
         account_combobox.changed.connect(check_ok);
+        if (secret_pq_mode) {
+            account_combobox.changed.connect(update_secret_server_gate);
+            update_secret_server_gate();
+        }
+    }
+
+    // Configure the dialog as an explicit "Secret Post-Quantum Group" creator:
+    // reveal the post-quantum / invite-only banner, force the private group
+    // toggle on and hide it (encryption is always-on), and drop the manual JID,
+    // nick and password fields — the room is auto-created on the account's MUC
+    // service and the user only picks a display name.
+    private void setup_secret_pq_mode() {
+        secret_header.visible = true;
+        private_group_switch.active = true;
+
+        jid_entry.visible = false;
+        jid_label.visible = false;
+        nick_entry.visible = false;
+        nick_label.visible = false;
+        password_entry.visible = false;
+        password_label.visible = false;
+        private_group_switch.visible = false;
+        private_group_label.visible = false;
+
+        alias_label.label = _("Name");
+        alias_entry.grab_focus();
+    }
+
+    // Server capability gate: only offer creation if the selected account has a
+    // discovered MUC (XEP-0045) conference service. Dino discovers a
+    // CATEGORY_CONFERENCE service (advertising http://jabber.org/protocol/muc)
+    // and exposes it via MucManager.default_muc_server; a null entry means the
+    // server does not offer group chats, so we disable creation and explain why.
+    private void update_secret_server_gate() {
+        if (!secret_pq_mode) return;
+        Account? account = account_combobox.selected;
+        bool muc_available = account != null &&
+                stream_interactor.get_module(MucManager.IDENTITY).default_muc_server[account] != null;
+        if (muc_available) {
+            secret_header_subtitle.label = _("End-to-end post-quantum encrypted and invite-only. Only you, the creator, can add or remove members.");
+            secret_header_subtitle.remove_css_class("error");
+            alias_entry.sensitive = true;
+        } else {
+            secret_header_subtitle.label = _("Your server doesn’t allow group chats, so a secret group can’t be created on this account.");
+            secret_header_subtitle.add_css_class("error");
+            alias_entry.sensitive = false;
+        }
+        check_ok();
     }
 
     private void on_jid_key_release() {
@@ -58,6 +122,14 @@ protected class AddGroupchatDialog : Gtk.Dialog {
     }
 
     private void check_ok() {
+        if (secret_pq_mode) {
+            // JID is auto-generated on the account's MUC service; the only
+            // requirement is that such a service exists.
+            Account? account = account_combobox.selected;
+            ok_button.sensitive = account != null &&
+                    stream_interactor.get_module(MucManager.IDENTITY).default_muc_server[account] != null;
+            return;
+        }
         if (jid_entry.text.strip() == "") {
             ok_button.sensitive = stream_interactor.get_module(MucManager.IDENTITY).default_muc_server[account_combobox.selected] != null;
             return;

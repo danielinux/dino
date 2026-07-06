@@ -191,6 +191,14 @@ public class Dino.Ui.Application : Adw.Application, Dino.Application {
         add_action(conference_action);
         set_accels_for_action("app.add_conference", KEY_COMBINATION_ADD_CONFERENCE);
 
+        SimpleAction secret_group_action = new SimpleAction("add_secret_group", null);
+        secret_group_action.activate.connect(() => {
+            AddGroupchatDialog add_secret_group_dialog = new AddGroupchatDialog(stream_interactor, _("New Secret Post-Quantum Group"), true, true);
+            add_secret_group_dialog.set_transient_for(window);
+            add_secret_group_dialog.present();
+        });
+        add_action(secret_group_action);
+
         SimpleAction accept_muc_invite_action = new SimpleAction("open-muc-join", VariantType.INT32);
         accept_muc_invite_action.activate.connect((variant) => {
             Conversation? conversation = stream_interactor.get_module(ConversationManager.IDENTITY).get_conversation_by_id(variant.get_int32());

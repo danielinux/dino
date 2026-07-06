@@ -11,5 +11,11 @@
                 <attribute name="label" translatable="yes">Join Channel</attribute>
             </item>
         </section>
+        <section>
+            <item>
+                <attribute name="action">app.add_secret_group</attribute>
+                <attribute name="label" translatable="yes">New Secret Post-Quantum Group</attribute>
+            </item>
+        </section>
     </menu>
 </interface>

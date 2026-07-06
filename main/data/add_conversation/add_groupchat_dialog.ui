@@ -24,6 +24,53 @@
         </child>
         <child internal-child="content_area">
             <object class="GtkBox" id="main">
+                <property name="orientation">vertical</property>
+                <child>
+                    <object class="GtkBox" id="secret_header">
+                        <property name="visible">False</property>
+                        <property name="orientation">horizontal</property>
+                        <property name="spacing">12</property>
+                        <property name="margin-start">20</property>
+                        <property name="margin-end">20</property>
+                        <property name="margin-top">18</property>
+                        <property name="margin-bottom">6</property>
+                        <child>
+                            <object class="GtkImage" id="secret_header_icon">
+                                <property name="icon-name">dino-changes-prevent-symbolic</property>
+                                <property name="pixel-size">32</property>
+                                <property name="valign">start</property>
+                            </object>
+                        </child>
+                        <child>
+                            <object class="GtkBox">
+                                <property name="orientation">vertical</property>
+                                <property name="spacing">2</property>
+                                <property name="hexpand">True</property>
+                                <child>
+                                    <object class="GtkLabel" id="secret_header_title">
+                                        <property name="label" translatable="1">Secret Post-Quantum Group</property>
+                                        <property name="xalign">0</property>
+                                        <property name="wrap">True</property>
+                                        <style>
+                                            <class name="title-4"/>
+                                        </style>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="GtkLabel" id="secret_header_subtitle">
+                                        <property name="label" translatable="1">End-to-end post-quantum encrypted and invite-only. Only you, the creator, can add or remove members.</property>
+                                        <property name="xalign">0</property>
+                                        <property name="wrap">True</property>
+                                        <property name="max-width-chars">40</property>
+                                        <style>
+                                            <class name="dim-label"/>
+                                        </style>
+                                    </object>
+                                </child>
+                            </object>
+                        </child>
+                    </object>
+                </child>
                 <child>
                     <object class="GtkGrid">
                         <property name="orientation">vertical</property>
@@ -76,7 +123,7 @@
                             </object>
                         </child>
                         <child>
-                            <object class="GtkLabel">
+                            <object class="GtkLabel" id="jid_label">
                                 <property name="label">JID</property>
                                 <property name="xalign">1</property>
                                 <layout>
@@ -97,7 +144,7 @@
                             </object>
                         </child>
                         <child>
-                            <object class="GtkLabel">
+                            <object class="GtkLabel" id="nick_label">
                                 <property name="label" translatable="1">Nick</property>
                                 <property name="xalign">1</property>
                                 <layout>
@@ -118,7 +165,7 @@
                             </object>
                         </child>
                         <child>
-                            <object class="GtkLabel">
+                            <object class="GtkLabel" id="password_label">
                                 <property name="label" translatable="1">Password</property>
                                 <property name="xalign">1</property>
                                 <layout>
@@ -140,7 +187,7 @@
                             </object>
                         </child>
                         <child>
-                            <object class="GtkLabel">
+                            <object class="GtkLabel" id="private_group_label">
                                 <property name="label" translatable="1">Private group</property>
                                 <property name="xalign">1</property>
                                 <layout>
