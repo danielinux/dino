@@ -120,6 +120,10 @@ public class Dino.Ui.ViewModel.ConferenceMemberListRow : Object {
     public string jid { get; set; }
     public Xmpp.Xep.Muc.Affiliation affiliation { get; set; }
     public string? affiliation_str { get; set; }
+    // x3dhpq AIK verification state, only shown in secret post-quantum groups.
+    public bool trust_badge_visible { get; set; default = false; }
+    public string? trust_badge { get; set; }
+    public string? trust_icon { get; set; }
 
     construct {
         this.bind_property("affiliation", this, "affiliation-str", BindingFlags.SYNC_CREATE | BindingFlags.BIDIRECTIONAL, (_, from_value, ref to_value) => {

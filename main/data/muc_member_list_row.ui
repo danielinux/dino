@@ -42,6 +42,44 @@
                   </object>
                 </child>
                 <child>
+                  <object class="GtkImage" id="trust_icon">
+                    <property name="margin-end">3</property>
+                    <property name="pixel-size">12</property>
+                    <binding name="visible">
+                      <lookup name="trust-badge-visible" type="DinoUiViewModelConferenceMemberListRow">
+                        <lookup name="item">GtkListItem</lookup>
+                      </lookup>
+                    </binding>
+                    <binding name="icon-name">
+                      <lookup name="trust-icon" type="DinoUiViewModelConferenceMemberListRow">
+                        <lookup name="item">GtkListItem</lookup>
+                      </lookup>
+                    </binding>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkLabel" id="trust_label">
+                    <property name="margin-end">6</property>
+                    <property name="xalign">1</property>
+                    <style>
+                      <class name="dim-label"/>
+                    </style>
+                    <attributes>
+                      <attribute name="scale" value="0.85"/>
+                    </attributes>
+                    <binding name="visible">
+                      <lookup name="trust-badge-visible" type="DinoUiViewModelConferenceMemberListRow">
+                        <lookup name="item">GtkListItem</lookup>
+                      </lookup>
+                    </binding>
+                    <binding name="label">
+                      <lookup name="trust-badge" type="DinoUiViewModelConferenceMemberListRow">
+                        <lookup name="item">GtkListItem</lookup>
+                      </lookup>
+                    </binding>
+                  </object>
+                </child>
+                <child>
                   <object class="GtkLabel" id="affiliation_label">
                     <property name="margin-end">6</property>
                     <property name="xalign">1</property>

@@ -36,12 +36,14 @@ namespace Dino.Ui.ConversationDetails {
         view_model.members.set_map_func((item) => {
             var conference_member = (Ui.Model.ConferenceMember) item;
             Jid? nick_jid = stream_interactor.get_module(MucManager.IDENTITY).get_occupant_jid(model.conversation.account, model.conversation.counterpart, conference_member.jid);
-            return new Ui.ViewModel.ConferenceMemberListRow() {
+            var row = new Ui.ViewModel.ConferenceMemberListRow() {
                 avatar = new ViewModel.CompatAvatarPictureModel(stream_interactor).add_participant(model.conversation, conference_member.jid),
                 name = nick_jid != null ? nick_jid.resourcepart : conference_member.jid.localpart,
                 jid = conference_member.jid.to_string(),
                 affiliation = conference_member.affiliation
             };
+            populate_member_trust_badge(row, model.conversation, conference_member.jid, stream_interactor);
+            return row;
         });
         view_model.account_jid = stream_interactor.get_accounts().size > 1 ? model.conversation.account.bare_jid.to_string() : null;
 
@@ -157,6 +159,41 @@ namespace Dino.Ui.ConversationDetails {
 
     private static void notify_binding_once(Binding binding) {
         binding.source.notify_property(binding.source_property);
+    }
+
+    // For secret post-quantum groups (members-only x3dhpq rooms), annotate each
+    // member row with its AIK verification/trust state so the local user can see
+    // at a glance whether a member is verified. Non-PQ contacts are flagged too.
+    private void populate_member_trust_badge(ViewModel.ConferenceMemberListRow row, Conversation conversation, Jid member_jid, StreamInteractor stream_interactor) {
+        var muc_manager = stream_interactor.get_module(MucManager.IDENTITY);
+        if (!muc_manager.is_private_room(conversation.account, conversation.counterpart)) return;
+        if (member_jid.equals_bare(conversation.account.bare_jid)) return;
+
+        Application? app = GLib.Application.get_default() as Application;
+        if (app == null || app.plugin_registry.x3dhpq_group_manager == null) return;
+        var gm = app.plugin_registry.x3dhpq_group_manager;
+
+        if (!gm.member_has_x3dhpq(conversation.account, member_jid)) {
+            row.trust_badge = _("No PQ client");
+            row.trust_icon = "dialog-warning-symbolic";
+            row.trust_badge_visible = true;
+            return;
+        }
+        switch (gm.get_member_trust_state(conversation.account, member_jid)) {
+            case Plugins.MemberTrustState.VERIFIED:
+                row.trust_badge = _("Verified");
+                row.trust_icon = "emblem-ok-symbolic";
+                break;
+            case Plugins.MemberTrustState.ROTATED:
+                row.trust_badge = _("Key changed");
+                row.trust_icon = "dialog-warning-symbolic";
+                break;
+            default:
+                row.trust_badge = _("Unverified");
+                row.trust_icon = "dialog-question-symbolic";
+                break;
+        }
+        row.trust_badge_visible = true;
     }
 
     private void add_group_management_rows(ViewModel.ConversationDetails view_model, Conversation conversation, StreamInteractor stream_interactor) {
