@@ -1173,6 +1173,30 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         }
     }
 
+    // Whether the JID publishes a usable x3dhpq devicelist (at least one active
+    // device). Used by the member-management UI to distinguish "can be added"
+    // from "not a post-quantum client".
+    public bool member_has_x3dhpq(Dino.Entities.Account account, Jid member_jid) {
+        string bare = member_jid.bare_jid.to_string();
+        return db.has_remote_device_list(account, bare)
+            && db.get_remote_device_ids(account, bare).size > 0;
+    }
+
+    // Map the persisted peer AIK trust_state to the UI-facing enum.
+    public global::Dino.Plugins.MemberTrustState get_member_trust_state(Dino.Entities.Account account, Jid member_jid) {
+        string bare = member_jid.bare_jid.to_string();
+        Row? identity = db.get_peer_account_identity_row(account, bare);
+        if (identity == null) {
+            return global::Dino.Plugins.MemberTrustState.UNKNOWN;
+        }
+        string trust_state = ((!) identity)[db.peer_account_identity.trust_state];
+        switch (trust_state) {
+            case "verified": return global::Dino.Plugins.MemberTrustState.VERIFIED;
+            case "rotated": return global::Dino.Plugins.MemberTrustState.ROTATED;
+            default: return global::Dino.Plugins.MemberTrustState.UNVERIFIED;
+        }
+    }
+
     public async bool add_private_group_member(Dino.Entities.Account account, Jid room_jid, Jid member_jid) {
         XmppStream? stream = app.stream_interactor.get_stream(account);
         StreamModule? module = app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);

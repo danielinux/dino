@@ -117,10 +117,25 @@ public interface VideoCallPlugin : Object {
     public abstract void dump_dot();
 }
 
+public enum MemberTrustState {
+    UNKNOWN,    // No x3dhpq identity known for this JID yet.
+    UNVERIFIED, // AIK known via TOFU but not manually verified.
+    VERIFIED,   // AIK manually verified by the local user.
+    ROTATED     // AIK changed since last seen and needs review.
+}
+
 public interface X3dhpqGroupManager : Object {
     public abstract async bool ensure_private_group_bootstrapped(Dino.Entities.Account account, Jid room_jid);
     public abstract async bool add_private_group_member(Dino.Entities.Account account, Jid room_jid, Jid member_jid);
     public abstract async bool remove_private_group_member(Dino.Entities.Account account, Jid room_jid, Jid member_jid);
+
+    // Whether the JID publishes an x3dhpq devicelist/bundle (i.e. can be added
+    // to a secret post-quantum group at all). Non-PQ contacts return false so
+    // the UI can surface a clear message instead of a silent failure.
+    public abstract bool member_has_x3dhpq(Dino.Entities.Account account, Jid member_jid);
+
+    // The verification/trust state of a member's authentication identity key.
+    public abstract MemberTrustState get_member_trust_state(Dino.Entities.Account account, Jid member_jid);
 }
 
 public interface VideoCallWidget : Object {
