@@ -86,7 +86,13 @@ public class View : Popover {
         Xmpp.Xep.Muc.Role? role = stream_interactor.get_module(MucManager.IDENTITY).get_role(own_jid, conversation.account);
         Xmpp.Xep.Muc.Affiliation? own_affiliation = own_jid != null ? stream_interactor.get_module(MucManager.IDENTITY).get_affiliation(conversation.counterpart, own_jid, conversation.account) : Xmpp.Xep.Muc.Affiliation.NONE;
 
-        bool can_invite = own_affiliation == Xmpp.Xep.Muc.Affiliation.ADMIN || own_affiliation == Xmpp.Xep.Muc.Affiliation.OWNER;
+        // In a secret post-quantum (members-only) group only the owner can add
+        // members, since the x3dhpq membership journal is signed by the owner's
+        // AIK. Public rooms keep the usual admin-or-owner rule.
+        bool is_private_room = stream_interactor.get_module(MucManager.IDENTITY).is_private_room(conversation.account, conversation.counterpart);
+        bool can_invite = is_private_room ?
+                own_affiliation == Xmpp.Xep.Muc.Affiliation.OWNER :
+                (own_affiliation == Xmpp.Xep.Muc.Affiliation.ADMIN || own_affiliation == Xmpp.Xep.Muc.Affiliation.OWNER);
         if (can_invite && invite_list == null) {
             invite_list = new ListBox();
             invite_list.append(new ListRow.label("+", _("Invite")).get_widget());
@@ -192,11 +198,18 @@ public class View : Popover {
     private async void invite_occupant_async(Account account, Jid muc_jid, Jid invitee_jid, StreamInteractor stream_interactor) {
         var muc_manager = stream_interactor.get_module(MucManager.IDENTITY);
         if (muc_manager.is_private_room(account, muc_jid)) {
+            Application? app = GLib.Application.get_default() as Application;
+            // A secret post-quantum group can only include contacts that publish
+            // an x3dhpq devicelist; surface a clear message otherwise.
+            if (app != null && app.plugin_registry.x3dhpq_group_manager != null &&
+                    !app.plugin_registry.x3dhpq_group_manager.member_has_x3dhpq(account, invitee_jid)) {
+                show_invite_error(_("%s isn’t using a post-quantum client, so they can’t join this secret group.").printf(invitee_jid.to_string()));
+                return;
+            }
             bool success = yield muc_manager.yield_change_affiliation_for_jid(account, muc_jid, invitee_jid, "member");
             if (!success) {
                 return;
             }
-            Application? app = GLib.Application.get_default() as Application;
             if (app != null && app.plugin_registry.x3dhpq_group_manager != null) {
                 if (!(yield app.plugin_registry.x3dhpq_group_manager.add_private_group_member(account, muc_jid, invitee_jid))) {
                     return;
@@ -204,6 +217,19 @@ public class View : Popover {
             }
         }
         muc_manager.invite(account, muc_jid, invitee_jid);
+    }
+
+    private void show_invite_error(string body) {
+        Window? window = get_root() as Window;
+        var dialog = new Adw.AlertDialog(_("Could not invite contact"), body);
+        dialog.add_response("close", _("Close"));
+        dialog.set_default_response("close");
+        dialog.set_close_response("close");
+        if (window != null) {
+            dialog.present(window);
+        } else {
+            warning("Could not invite contact: %s", body);
+        }
     }
 }
 

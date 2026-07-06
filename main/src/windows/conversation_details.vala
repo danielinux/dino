@@ -187,8 +187,12 @@ namespace Dino.Ui.ConversationDetails {
                 Xmpp.Xep.Muc.Role own_role = muc_manager.get_role(own_jid, model.conversation.account) ?? Xmpp.Xep.Muc.Role.NONE;
                 Jid? occupant_jid = muc_manager.get_occupant_jid(model.conversation.account, model.conversation.counterpart, row_view_model.jid);
                 bool can_kick = occupant_jid != null && own_role == Xmpp.Xep.Muc.Role.MODERATOR && muc_manager.kick_possible(model.conversation.account, occupant_jid);
+                bool is_private_room = muc_manager.is_private_room(model.conversation.account, model.conversation.counterpart);
                 bool can_owner_admin = own_affiliation == Xmpp.Xep.Muc.Affiliation.OWNER;
-                bool can_member_ops = can_owner_admin || own_affiliation == Xmpp.Xep.Muc.Affiliation.ADMIN;
+                // Secret post-quantum groups are owner-managed only: the x3dhpq
+                // membership journal must be signed by the owner's AIK, so admins
+                // don't get member ops there.
+                bool can_member_ops = is_private_room ? can_owner_admin : (can_owner_admin || own_affiliation == Xmpp.Xep.Muc.Affiliation.ADMIN);
                 bool can_ban = can_member_ops;
 
                 var dialog = new Adw.AlertDialog(_("Manage member"), row_view_model.jid.to_string());
@@ -209,12 +213,15 @@ namespace Dino.Ui.ConversationDetails {
                             if (occupant_jid != null) {
                                 app.stream_interactor.get_module(MucManager.IDENTITY).kick(model.conversation.account, model.conversation.counterpart, occupant_jid.resourcepart);
                             }
+                            revoke_x3dhpq_membership_if_private(model.conversation, row_view_model.jid);
                             break;
                         case "ban":
                             app.stream_interactor.get_module(MucManager.IDENTITY).change_affiliation_for_jid(model.conversation.account, model.conversation.counterpart, row_view_model.jid, "outcast");
+                            revoke_x3dhpq_membership_if_private(model.conversation, row_view_model.jid);
                             break;
                         case "none":
                             app.stream_interactor.get_module(MucManager.IDENTITY).change_affiliation_for_jid(model.conversation.account, model.conversation.counterpart, row_view_model.jid, "none");
+                            revoke_x3dhpq_membership_if_private(model.conversation, row_view_model.jid);
                             break;
                         case "member":
                             app.stream_interactor.get_module(MucManager.IDENTITY).change_affiliation_for_jid(model.conversation.account, model.conversation.counterpart, row_view_model.jid, "member");
@@ -230,6 +237,19 @@ namespace Dino.Ui.ConversationDetails {
             });
 
             add_members_tab_element(list_view);
+        }
+
+        // When a member is removed/banned/kicked from a secret post-quantum
+        // (members-only) group, also revoke them from the x3dhpq membership
+        // journal and rotate the group epoch so the removed device can no longer
+        // read future group messages. No-op for public rooms.
+        private void revoke_x3dhpq_membership_if_private(Conversation conversation, Jid member_jid) {
+            var app = (Application) GLib.Application.get_default();
+            var muc_manager = app.stream_interactor.get_module(MucManager.IDENTITY);
+            if (!muc_manager.is_private_room(conversation.account, conversation.counterpart)) return;
+            if (app.plugin_registry.x3dhpq_group_manager == null) return;
+            app.plugin_registry.x3dhpq_group_manager.remove_private_group_member.begin(
+                conversation.account, conversation.counterpart, member_jid.bare_jid);
         }
 
         private void populate_about_tab() {
