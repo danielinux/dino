@@ -76,6 +76,13 @@ public class EncryptionButton {
     }
 
     private void update_visibility() {
+        // Secret post-quantum (members-only) groups have always-on x3dhpq E2EE
+        // and offer no per-message encryption toggle: hide the button entirely.
+        if (conversation.type_ == Conversation.Type.GROUPCHAT &&
+                stream_interactor.get_module(MucManager.IDENTITY).is_private_room(conversation.account, conversation.counterpart)) {
+            menu_button.visible = false;
+            return;
+        }
         if (conversation.encryption != Encryption.NONE) {
             menu_button.visible = true;
             return;
@@ -88,7 +95,7 @@ public class EncryptionButton {
                 menu_button.visible = false;
                 break;
             case Conversation.Type.GROUPCHAT:
-                menu_button.visible = stream_interactor.get_module(MucManager.IDENTITY).is_private_room(conversation.account, conversation.counterpart);
+                menu_button.visible = false;
                 break;
         }
     }
