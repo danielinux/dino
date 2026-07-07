@@ -973,6 +973,20 @@ public class Database : Qlite.Database {
             .perform();
     }
 
+    // Remove a single device from the account's OWN persisted device set: the
+    // peer_device row stored under our own bare JID that publish_device_list
+    // unions from. Used by the §8.6 revocation path so the rebuilt union — and
+    // therefore the next signed devicelist — no longer lists the removed id.
+    // Mirrors remove_peer_device but scoped to the account's own JID and limited
+    // to the peer_device row (bundle/session teardown is handled separately).
+    public void delete_own_device(Account account, uint32 device_id) {
+        peer_device.delete()
+            .with(peer_device.account_id, "=", account.id)
+            .with(peer_device.bare_jid, "=", account.bare_jid.to_string())
+            .with(peer_device.device_id, "=", (int) device_id)
+            .perform();
+    }
+
     public void forget_peer(Account account, string bare_jid) {
         device_list.delete()
             .with(device_list.account_id, "=", account.id)

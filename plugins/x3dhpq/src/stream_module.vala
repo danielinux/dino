@@ -162,7 +162,7 @@ public class StreamModule : XmppStreamModule {
         return null;
     }
 
-    private async void publish_device_list(XmppStream stream) {
+    private async void publish_device_list(XmppStream stream, Gee.Set<uint32>? allow_removals = null) {
         int? device_id = db.get_local_device_id(account);
         if (device_id == null) {
             return;
@@ -235,6 +235,32 @@ public class StreamModule : XmppStreamModule {
         devices.add_all(by_id.values);
         devices.sort((a, b) => (a.device_id < b.device_id) ? -1 : (a.device_id > b.device_id ? 1 : 0));
 
+        // Safety net ("no accidental/injected devicelist shrink"): a publish
+        // that DROPS a previously-known account device must never happen by
+        // accident (transient/buggy/injected partial state). Compare the union
+        // we are about to sign against the ids in the LAST authoritative own
+        // devicelist we committed — read from its stored XML payload, which is
+        // independent of the peer_device union built above (so the comparison is
+        // not circular). Any id present before but absent now, and not in the
+        // explicitly allowed removal set (§8.6 revocation), aborts the publish
+        // BEFORE signing/sending/persisting. First publish (empty prevIds),
+        // identical republish and growth all pass through unchanged.
+        var new_ids = new Gee.HashSet<uint32>();
+        foreach (Protocol.DeviceListDevice d in devices) {
+            new_ids.add(d.device_id);
+        }
+        Gee.Set<uint32> prev_ids = yield parse_own_devicelist_ids(db.get_device_list_payload_xml(account, own_jid));
+        Gee.List<uint32> missing = Protocol.devicelist_shrink_drops(prev_ids, new_ids, allow_removals);
+        if (missing.size > 0) {
+            var missing_str = new StringBuilder();
+            foreach (uint32 mid in missing) {
+                if (missing_str.len > 0) missing_str.append(", ");
+                missing_str.append(mid.to_string());
+            }
+            warning("x3dhpq: refusing to publish devicelist dropping known device(s) %s without revocation", missing_str.str);
+            return;
+        }
+
         // Version rule (§8.2): the version is a persisted, monotonic per-account
         // counter incremented ONLY when the list *content* changes. A routine
         // self-republish (same devices) MUST reuse the current version. The
@@ -301,6 +327,40 @@ public class StreamModule : XmppStreamModule {
         // pairing_completed handler calls db.store_remote_device); other devices
         // pick up co-account siblings from the account's own inbound signed
         // devicelist via parse_device_list's is_self branch.
+    }
+
+    // Republish the account's signed devicelist while explicitly permitting the
+    // shrink guard in publish_device_list to drop exactly one device id (the
+    // §8.6 revocation path). Callers MUST have already removed the id from the
+    // account's own persisted device set (db.delete_own_device) so the rebuilt
+    // union no longer lists it; the version bumps because the content changed.
+    public async void republish_device_list_removing(XmppStream stream, uint32 removed_device_id) {
+        var allow = new Gee.HashSet<uint32>();
+        allow.add(removed_device_id);
+        yield publish_device_list(stream, allow);
+    }
+
+    // Parse the <device id="..."> ids from a previously committed own-list XML
+    // payload (Database.get_device_list_payload_xml). Returns an empty set for
+    // null/empty input or on parse failure. Used only by the publish-time shrink
+    // guard, whose reference set is the last authoritative own devicelist.
+    private async Gee.Set<uint32> parse_own_devicelist_ids(string? xml) {
+        var ids = new Gee.HashSet<uint32>();
+        if (xml == null || ((!) xml).length == 0) {
+            return ids;
+        }
+        try {
+            StanzaNode root = yield new StanzaReader.for_string((!) xml).read_node();
+            foreach (StanzaNode device_node in root.get_subnodes("device", Protocol.NS_DEVICELIST)) {
+                int id = device_node.get_attribute_int("id");
+                if (id > 0) {
+                    ids.add((uint32) id);
+                }
+            }
+        } catch (GLib.Error e) {
+            warning("x3dhpq: failed to parse stored own devicelist for shrink guard: %s", e.message);
+        }
+        return ids;
     }
 
     // Canonical device-set key for one device: "id|added_at|flags|cert". Used to

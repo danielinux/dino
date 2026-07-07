@@ -1419,14 +1419,15 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     // Revoke one of the account's own devices (§8.6). Publishes a RemoveDevice
     // audit entry (action=2, payload uint32_BE(device_id); §11.4) to the account
     // audit node, tears down local session/bundle/prekey state for that device,
-    // and republishes our signed devicelist so any content change propagates.
+    // drops it from the account's own persisted device set, and republishes our
+    // signed devicelist with the shrink explicitly permitted so the new,
+    // versioned list omits the revoked id.
     //
-    // NOTE: under dino's current publish model each device publishes a devicelist
-    // containing ONLY its own device id, so "republishing the list with the device
-    // omitted" is inherently a no-op for a *different* device — the removed id was
-    // never present in our own published list. The authoritative teardown for
-    // peers is the inbound signed-devicelist prune (StreamModule.parse_device_list),
-    // which already fires on the signed, version-advanced accept path.
+    // The publish is now union-based (StreamModule.publish_device_list lists
+    // every device under the account's AIK), so omitting the revoked id is a
+    // genuine content change that bumps the version and propagates to peers. A
+    // publish-time guard refuses accidental shrinks, so the removal is routed
+    // through republish_device_list_removing, which whitelists exactly this id.
     public async bool remove_own_device(Dino.Entities.Account account, uint32 device_id) {
         XmppStream? stream = app.stream_interactor.get_stream(account);
         StreamModule? module = app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
@@ -1479,9 +1480,14 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         // Local teardown: drop the removed device's session/bundle/prekey state.
         db.remove_peer_device(account, account.bare_jid.to_string(), (int) device_id);
 
-        // Republish our signed devicelist (item ③ machinery); a content-unchanged
-        // republish reuses the current version, a changed one bumps it (§8.2).
-        yield module.publish_current_state(stream);
+        // Drop the device from the account's own persisted device set so the
+        // union rebuilt by publish_device_list no longer lists it.
+        db.delete_own_device(account, device_id);
+
+        // Republish our signed devicelist, permitting the shrink guard to drop
+        // exactly this id (§8.6). The removed device is now absent from the
+        // union, so the content changes and the version bumps (§8.2).
+        yield module.republish_device_list_removing(stream, device_id);
         return true;
     }
 }
