@@ -38,6 +38,20 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
         });
         group.add(devices_widget);
 
+        var pair_existing_row = new ActionRow() {
+            title = "Pair This Device to an Existing Account",
+            subtitle = "Already have another device for this account? Enter its pairing code here to join instead of creating a new identity."
+        };
+        var pair_existing_button = new Gtk.Button.with_label("Pair") {
+            valign = Gtk.Align.CENTER
+        };
+        pair_existing_button.clicked.connect(() => {
+            launch_pair_to_existing_dialog(account, pair_existing_row);
+        });
+        pair_existing_row.add_suffix(pair_existing_button);
+        pair_existing_row.activatable_widget = pair_existing_button;
+        group.add(pair_existing_row);
+
         return group;
     }
 
@@ -53,6 +67,42 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
         Gtk.Window? parent = (root as Gtk.Window);
 
         var dialog = new UI.PairNewDeviceDialog(parent, plugin.db, account, module, stream);
+        dialog.pairing_completed.connect((cert) => {
+            // Persist the newly enrolled device under our own account so the next
+            // devicelist republish (union) includes it immediately, without waiting
+            // for an inbound devicelist round-trip.
+            plugin.db.store_remote_device(account, account.bare_jid.to_string(),
+                (int) cert.device_id, Base64.encode(cert.marshal()), (long) cert.created_at, cert.flags);
+            if (stream != null) {
+                module.publish_current_state.begin((!) stream);
+            }
+        });
+        dialog.present();
+    }
+
+    private void launch_pair_to_existing_dialog(Account account, Gtk.Widget anchor) {
+        StreamModule? module = plugin.app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
+        if (module == null) {
+            warning("x3dhpq: no StreamModule for account; cannot open pair-to-existing dialog");
+            return;
+        }
+        XmppStream? stream = plugin.app.stream_interactor.get_stream(account);
+
+        Gtk.Root? root = anchor.get_root();
+        Gtk.Window? parent = (root as Gtk.Window);
+
+        var dialog = new UI.PairToExistingDialog(parent, plugin.db, account, module, stream);
+        dialog.pairing_completed.connect((result) => {
+            // Adopt the primary's AIK (and, if shared, its ML-DSA-65 private
+            // key) into our account_identity row, and cache the DC the
+            // primary issued us so publish_device_list / bundle fetches can
+            // serve it without waiting on an inbound devicelist round-trip.
+            plugin.db.apply_paired_identity(account, result);
+            plugin.db.store_local_device_certificate(account, (int) result.cert.device_id, Base64.encode(result.cert.marshal()));
+            if (stream != null) {
+                module.publish_current_state.begin((!) stream);
+            }
+        });
         dialog.present();
     }
 }

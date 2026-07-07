@@ -410,20 +410,24 @@ private static PairingResult? unmarshal_issuance_payload(uint8[] b) {
 /**
  * marshal_aik_priv mirrors pairing.go lines 493–510.
  *
- * 3 length-prefixed fields: priv_ed25519 || pub_ed25519 || pub_mldsa
- * Deliberately omits ML-DSA-65 private key, per Go reference.
+ * 4 length-prefixed fields: priv_ed25519 || pub_ed25519 || priv_mldsa || pub_mldsa
+ * Now carries priv_mldsa to match the PQonversations 4-field wire form, so the
+ * new primary can produce hybrid Ed25519+ML-DSA-65 signatures per §7.7.
  */
 private static uint8[] marshal_aik_priv(AccountIdentityKey aik) {
     uint8[] priv_ed = aik.priv_ed25519;
     uint8[] pub_ed  = aik.pub_ed25519;
+    uint8[] priv_ml = aik.priv_mldsa;
     uint8[] pub_ml  = aik.pub_mldsa;
-    int total = 2 + priv_ed.length + 2 + pub_ed.length + 2 + pub_ml.length;
+    int total = 2 + priv_ed.length + 2 + pub_ed.length + 2 + priv_ml.length + 2 + pub_ml.length;
     uint8[] buf = new uint8[total];
     int pos = 0;
     append_u16(buf, ref pos, priv_ed.length);
     append_bytes(buf, ref pos, priv_ed);
     append_u16(buf, ref pos, pub_ed.length);
     append_bytes(buf, ref pos, pub_ed);
+    append_u16(buf, ref pos, priv_ml.length);
+    append_bytes(buf, ref pos, priv_ml);
     append_u16(buf, ref pos, pub_ml.length);
     append_bytes(buf, ref pos, pub_ml);
     return buf;
@@ -432,22 +436,24 @@ private static uint8[] marshal_aik_priv(AccountIdentityKey aik) {
 /**
  * unmarshal_aik_priv mirrors pairing.go lines 513–546.
  *
- * Reads 3 length-prefixed fields: priv_ed25519 || pub_ed25519 || pub_mldsa
+ * Reads 4 length-prefixed fields: priv_ed25519 || pub_ed25519 || priv_mldsa || pub_mldsa
  */
 private static AccountIdentityKey? unmarshal_aik_priv(uint8[] b) {
     int pos = 0;
     uint8[] priv_ed;
     uint8[] pub_ed;
+    uint8[] priv_ml;
     uint8[] pub_ml;
     if (!read_field16(b, ref pos, out priv_ed)) return null;
     if (!read_field16(b, ref pos, out pub_ed))  return null;
+    if (!read_field16(b, ref pos, out priv_ml)) return null;
     if (!read_field16(b, ref pos, out pub_ml))  return null;
 
     AccountIdentityKey aik = new AccountIdentityKey();
     aik.priv_ed25519 = priv_ed;
     aik.pub_ed25519  = pub_ed;
+    aik.priv_mldsa   = priv_ml;
     aik.pub_mldsa    = pub_ml;
-    // priv_mldsa is not transmitted; left as empty array
     return aik;
 }
 

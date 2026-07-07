@@ -11,6 +11,12 @@ private const string INFO_CHECKPOINT_CHAIN_RECV = "X3DHPQ-ChainRecv-v1";
 private const string CHECKPOINT_TRANSCRIPT_LABEL = "X3DHPQ-Checkpoint-Transcript-v1\x00";
 private const string CHECKPOINT_HISTORY_LABEL = "X3DHPQ-KEMHistory-v1\x00";
 
+// Bound on the pairwise-ratchet skipped-message-key cache (spec §9.4.2),
+// matching the Java/Go reference's MAX_SKIPPED. Named distinctly from
+// senderchain.vala's (unrelated) MAX_SKIPPED, since Vala namespace-scope
+// "private" consts are not file-scoped and would otherwise collide.
+private const int PAIRWISE_MAX_SKIPPED = 1000;
+
 public class DeviceCertificate : Object {
     public uint16 version { get; set; default = 1; }
     public uint32 device_id { get; set; }
@@ -260,6 +266,14 @@ public class SessionState : Object {
     public Bytes ad { get; set; }
     public Bytes kem_history { get; set; }
 
+    // Skipped receive-chain message keys, cached for out-of-order delivery
+    // (spec §9.4.2). Keyed by skipped_key_string(remote dh pub, chain index),
+    // bounded at PAIRWISE_MAX_SKIPPED entries with oldest-first eviction;
+    // skipped_order tracks insertion order so eviction and serialization
+    // stay deterministic.
+    public HashMap<string, Bytes> skipped_keys { get; private set; default = new HashMap<string, Bytes>(); }
+    public ArrayList<string> skipped_order { get; private set; default = new ArrayList<string>(); }
+
     public string serialize() {
         StringBuilder builder = new StringBuilder();
         append_serialized(builder, "rk", bytes_to_base64(rk));
@@ -278,6 +292,19 @@ public class SessionState : Object {
         append_serialized(builder, "last_checkpoint_time", last_checkpoint_time.to_string());
         append_serialized(builder, "ad", bytes_to_base64(ad));
         append_serialized(builder, "kem_history", bytes_to_base64(kem_history));
+
+        StringBuilder skipped_builder = new StringBuilder();
+        bool skipped_first = true;
+        foreach (string key in skipped_order) {
+            if (!skipped_first) {
+                skipped_builder.append(";");
+            }
+            skipped_first = false;
+            skipped_builder.append(key);
+            skipped_builder.append(",");
+            skipped_builder.append(bytes_to_base64(skipped_keys[key]));
+        }
+        append_serialized(builder, "skipped_keys", skipped_builder.str);
         return builder.str;
     }
 
@@ -310,6 +337,23 @@ public class SessionState : Object {
         state.last_checkpoint_time = int64.parse(values["last_checkpoint_time"]);
         state.ad = bytes_from_base64(values["ad"]);
         state.kem_history = bytes_from_base64(values["kem_history"]);
+
+        // "skipped_keys" is optional so blobs serialized before this field was
+        // introduced still deserialize (with an empty skipped-key cache).
+        string skipped_blob = values.has_key("skipped_keys") ? values["skipped_keys"] : "";
+        if (skipped_blob != "") {
+            foreach (string entry in skipped_blob.split(";")) {
+                if (entry == "") {
+                    continue;
+                }
+                string[] parts = entry.split(",", 2);
+                if (parts.length != 2) {
+                    continue;
+                }
+                state.skipped_keys[parts[0]] = bytes_from_base64(parts[1]);
+                state.skipped_order.add(parts[0]);
+            }
+        }
         return state;
     }
 }
@@ -502,15 +546,26 @@ public Bytes decrypt_transport_key(SessionState state, MessageHeader header, Byt
         state.kem_send_pub = header.kem_pub_for_reply;
     }
 
+    // Out-of-order fast path: if we already skipped past this (dh_pub, n) while
+    // advancing the chain for a later message, decrypt directly from the cache
+    // instead of re-deriving/discarding via the ratchet below (spec §9.4.2).
+    string skip_lookup_key = skipped_key_string(header.dh_pub, header.n);
+    if (state.skipped_keys.has_key(skip_lookup_key)) {
+        Bytes cached_mk = state.skipped_keys[skip_lookup_key];
+        state.skipped_keys.unset(skip_lookup_key);
+        state.skipped_order.remove(skip_lookup_key);
+        Bytes aes_key;
+        Bytes nonce;
+        derive_message_key(cached_mk, out aes_key, out nonce);
+        return global::X3dhpq.Crypto.aes256gcm_decrypt(aes_key, nonce, ciphertext, new Bytes(concat_byte_arrays(bytes_to_uint8_array(state.ad), bytes_to_uint8_array(header.marshal()))));
+    }
+
     if (state.remote_dh_pub == null || Memory.cmp(bytes_to_uint8_array((!) state.remote_dh_pub), bytes_to_uint8_array(header.dh_pub), bytes_to_uint8_array(header.dh_pub).length) != 0) {
         if (state.chain_recv_key != null && header.prev_chain_len > state.recv_count) {
-            while (state.recv_count < header.prev_chain_len) {
-                Bytes skipped_mk;
-                Bytes skipped_next;
-                chain_step((!) state.chain_recv_key, out skipped_mk, out skipped_next);
-                state.chain_recv_key = skipped_next;
-                state.recv_count++;
-            }
+            // Skip (and cache) the remainder of the outgoing-epoch chain before
+            // the DH ratchet below moves us to a new chain. These keys are for
+            // the OLD remote_dh_pub, since header.dh_pub is the new one.
+            skip_recv_keys(state, dh_pub_or_empty(state.remote_dh_pub), header.prev_chain_len);
         }
 
         state.prev_send_count = state.send_count;
@@ -547,13 +602,9 @@ public Bytes decrypt_transport_key(SessionState state, MessageHeader header, Byt
         state.kem_history = new_history;
     }
 
-    while (state.recv_count < header.n) {
-        Bytes skipped_mk;
-        Bytes skipped_next;
-        chain_step((!) state.chain_recv_key, out skipped_mk, out skipped_next);
-        state.chain_recv_key = skipped_next;
-        state.recv_count++;
-    }
+    // Skip ahead (and cache) to this message's position on the current chain,
+    // keyed by the CURRENT header.dh_pub.
+    skip_recv_keys(state, header.dh_pub, header.n);
 
     Bytes mk;
     Bytes next_ck;
@@ -612,6 +663,49 @@ private void maybe_kem_checkpoint(SessionState state) { }
 private void chain_step(Bytes chain_key, out Bytes message_key, out Bytes next_chain_key) throws GLib.Error {
     message_key = global::X3dhpq.Crypto.hmac_sha256(chain_key, new Bytes({ 0x01 }));
     next_chain_key = global::X3dhpq.Crypto.hmac_sha256(chain_key, new Bytes({ 0x02 }));
+}
+
+// Key format for the skipped-message-key cache: base64(dh_pub) + ":" + n.
+// Mirrors the Java reference's SkippedKey(dhStr, n).
+private string skipped_key_string(Bytes dh_pub, uint32 n) {
+    return bytes_to_base64(dh_pub) + ":" + n.to_string();
+}
+
+private Bytes dh_pub_or_empty(Bytes? dh_pub) {
+    return dh_pub != null ? (!) dh_pub : new Bytes(new uint8[0]);
+}
+
+// Inserts (dh_pub, n) -> mk into the skipped-key cache, evicting the oldest
+// entry first if the cache is already at MAX_SKIPPED. Mirrors the Java
+// reference's skipped.put() eviction in Session.skipKeys().
+private void store_skipped_key(SessionState state, Bytes dh_pub, uint32 n, Bytes mk) {
+    string key = skipped_key_string(dh_pub, n);
+    if (state.skipped_keys.has_key(key)) {
+        state.skipped_order.remove(key);
+    } else if (state.skipped_keys.size >= PAIRWISE_MAX_SKIPPED) {
+        string oldest = state.skipped_order.remove_at(0);
+        state.skipped_keys.unset(oldest);
+    }
+    state.skipped_keys[key] = mk;
+    state.skipped_order.add(key);
+}
+
+// Advances the receive chain up to (but not including) target_n, caching each
+// intermediate message key under dh_pub_for_key so an out-of-order message
+// arriving later can still be decrypted (spec §9.4.2). Mirrors the Java
+// reference's Session.skipKeys(), including its MAX_SKIPPED gap guard.
+private void skip_recv_keys(SessionState state, Bytes dh_pub_for_key, uint32 target_n) throws GLib.Error {
+    if (target_n > state.recv_count && (target_n - state.recv_count) > PAIRWISE_MAX_SKIPPED) {
+        throw new IOError.FAILED("too many skipped messages: would skip %u".printf(target_n - state.recv_count));
+    }
+    while (state.recv_count < target_n) {
+        Bytes skipped_mk;
+        Bytes skipped_next;
+        chain_step((!) state.chain_recv_key, out skipped_mk, out skipped_next);
+        state.chain_recv_key = skipped_next;
+        store_skipped_key(state, dh_pub_for_key, state.recv_count, skipped_mk);
+        state.recv_count++;
+    }
 }
 
 private void dh_ratchet_step(Bytes rk, Bytes dh_priv, Bytes remote_pub, Bytes kem_history, out Bytes new_rk, out Bytes new_ck) throws GLib.Error {

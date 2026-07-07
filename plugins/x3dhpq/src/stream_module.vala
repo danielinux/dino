@@ -188,10 +188,51 @@ public class StreamModule : XmppStreamModule {
         uint8 flags = 1;
         string own_jid = account.bare_jid.to_string();
 
+        // The devicelist MUST list every device under this account's AIK, not
+        // just this local device (§8.2/§8.4) — otherwise a second device on the
+        // same account disappears from `current` and contacts stop encrypting
+        // to it. Build the UNION of: this local device (canonical, freshly
+        // loaded certificate) PLUS any other account devices already persisted
+        // under our own bare JID. Those rows come from store_remote_device,
+        // populated by parse_device_list's is_self branch whenever this device
+        // has previously accepted a signed devicelist for the account that
+        // listed co-account devices (e.g. a device enrolled via pairing that
+        // later republished the full list itself).
+        var by_id = new Gee.HashMap<uint32, Protocol.DeviceListDevice>();
+        var local_dld = new Protocol.DeviceListDevice();
+        local_dld.device_id = (uint32)(!) device_id;
+        local_dld.added_at = added_at;
+        local_dld.flags = flags;
+        try {
+            local_dld.cert_bytes = bytes_to_uint8_array(bytes_from_base64(cert));
+        } catch (GLib.Error e) {
+            warning("publish_device_list: cert base64 decode failed: %s", e.message);
+            return;
+        }
+        by_id[local_dld.device_id] = local_dld;
+        foreach (Protocol.DeviceListDevice other in db.get_device_list_devices(account, own_jid)) {
+            if (by_id.has_key(other.device_id)) {
+                continue;   // local device above is the canonical entry for our own id
+            }
+            if (other.cert_bytes.length == 0) {
+                // No certificate persisted for this co-account device yet — it
+                // cannot be safely re-emitted on a signed list. See follow-up
+                // note at the end of this method.
+                continue;
+            }
+            by_id[other.device_id] = other;
+        }
+        var devices = new Gee.ArrayList<Protocol.DeviceListDevice>();
+        devices.add_all(by_id.values);
+        devices.sort((a, b) => (a.device_id < b.device_id) ? -1 : (a.device_id > b.device_id ? 1 : 0));
+
         // Version rule (§8.2): the version is a persisted, monotonic per-account
         // counter incremented ONLY when the list *content* changes. A routine
-        // self-republish (same devices) MUST reuse the current version.
-        string content_key = build_device_content_key_single((uint32)(!) device_id, (int64) added_at, flags, cert);
+        // self-republish (same devices) MUST reuse the current version. The
+        // content key is computed over the FULL union so a co-account device
+        // appearing/disappearing counts as a content change, exactly mirroring
+        // parse_device_list's inbound content-key computation.
+        string content_key = build_device_content_key(devices);
         long prev_version = db.get_device_list_version(account, own_jid);
         string? prev_content_key = db.get_device_list_content_key(account, own_jid);
         long version;
@@ -202,19 +243,8 @@ public class StreamModule : XmppStreamModule {
         }
         long issued_at = (long) new DateTime.now_utc().to_unix();
 
-        // Compute the SignedPart (layout A) and hybrid-sign it with the AIK.
-        var devices = new Gee.ArrayList<Protocol.DeviceListDevice>();
-        var dld = new Protocol.DeviceListDevice();
-        dld.device_id = (uint32)(!) device_id;
-        dld.added_at = added_at;
-        dld.flags = flags;
-        try {
-            dld.cert_bytes = bytes_to_uint8_array(bytes_from_base64(cert));
-        } catch (GLib.Error e) {
-            warning("publish_device_list: cert base64 decode failed: %s", e.message);
-            return;
-        }
-        devices.add(dld);
+        // Compute the SignedPart (layout A) over the full device union and
+        // hybrid-sign it with the AIK.
         uint8[] sp = Protocol.DeviceListSigned.signed_part((uint64) version, issued_at, devices);
         string sig_b64;
         string mldsa_sig_b64;
@@ -232,18 +262,23 @@ public class StreamModule : XmppStreamModule {
         // initialiser (which is ignored for element StanzaNodes on serialization).
         // <sig>/<mldsa-sig> are children of <devicelist> (siblings of <device>) so
         // they survive PEP item delivery, which hands the receiver only the first
-        // item child (the <devicelist> element).
+        // item child (the <devicelist> element). One <device> element (with its
+        // <cert>) is emitted per device in the union, sorted by id, followed by
+        // the trailing <sig>/<mldsa-sig> — element ordering and the SignedPart
+        // byte layout are unchanged.
         StanzaNode node = new StanzaNode.build("devicelist", Protocol.NS_DEVICELIST)
             .add_self_xmlns()
             .put_attribute("version", version.to_string())
-            .put_attribute("issued-at", issued_at.to_string())
-            .put_node(new StanzaNode.build("device", Protocol.NS_DEVICELIST)
-                .put_attribute("id", ((!) device_id).to_string())
-                .put_attribute("added-at", added_at.to_string())
-                .put_attribute("flags", flags.to_string())
+            .put_attribute("issued-at", issued_at.to_string());
+        foreach (Protocol.DeviceListDevice d in devices) {
+            node.put_node(new StanzaNode.build("device", Protocol.NS_DEVICELIST)
+                .put_attribute("id", d.device_id.to_string())
+                .put_attribute("added-at", d.added_at.to_string())
+                .put_attribute("flags", d.flags.to_string())
                 .put_node(new StanzaNode.build("cert", Protocol.NS_DEVICELIST)
-                    .put_node(new StanzaNode.text(cert))))
-            .put_node(new StanzaNode.build("sig", Protocol.NS_DEVICELIST)
+                    .put_node(new StanzaNode.text(Base64.encode(d.cert_bytes)))));
+        }
+        node.put_node(new StanzaNode.build("sig", Protocol.NS_DEVICELIST)
                 .put_node(new StanzaNode.text(sig_b64)))
             .put_node(new StanzaNode.build("mldsa-sig", Protocol.NS_DEVICELIST)
                 .put_node(new StanzaNode.text(mldsa_sig_b64)));
@@ -252,14 +287,39 @@ public class StreamModule : XmppStreamModule {
             yield try_make_node_public(stream, Protocol.NS_DEVICELIST);
             db.store_device_list_payload(account, own_jid, "current", node.to_string(), version, true, content_key);
         }
+        // FOLLOW-UP GAP: a co-account device enrolled via pairing but never seen
+        // in a previously-accepted signed devicelist (so its certificate is not
+        // yet persisted in peer_device under our own bare JID) is still skipped
+        // above. Nothing in this plugin currently stores a freshly-paired peer
+        // device's DC under the account's own bare JID at pairing completion
+        // time; that should be wired up (persist the paired device's DC via
+        // db.store_remote_device(account, own_jid, ...) once pairing hands us
+        // its certificate) so a first publish after pairing already includes it
+        // without waiting on an inbound devicelist round-trip.
     }
 
-    // Canonical device-set key for one device: "id|added_at|flags|cert". For a
-    // multi-device list the caller joins the per-device keys sorted by id with
-    // ';'. Used to decide own-version bumps (§8.2) and detect same-version forks
-    // (§8.5); deliberately excludes version/issued_at.
+    // Canonical device-set key for one device: "id|added_at|flags|cert". Used to
+    // decide own-version bumps (§8.2) and detect same-version forks (§8.5);
+    // deliberately excludes version/issued_at.
     private static string build_device_content_key_single(uint32 device_id, int64 added_at, uint8 flags, string cert_b64) {
         return @"$device_id|$added_at|$flags|$cert_b64";
+    }
+
+    // Canonical content key for a device SET: per-device keys (sorted by
+    // device_id ascending) joined with ';'. Shared by publish_device_list (own
+    // account union) and parse_device_list (inbound lists) so both sides compare
+    // on an identical representation — required for version-bump/fork detection
+    // to agree regardless of which side computed it.
+    private static string build_device_content_key(Gee.List<Protocol.DeviceListDevice> devices) {
+        var sorted = new Gee.ArrayList<Protocol.DeviceListDevice>();
+        sorted.add_all(devices);
+        sorted.sort((a, b) => (a.device_id < b.device_id) ? -1 : (a.device_id > b.device_id ? 1 : 0));
+        StringBuilder ck = new StringBuilder();
+        foreach (Protocol.DeviceListDevice e in sorted) {
+            if (ck.len > 0) ck.append(";");
+            ck.append(build_device_content_key_single(e.device_id, e.added_at, e.flags, Base64.encode(e.cert_bytes)));
+        }
+        return ck.str;
     }
 
     private async void publish_bundle(XmppStream stream) {
@@ -368,13 +428,9 @@ public class StreamModule : XmppStreamModule {
         }
 
         // Canonical content key (sorted by device_id), excluding version/issued_at.
-        entries.sort((a, b) => (a.device_id < b.device_id) ? -1 : (a.device_id > b.device_id ? 1 : 0));
-        StringBuilder ck = new StringBuilder();
-        foreach (Protocol.DeviceListDevice e in entries) {
-            if (ck.len > 0) ck.append(";");
-            ck.append(build_device_content_key_single(e.device_id, e.added_at, e.flags, Base64.encode(e.cert_bytes)));
-        }
-        string content_key = ck.str;
+        // Shared with publish_device_list's own-account union so both sides
+        // agree on the same representation for version-bump/fork detection.
+        string content_key = build_device_content_key(entries);
 
         // The account's own devicelist echo: version/content are maintained by
         // publish_device_list; just refresh the stored payload (sentinels keep
@@ -395,7 +451,7 @@ public class StreamModule : XmppStreamModule {
             foreach (Protocol.DeviceListDevice e in entries) {
                 int did = (int) e.device_id;
                 devices.add(did);
-                db.store_remote_device(account, bare, did, cert_by_id[did], added_by_id[did] ?? 0);
+                db.store_remote_device(account, bare, did, cert_by_id[did], added_by_id[did] ?? 0, e.flags);
             }
             db.store_device_list_payload(account, bare, id, node.to_string(),
                 accepted_version, accepted_signed, content_key);

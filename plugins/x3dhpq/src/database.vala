@@ -5,7 +5,7 @@ using Xmpp;
 namespace Dino.Plugins.X3dhpq {
 
 public class Database : Qlite.Database {
-    private const int VERSION = 6;
+    private const int VERSION = 7;
 
     public class AccountIdentityTable : Table {
         public Column<int> id = new Column.Integer("id") { primary_key = true, auto_increment = true };
@@ -64,10 +64,15 @@ public class Database : Qlite.Database {
         // devicelist wire (XEP §8.4). Needed so the receiver can reconstruct the
         // exact SignedPart (§8.3). Added at schema v5.
         public Column<long> added_at = new Column.Long("added_at") { min_version = 5, default = "0" };
+        // Per-device flags byte as carried on the signed devicelist wire (XEP
+        // §8.3/§8.4; bit 0 = primary, mirrors DeviceCertificate.flags). Needed
+        // so publish_device_list can reconstruct the exact SignedPart for the
+        // account's own multi-device union (§8.2). Added at schema v7.
+        public Column<int> flags = new Column.Integer("flags") { min_version = 7, default = "1" };
 
         internal PeerDeviceTable(Database db) {
             base(db, "peer_device");
-            init({ account_id, bare_jid, device_id, dik_pub_ed25519_base64, dik_pub_x25519_base64, dik_pub_mldsa_base64, certificate_base64, active, created_at, updated_at, added_at });
+            init({ account_id, bare_jid, device_id, dik_pub_ed25519_base64, dik_pub_x25519_base64, dik_pub_mldsa_base64, certificate_base64, active, created_at, updated_at, added_at, flags });
             unique({ account_id, bare_jid, device_id });
         }
     }
@@ -404,6 +409,21 @@ public class Database : Qlite.Database {
             .value(bundle.updated_at, (long) new DateTime.now_utc().to_unix())
             .perform();
         return certificate;
+    }
+
+    // Cache a DeviceCertificate that was handed to us by the pairing primary
+    // (rather than self-issued, which requires an aik_priv this device may not
+    // have). Mirrors the upsert in ensure_local_device_certificate() so
+    // publish_device_list / bundle fetches can serve it the same way, keyed by
+    // (account_id, our own bare_jid, device_id).
+    public void store_local_device_certificate(Account account, int device_id, string cert_base64) {
+        bundle.upsert()
+            .value(bundle.account_id, account.id, true)
+            .value(bundle.bare_jid, account.bare_jid.to_string(), true)
+            .value(bundle.device_id, device_id, true)
+            .value(bundle.device_certificate_base64, cert_base64)
+            .value(bundle.updated_at, (long) new DateTime.now_utc().to_unix())
+            .perform();
     }
 
     public void ensure_local_prekeys(Account account) {
@@ -976,7 +996,7 @@ public class Database : Qlite.Database {
             .perform();
     }
 
-    public void store_remote_device(Account account, string bare_jid, int device_id, string? certificate_base64 = null, long added_at = 0) {
+    public void store_remote_device(Account account, string bare_jid, int device_id, string? certificate_base64 = null, long added_at = 0, uint8 flags = 1) {
         // Preserve the earliest known added_at (first-seen) for this device id:
         // once a peer has published a device with a given added_at we keep it so
         // the reconstructed SignedPart stays stable even if a later republish
@@ -1002,7 +1022,39 @@ public class Database : Qlite.Database {
             .value(peer_device.updated_at, (long) new DateTime.now_utc().to_unix())
             .value(peer_device.created_at, (long) new DateTime.now_utc().to_unix())
             .value(peer_device.added_at, effective_added_at)
+            .value(peer_device.flags, (int) flags)
             .perform();
+    }
+
+    // Every persisted device row for a bare_jid, as full DeviceListDevice
+    // records (id, added_at, flags, cert_bytes). Used by publish_device_list
+    // to reconstruct the account's own multi-device union (§8.2/§8.3): when
+    // this device has previously accepted the account's own signed devicelist
+    // (is_self branch of parse_device_list, which persists every entry via
+    // store_remote_device under the account's bare JID), those rows let a
+    // routine republish include co-account devices instead of shrinking the
+    // list back down to this device alone. A row whose certificate was never
+    // persisted yields empty cert_bytes; callers MUST skip such rows since an
+    // uncertified device cannot be safely re-emitted on a signed list.
+    public Gee.List<Protocol.DeviceListDevice> get_device_list_devices(Account account, string bare_jid) {
+        var result = new Gee.ArrayList<Protocol.DeviceListDevice>();
+        foreach (Row row in peer_device.select()
+                .with(peer_device.account_id, "=", account.id)
+                .with(peer_device.bare_jid, "=", bare_jid)
+                .with(peer_device.active, "=", true)) {
+            var d = new Protocol.DeviceListDevice();
+            d.device_id = (uint32) row[peer_device.device_id];
+            d.added_at = row[peer_device.added_at];
+            d.flags = (uint8) row[peer_device.flags];
+            string? cert_b64 = row[peer_device.certificate_base64];
+            try {
+                d.cert_bytes = cert_b64 != null ? bytes_to_uint8_array(bytes_from_base64(cert_b64)) : new uint8[0];
+            } catch (GLib.Error e) {
+                d.cert_bytes = new uint8[0];
+            }
+            result.add(d);
+        }
+        return result;
     }
 
     // First-seen creation time of the local device's own identity (unix
@@ -1135,6 +1187,39 @@ public class Database : Qlite.Database {
         } catch (GLib.Error e) {
             warning("Unable to initialize x3dhpq identity for %s: %s", account.bare_jid.to_string(), e.message);
         }
+    }
+
+    // Adopt the pairing primary's account identity (AIK) into a new device's
+    // account_identity row. ensure_local_identity() already ran on this device
+    // and generated its own DIK (kept as-is) plus a throwaway AIK (replaced
+    // here, since the account is now bound to the primary's AIK instead).
+    //
+    // If the primary shared its ML-DSA-65 (and Ed25519) AIK private key
+    // (result.aik_priv != null), this device becomes able to self-issue
+    // DeviceCertificates for further devices, so it is marked is_primary and
+    // the private key material is persisted. Otherwise the account_identity
+    // row's aik_priv_* columns are cleared to "" — they are NonNullText and
+    // the values ensure_local_identity() generated for the throwaway AIK are
+    // now invalid because the AIK public key changed.
+    public void apply_paired_identity(Account account, Protocol.PairingResult result) {
+        var update = account_identity.update()
+            .with(account_identity.account_id, "=", account.id)
+            .set(account_identity.device_id, (int) result.cert.device_id)
+            .set(account_identity.aik_pub_ed25519_base64, Base64.encode(result.aik_pub.pub_ed25519))
+            .set(account_identity.aik_pub_mldsa_base64, Base64.encode(result.aik_pub.pub_mldsa));
+        if (result.aik_priv != null) {
+            Protocol.AccountIdentityKey aik_priv = (!) result.aik_priv;
+            update
+                .set(account_identity.is_primary, true)
+                .set(account_identity.aik_priv_ed25519_base64, Base64.encode(aik_priv.priv_ed25519))
+                .set(account_identity.aik_priv_mldsa_base64, Base64.encode(aik_priv.priv_mldsa));
+        } else {
+            update
+                .set(account_identity.is_primary, false)
+                .set(account_identity.aik_priv_ed25519_base64, "")
+                .set(account_identity.aik_priv_mldsa_base64, "");
+        }
+        update.perform();
     }
 
     private string? serialize_key_nodes(StanzaNode? parent_node, string child_name) {
