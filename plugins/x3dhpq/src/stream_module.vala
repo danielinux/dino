@@ -185,7 +185,6 @@ public class StreamModule : XmppStreamModule {
             return;
         }
         long added_at = db.get_local_device_created_at(account);
-        uint8 flags = 1;
         string own_jid = account.bare_jid.to_string();
 
         // The devicelist MUST list every device under this account's AIK, not
@@ -202,13 +201,23 @@ public class StreamModule : XmppStreamModule {
         var local_dld = new Protocol.DeviceListDevice();
         local_dld.device_id = (uint32)(!) device_id;
         local_dld.added_at = added_at;
-        local_dld.flags = flags;
         try {
             local_dld.cert_bytes = bytes_to_uint8_array(bytes_from_base64(cert));
         } catch (GLib.Error e) {
             warning("publish_device_list: cert base64 decode failed: %s", e.message);
             return;
         }
+        // The published flags MUST reflect this device's own DC (bit 0 = primary),
+        // not be hardcoded — a non-primary paired device must not advertise itself
+        // as primary. Derive from the freshly loaded certificate rather than the
+        // (unrelated) union built below.
+        Protocol.DeviceCertificate? local_dc = Protocol.DeviceCertificate.unmarshal(new Bytes(local_dld.cert_bytes));
+        if (local_dc == null) {
+            warning("publish_device_list: failed to unmarshal local device certificate for %s; falling back to flags=0",
+                own_jid);
+        }
+        uint8 flags = local_dc != null ? local_dc.flags : 0;
+        local_dld.flags = flags;
         by_id[local_dld.device_id] = local_dld;
         foreach (Protocol.DeviceListDevice other in db.get_device_list_devices(account, own_jid)) {
             if (by_id.has_key(other.device_id)) {
@@ -287,15 +296,11 @@ public class StreamModule : XmppStreamModule {
             yield try_make_node_public(stream, Protocol.NS_DEVICELIST);
             db.store_device_list_payload(account, own_jid, "current", node.to_string(), version, true, content_key);
         }
-        // FOLLOW-UP GAP: a co-account device enrolled via pairing but never seen
-        // in a previously-accepted signed devicelist (so its certificate is not
-        // yet persisted in peer_device under our own bare JID) is still skipped
-        // above. Nothing in this plugin currently stores a freshly-paired peer
-        // device's DC under the account's own bare JID at pairing completion
-        // time; that should be wired up (persist the paired device's DC via
-        // db.store_remote_device(account, own_jid, ...) once pairing hands us
-        // its certificate) so a first publish after pairing already includes it
-        // without waiting on an inbound devicelist round-trip.
+        // The primary already persists a newly-enrolled device's DC under our own
+        // bare JID at pairing completion (encryption_preferences_entry.vala's
+        // pairing_completed handler calls db.store_remote_device); other devices
+        // pick up co-account siblings from the account's own inbound signed
+        // devicelist via parse_device_list's is_self branch.
     }
 
     // Canonical device-set key for one device: "id|added_at|flags|cert". Used to

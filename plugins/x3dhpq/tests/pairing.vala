@@ -205,6 +205,13 @@ class PairingTest : Gee.TestCase {
                 "share_primary: pub_mldsa mismatch"
             );
 
+            // priv_mldsa must also be transferred (the 4-field issuance fix)
+            fail_if_not_eq_uint8_arr(
+                aik.priv_mldsa,
+                ((!) received_priv).priv_mldsa,
+                "share_primary: priv_mldsa mismatch"
+            );
+
         } catch (Error e) {
             fail_if_reached("share_primary threw: " + e.message);
         }
