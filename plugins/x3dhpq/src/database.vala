@@ -1010,6 +1010,48 @@ public class Database : Qlite.Database {
             .perform();
     }
 
+    // Mark the peer's CURRENTLY-OBSERVED AIK as user-verified (re-pinned). Clears
+    // the `downgraded`/rotated flag. Called only from the explicit user "accept
+    // identity" action (contact details), after the user has reviewed the new
+    // fingerprint — never automatically, so a server-substituted AIK cannot be
+    // silently trusted.
+    public void set_peer_aik_verified(Account account, string bare_jid) {
+        Row? existing = get_peer_account_identity_row(account, bare_jid);
+        if (existing == null) return;
+        peer_account_identity.update()
+            .with(peer_account_identity.account_id, "=", account.id)
+            .with(peer_account_identity.bare_jid, "=", bare_jid)
+            .set(peer_account_identity.trust_state, "verified")
+            .set(peer_account_identity.downgraded, false)
+            .set(peer_account_identity.updated_at, (long) new DateTime.now_utc().to_unix())
+            .perform();
+    }
+
+    // Reset the devicelist/version rollback state and stale device/bundle/session
+    // rows for a peer WITHOUT forgetting its (new) AIK identity. After a peer
+    // legitimately resets (fresh install → version restarts at 1, which the
+    // rollback guard (§8.5) would otherwise reject), this lets the fresh signed
+    // devicelist be re-accepted on the next fetch. Keeps peer_account_identity so
+    // the just-accepted AIK survives.
+    public void reset_peer_devicelist(Account account, string bare_jid) {
+        device_list.delete()
+            .with(device_list.account_id, "=", account.id)
+            .with(device_list.bare_jid, "=", bare_jid)
+            .perform();
+        peer_device.delete()
+            .with(peer_device.account_id, "=", account.id)
+            .with(peer_device.bare_jid, "=", bare_jid)
+            .perform();
+        bundle.delete()
+            .with(bundle.account_id, "=", account.id)
+            .with(bundle.bare_jid, "=", bare_jid)
+            .perform();
+        pairwise_session.delete()
+            .with(pairwise_session.account_id, "=", account.id)
+            .with(pairwise_session.bare_jid, "=", bare_jid)
+            .perform();
+    }
+
     public void store_remote_device(Account account, string bare_jid, int device_id, string? certificate_base64 = null, long added_at = 0, uint8 flags = 1) {
         // Preserve the earliest known added_at (first-seen) for this device id:
         // once a peer has published a device with a given added_at we keep it so
@@ -1393,10 +1435,16 @@ public class Database : Qlite.Database {
             .perform();
     }
 
+    // Emitted when a peer's observed AIK changes from a previously-stored one
+    // (rotation/reset). The UI raises a review notification; the change itself is
+    // NOT auto-trusted — trust_state moves to "rotated" until the user accepts.
+    public signal void peer_identity_rotated(Account account, string bare_jid, string? fingerprint);
+
     private void update_peer_identity(Account account, string bare_jid, string? aik_ed25519, string? aik_mldsa) {
         Row? existing = get_peer_account_identity_row(account, bare_jid);
         string trust_state = "unverified";
         bool downgraded = false;
+        bool rotation_detected = false;
         long created_at = (long) new DateTime.now_utc().to_unix();
         if (existing != null) {
             created_at = ((!) existing)[peer_account_identity.created_at];
@@ -1405,6 +1453,10 @@ public class Database : Qlite.Database {
             trust_state = ((!) existing)[peer_account_identity.trust_state];
             downgraded = ((!) existing)[peer_account_identity.downgraded];
             if ((old_ed != null && aik_ed25519 != null && old_ed != aik_ed25519) || (old_m != null && aik_mldsa != null && old_m != aik_mldsa)) {
+                // Only fire the review signal on a genuine transition into the
+                // rotated state (not on every subsequent republish of the new
+                // AIK, which would already be "rotated").
+                rotation_detected = trust_state != "rotated";
                 trust_state = "rotated";
                 downgraded = true;
             }
@@ -1430,6 +1482,10 @@ public class Database : Qlite.Database {
             .value(peer_account_identity.created_at, created_at)
             .value(peer_account_identity.updated_at, (long) new DateTime.now_utc().to_unix())
             .perform();
+
+        if (rotation_detected) {
+            peer_identity_rotated(account, bare_jid, fingerprint);
+        }
     }
 
     public override void migrate(long old_version) {

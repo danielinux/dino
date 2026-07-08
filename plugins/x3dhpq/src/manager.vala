@@ -226,6 +226,41 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         return true;
     }
 
+    // Whether we hold a peer AIK for this contact that is in the rotated /
+    // needs-review state (changed from a previously-observed one). Drives the
+    // "review & accept identity" UI action.
+    public bool peer_aik_needs_review(Account account, Jid jid) {
+        Row? identity = db.get_peer_account_identity_row(account, jid.bare_jid.to_string());
+        if (identity == null) return false;
+        return ((!) identity)[db.peer_account_identity.trust_state] == "rotated";
+    }
+
+    // The spaced-hex fingerprint of the peer's currently-observed AIK, for the
+    // review dialog. Null if unknown.
+    public string? peer_aik_fingerprint(Account account, Jid jid) {
+        return db.get_peer_aik_fingerprint(account, jid.bare_jid.to_string());
+    }
+
+    // Explicit user action (contact details) to accept a peer's CHANGED AIK after
+    // reviewing the new fingerprint out-of-band. Re-pins the currently-observed
+    // AIK as verified, clears the rollback/version state that was rejecting the
+    // peer's post-reset devicelist (§8.5), and re-fetches the fresh devicelist +
+    // bundles so capability and group membership recover. NEVER called
+    // automatically — accepting an unverified AIK is the user's deliberate,
+    // impersonation-aware decision.
+    public async bool accept_peer_aik(Account account, Jid jid) {
+        string bare = jid.bare_jid.to_string();
+        db.set_peer_aik_verified(account, bare);
+        db.reset_peer_devicelist(account, bare);
+        XmppStream? stream = app.stream_interactor.get_stream(account);
+        StreamModule? module = app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
+        if (stream == null || module == null) {
+            return false;
+        }
+        yield module.request_device_list((!) stream, jid);
+        return yield ensure_get_keys_for_jid(account, jid);
+    }
+
     public async void prefetch_for_conversation(Conversation conversation) {
         if (conversation.type_ == Conversation.Type.GROUPCHAT_PM) {
             return;

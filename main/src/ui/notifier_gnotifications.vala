@@ -135,6 +135,16 @@ namespace Dino.Ui {
             GLib.Application.get_default().send_notification(null, notification);
         }
 
+        public async void notify_identity_change(Account account, Jid jid, string display_name, string fingerprint) {
+            Conversation conversation = new Conversation(jid, account, Conversation.Type.CHAT);
+            Notification notification = new Notification(_("Identity key changed"));
+            notification.set_body(_("%s’s post-quantum identity key changed — review it before trusting.").printf(display_name));
+            try {
+                notification.set_icon(yield get_conversation_icon(conversation));
+            } catch (Error e) { }
+            GLib.Application.get_default().send_notification(null, notification);
+        }
+
         public async void notify_voice_request(Conversation conversation, Jid from_jid) {
             string display_name = Util.get_participant_display_name(stream_interactor, conversation, from_jid);
             string display_room = Util.get_conversation_display_name(stream_interactor, conversation);

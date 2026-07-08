@@ -35,6 +35,21 @@ public class Plugin : RootInterface, Object {
                 db.forget_peer(conversation.account, conversation.counterpart.bare_jid.to_string());
             }
         });
+        // Surface a peer AIK change (rotation/reset) as a user notification so it
+        // is not silently stuck in "needs review". The change is not trusted
+        // here — the notification prompts the user to review and accept it.
+        db.peer_identity_rotated.connect(on_peer_identity_rotated);
+    }
+
+    private void on_peer_identity_rotated(Account account, string bare_jid, string? fingerprint) {
+        Xmpp.Jid jid;
+        try {
+            jid = new Xmpp.Jid(bare_jid);
+        } catch (Xmpp.InvalidJidError e) {
+            return;
+        }
+        Dino.NotificationEvents events = app.stream_interactor.get_module(Dino.NotificationEvents.IDENTITY);
+        events.notify_identity_change.begin(account, jid, bare_jid, fingerprint ?? "");
     }
 
     public void shutdown() { }

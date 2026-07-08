@@ -247,6 +247,27 @@ public class Dino.Ui.FreeDesktopNotifier : NotificationProvider, Object {
         }
     }
 
+    public async void notify_identity_change(Account account, Jid jid, string display_name, string fingerprint) {
+        Conversation conversation = new Conversation(jid, account, Conversation.Type.CHAT);
+        string summary = _("Identity key changed");
+        string body = _("%s’s post-quantum identity key changed — review it before trusting.").printf(display_name);
+        if (supports_body_markup) {
+            body = Markup.escape_text(body);
+        }
+
+        HashTable<string, Variant> hash_table = new HashTable<string, Variant>(null, null);
+        hash_table["image-data"] = yield get_conversation_icon(conversation);
+        hash_table["desktop-entry"] = new Variant.string(Dino.Application.get_default().get_application_id());
+        hash_table["category"] = new Variant.string("im");
+        string[] actions = new string[] {};
+
+        try {
+            yield dbus_notifications.notify("Dino", 0, "", summary, body, actions, hash_table, -1);
+        } catch (Error e) {
+            warning("Failed showing identity-change notification: %s", e.message);
+        }
+    }
+
     public async void notify_voice_request(Conversation conversation, Jid from_jid) {
 
         string display_name = Util.get_participant_display_name(stream_interactor, conversation, from_jid);

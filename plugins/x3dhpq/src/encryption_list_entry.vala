@@ -69,13 +69,32 @@ public class EncryptionListEntry : Plugins.EncryptionListEntry, Object {
                     return;
                 }
                 if (!is_active_member(conversation.account, room_jid, member_aik_fp_raw)) {
-                    input_status_callback(new Plugins.InputFieldStatus("A group member has not been added to this channel's x3dhpq membership journal: %s".printf(member.to_string()), Plugins.InputFieldStatus.MessageType.ERROR, Plugins.InputFieldStatus.InputState.NO_SEND));
-                    return;
+                    // Owner-side reconciliation: a contact can be a MUC member
+                    // (owner granted affiliation) yet absent from the journal if
+                    // the invite-time add failed — e.g. their keys weren't fetched
+                    // yet, a transient publish error, or they reset their identity
+                    // and were only just re-accepted. Their keys are available now
+                    // (fetched just above), so if we are the room owner add them to
+                    // the journal here instead of dead-ending on an error.
+                    if (is_room_owner(conversation) &&
+                            (yield plugin.manager.add_private_group_member(conversation.account, conversation.counterpart, member))) {
+                        // added (or already present) — continue to the next member
+                    } else {
+                        input_status_callback(new Plugins.InputFieldStatus("A group member has not been added to this channel's x3dhpq membership journal: %s".printf(member.to_string()), Plugins.InputFieldStatus.MessageType.ERROR, Plugins.InputFieldStatus.InputState.NO_SEND));
+                        return;
+                    }
                 }
             }
         }
 
         input_status_callback(new Plugins.InputFieldStatus("x3dhpq is ready for this conversation.", Plugins.InputFieldStatus.MessageType.INFO, Plugins.InputFieldStatus.InputState.NORMAL));
+    }
+
+    private bool is_room_owner(Conversation conversation) {
+        var mm = plugin.app.stream_interactor.get_module(MucManager.IDENTITY);
+        Xmpp.Jid? own = mm.get_own_jid(conversation.counterpart, conversation.account);
+        if (own == null) return false;
+        return mm.get_affiliation(conversation.counterpart, own, conversation.account) == Xmpp.Xep.Muc.Affiliation.OWNER;
     }
 
     private bool is_active_member(Account account, string room_jid, uint8[] member_aik_fp_raw) {

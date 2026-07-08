@@ -148,6 +148,13 @@ public class NotificationEvents : StreamInteractionModule, Object {
         yield notifier.notify_connection_error(account, error);
     }
 
+    // Public trigger for a peer identity-key change, raised by the x3dhpq plugin
+    // (which owns the detection signal) since libdino has no reference to it.
+    public async void notify_identity_change(Account account, Jid jid, string display_name, string fingerprint) {
+        NotificationProvider notifier = yield notifier.wait_async();
+        yield notifier.notify_identity_change(account, jid, display_name, fingerprint);
+    }
+
     private async void on_focused_in(Conversation conversation) {
         NotificationProvider notifier = yield notifier.wait_async();
         yield notifier.retract_content_item_notifications();
@@ -166,6 +173,7 @@ public interface NotificationProvider : Object {
     public abstract async void notify_connection_error(Account account, ConnectionManager.ConnectionError error);
     public abstract async void notify_muc_invite(Account account, Jid room_jid, Jid from_jid, string inviter_display_name);
     public abstract async void notify_voice_request(Conversation conversation, Jid from_jid);
+    public abstract async void notify_identity_change(Account account, Jid jid, string display_name, string fingerprint);
 
     public abstract async void retract_content_item_notifications();
     public abstract async void retract_conversation_notifications(Conversation conversation);
