@@ -1182,6 +1182,14 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             && db.get_remote_device_ids(account, bare).size > 0;
     }
 
+    // A room is a secret PQ group iff we hold its membership journal locally
+    // (written by ensure_private_group_bootstrapped at creation/first add). This
+    // is a reliable local fact, unlike MucManager.is_private_room()'s offline
+    // disco cache — see the interface doc.
+    public bool is_secret_pq_group(Dino.Entities.Account account, Jid room_jid) {
+        return db.has_membership_journal(account, room_jid.bare_jid.to_string());
+    }
+
     // Map the persisted peer AIK trust_state to the UI-facing enum.
     public global::Dino.Plugins.MemberTrustState get_member_trust_state(Dino.Entities.Account account, Jid member_jid) {
         string bare = member_jid.bare_jid.to_string();

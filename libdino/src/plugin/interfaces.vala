@@ -134,6 +134,14 @@ public interface X3dhpqGroupManager : Object {
     // the UI can surface a clear message instead of a silent failure.
     public abstract bool member_has_x3dhpq(Dino.Entities.Account account, Jid member_jid);
 
+    // Whether this room is a secret post-quantum group we participate in, decided
+    // from LOCAL state (the presence of a membership journal), independent of the
+    // MUC disco cache. The invite flow must NOT gate the membership grant +
+    // journal publish on MucManager.is_private_room(), whose offline disco can be
+    // stale/incomplete right after room creation and leave the invitee neither a
+    // MUC member (→ "banned") nor an x3dhpq member.
+    public abstract bool is_secret_pq_group(Dino.Entities.Account account, Jid room_jid);
+
     // The verification/trust state of a member's authentication identity key.
     public abstract MemberTrustState get_member_trust_state(Dino.Entities.Account account, Jid member_jid);
 }

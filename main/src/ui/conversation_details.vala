@@ -246,13 +246,18 @@ namespace Dino.Ui.ConversationDetails {
 
     private async void send_invite(Conversation conversation, StreamInteractor stream_interactor, Jid jid) {
         var muc_manager = stream_interactor.get_module(MucManager.IDENTITY);
-        if (muc_manager.is_private_room(conversation.account, conversation.counterpart)) {
-            Application? app = GLib.Application.get_default() as Application;
+        Application? app = GLib.Application.get_default() as Application;
+        var pq = (app != null) ? app.plugin_registry.x3dhpq_group_manager : null;
+        // Enter the members-only invite path when the room is private OR when it
+        // is a secret PQ group we own — the latter decided from local journal
+        // state, so a stale is_private_room() disco cache can't leave the invitee
+        // un-affiliated ("banned") and outside the membership journal.
+        bool is_pq_group = pq != null && pq.is_secret_pq_group(conversation.account, conversation.counterpart);
+        if (muc_manager.is_private_room(conversation.account, conversation.counterpart) || is_pq_group) {
             // Pre-flight: a secret post-quantum group can only include contacts
             // that publish an x3dhpq devicelist. Surface a clear message rather
             // than letting the membership-journal add fail silently.
-            if (app != null && app.plugin_registry.x3dhpq_group_manager != null &&
-                    !app.plugin_registry.x3dhpq_group_manager.member_has_x3dhpq(conversation.account, jid)) {
+            if (pq != null && !pq.member_has_x3dhpq(conversation.account, jid)) {
                 show_group_error(_("Could not invite contact"), _("%s isn’t using a post-quantum client, so they can’t join this secret group.").printf(jid.to_string()));
                 return;
             }
@@ -261,8 +266,8 @@ namespace Dino.Ui.ConversationDetails {
                 show_group_error(_("Could not invite contact"), _("Dino could not grant membership for %s in this private channel.").printf(jid.to_string()));
                 return;
             }
-            if (app != null && app.plugin_registry.x3dhpq_group_manager != null) {
-                if (!(yield app.plugin_registry.x3dhpq_group_manager.add_private_group_member(conversation.account, conversation.counterpart, jid))) {
+            if (pq != null) {
+                if (!(yield pq.add_private_group_member(conversation.account, conversation.counterpart, jid))) {
                     show_group_error(_("Could not invite contact"), _("Dino could not publish x3dhpq membership data for %s in this private channel.").printf(jid.to_string()));
                     return;
                 }

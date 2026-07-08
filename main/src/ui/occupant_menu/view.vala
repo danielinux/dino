@@ -197,12 +197,17 @@ public class View : Popover {
 
     private async void invite_occupant_async(Account account, Jid muc_jid, Jid invitee_jid, StreamInteractor stream_interactor) {
         var muc_manager = stream_interactor.get_module(MucManager.IDENTITY);
-        if (muc_manager.is_private_room(account, muc_jid)) {
-            Application? app = GLib.Application.get_default() as Application;
+        Application? app = GLib.Application.get_default() as Application;
+        var pq = (app != null) ? app.plugin_registry.x3dhpq_group_manager : null;
+        // Enter the members-only invite path for a private room OR a secret PQ
+        // group we own (decided from local journal state, not the possibly-stale
+        // is_private_room() disco cache) so the invitee is always granted MUC
+        // membership and added to the x3dhpq membership journal.
+        bool is_pq_group = pq != null && pq.is_secret_pq_group(account, muc_jid);
+        if (muc_manager.is_private_room(account, muc_jid) || is_pq_group) {
             // A secret post-quantum group can only include contacts that publish
             // an x3dhpq devicelist; surface a clear message otherwise.
-            if (app != null && app.plugin_registry.x3dhpq_group_manager != null &&
-                    !app.plugin_registry.x3dhpq_group_manager.member_has_x3dhpq(account, invitee_jid)) {
+            if (pq != null && !pq.member_has_x3dhpq(account, invitee_jid)) {
                 show_invite_error(_("%s isn’t using a post-quantum client, so they can’t join this secret group.").printf(invitee_jid.to_string()));
                 return;
             }
@@ -210,8 +215,8 @@ public class View : Popover {
             if (!success) {
                 return;
             }
-            if (app != null && app.plugin_registry.x3dhpq_group_manager != null) {
-                if (!(yield app.plugin_registry.x3dhpq_group_manager.add_private_group_member(account, muc_jid, invitee_jid))) {
+            if (pq != null) {
+                if (!(yield pq.add_private_group_member(account, muc_jid, invitee_jid))) {
                     return;
                 }
             }
