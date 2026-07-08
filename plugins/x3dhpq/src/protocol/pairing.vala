@@ -390,7 +390,9 @@ private static PairingResult? unmarshal_issuance_payload(uint8[] b) {
                      | ((uint32) b[pos + 2] << 8)
                      | (uint32) b[pos + 3];
     pos += 4;
-    if (pos + (int) state_len > b.length) return null;
+    // 64-bit comparison so a corrupt/huge state_len can't wrap to a negative
+    // int and reach `new uint8[(int) state_len]` (giant-allocation abort).
+    if ((int64) pos + (int64) state_len > (int64) b.length) return null;
     uint8[] state_blob = new uint8[(int) state_len];
     for (int i = 0; i < (int) state_len; i++) state_blob[i] = b[pos + i];
 

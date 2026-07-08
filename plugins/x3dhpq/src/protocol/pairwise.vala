@@ -806,7 +806,9 @@ private uint8[]? read_u32_prefixed_field(uint8[] data, ref int offset) {
     }
     uint32 length = uint32_from_bytes(data, offset);
     offset += 4;
-    if (offset + (int) length > data.length) {
+    // 64-bit comparison so a corrupt/huge length can't wrap to a negative int
+    // and reach `new uint8[(int) length]` (giant-allocation abort).
+    if ((int64) offset + (int64) length > (int64) data.length) {
         return null;
     }
     uint8[] result = new uint8[(int) length];

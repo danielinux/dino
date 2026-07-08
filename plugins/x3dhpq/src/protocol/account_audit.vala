@@ -139,7 +139,9 @@ public class AuditEntry : Object {
         e.action = b[off++];
         uint32 pl = uint32_from_bytes(b, off);
         off += 4;
-        if (off + (int) pl + 8 + 2 + 2 > b.length) return null;
+        // 64-bit comparison so a corrupt/huge length can't wrap or become a
+        // negative int and reach `new uint8[(int) pl]` (giant-allocation abort).
+        if ((int64) off + (int64) pl + 8 + 2 + 2 > (int64) b.length) return null;
         e.payload = new uint8[(int) pl];
         if (pl > 0) Memory.copy(e.payload, (uint8*) b + off, (int) pl);
         off += (int) pl;

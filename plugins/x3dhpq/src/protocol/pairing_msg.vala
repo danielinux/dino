@@ -40,7 +40,9 @@ public class PairingMsg : GLib.Object {
                    | ((uint32) raw[2] << 16)
                    | ((uint32) raw[3] << 8)
                    | (uint32) raw[4];
-        if ((int) len > raw.length - 5) {
+        // 64-bit comparison so a corrupt/huge len can't wrap to a negative int
+        // and slip past the check into a giant `new uint8[len]` allocation.
+        if ((int64) len > (int64) (raw.length - 5)) {
             throw new PairingMsgError.MALFORMED("payload length exceeds buffer");
         }
         uint8[] payload = new uint8[len];
