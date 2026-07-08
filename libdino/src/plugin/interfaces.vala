@@ -144,6 +144,14 @@ public interface X3dhpqGroupManager : Object {
 
     // The verification/trust state of a member's authentication identity key.
     public abstract MemberTrustState get_member_trust_state(Dino.Entities.Account account, Jid member_jid);
+
+    // Peer identity-key review/accept, so the secret-group member UI can recover
+    // after a contact reset their client (new AIK). peer_aik_needs_review is true
+    // when the contact's AIK changed and is pending user review; accept_peer_aik
+    // re-pins it — invoked only from an explicit, impersonation-aware user action.
+    public abstract bool peer_aik_needs_review(Dino.Entities.Account account, Jid jid);
+    public abstract string? peer_aik_fingerprint(Dino.Entities.Account account, Jid jid);
+    public abstract async bool accept_peer_aik(Dino.Entities.Account account, Jid jid);
 }
 
 public interface VideoCallWidget : Object {

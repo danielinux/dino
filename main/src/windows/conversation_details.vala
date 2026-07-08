@@ -178,7 +178,12 @@ namespace Dino.Ui.ConversationDetails {
 
                 var app = (Application) GLib.Application.get_default();
                 var muc_manager = app.stream_interactor.get_module(MucManager.IDENTITY);
-                if (!muc_manager.is_private_room(model.conversation.account, model.conversation.counterpart)) return;
+                var pq = app.plugin_registry.x3dhpq_group_manager;
+                bool is_pq_group = pq != null && pq.is_secret_pq_group(model.conversation.account, model.conversation.counterpart);
+                // Use the reliable local secret-PQ-group signal in addition to
+                // is_private_room(), whose offline disco can be stale and would
+                // otherwise suppress the whole member-management dialog.
+                if (!muc_manager.is_private_room(model.conversation.account, model.conversation.counterpart) && !is_pq_group) return;
                 if (row_view_model.jid.equals(model.conversation.account.bare_jid)) return;
 
                 Jid? own_jid = muc_manager.get_own_jid(model.conversation.counterpart, model.conversation.account);
@@ -192,11 +197,13 @@ namespace Dino.Ui.ConversationDetails {
                 // Secret post-quantum groups are owner-managed only: the x3dhpq
                 // membership journal must be signed by the owner's AIK, so admins
                 // don't get member ops there.
-                bool can_member_ops = is_private_room ? can_owner_admin : (can_owner_admin || own_affiliation == Xmpp.Xep.Muc.Affiliation.ADMIN);
+                bool can_member_ops = (is_private_room || is_pq_group) ? can_owner_admin : (can_owner_admin || own_affiliation == Xmpp.Xep.Muc.Affiliation.ADMIN);
                 bool can_ban = can_member_ops;
+                bool needs_identity_review = pq != null && pq.peer_aik_needs_review(model.conversation.account, row_view_model.jid);
 
                 var dialog = new Adw.AlertDialog(_("Manage member"), row_view_model.jid.to_string());
                 dialog.add_response("cancel", _("Cancel"));
+                if (needs_identity_review) dialog.add_response("review-identity", _("Review identity"));
                 if (can_kick) dialog.add_response("kick", _("Kick"));
                 if (can_ban) dialog.add_response("ban", _("Ban"));
                 if (can_member_ops && row_view_model.affiliation != Xmpp.Xep.Muc.Affiliation.NONE) dialog.add_response("none", _("Remove membership"));
@@ -209,6 +216,9 @@ namespace Dino.Ui.ConversationDetails {
                 dialog.choose.begin(this, null, (obj, res) => {
                     string response = dialog.choose.end(res);
                     switch (response) {
+                        case "review-identity":
+                            show_review_identity_dialog(model.conversation.account, row_view_model.jid);
+                            break;
                         case "kick":
                             if (occupant_jid != null) {
                                 app.stream_interactor.get_module(MucManager.IDENTITY).kick(model.conversation.account, model.conversation.counterpart, occupant_jid.resourcepart);
@@ -237,6 +247,30 @@ namespace Dino.Ui.ConversationDetails {
             });
 
             add_members_tab_element(list_view);
+        }
+
+        // Impersonation-aware accept flow for a group member whose AIK changed
+        // (e.g. they reinstalled/reset their client). Never auto-accepts: shows
+        // the new fingerprint with a warning and requires explicit confirmation.
+        private void show_review_identity_dialog(Account account, Jid jid) {
+            var app = (Application) GLib.Application.get_default();
+            var pq = app.plugin_registry.x3dhpq_group_manager;
+            if (pq == null) return;
+            string fp = pq.peer_aik_fingerprint(account, jid) ?? _("unavailable");
+            var confirm = new Adw.AlertDialog(
+                _("Accept changed identity?"),
+                _("%s’s post-quantum identity key changed. This is expected if they reinstalled or reset their client, but a changed key can also be an impersonation attempt by a malicious server.\n\nOnly accept if you have confirmed this fingerprint with them out-of-band (in person, a call, or a QR scan):\n\n%s").printf(jid.to_string(), fp)
+            );
+            confirm.add_response("cancel", _("Cancel"));
+            confirm.add_response("accept", _("Accept new identity"));
+            confirm.set_response_appearance("accept", Adw.ResponseAppearance.DESTRUCTIVE);
+            confirm.set_default_response("cancel");
+            confirm.set_close_response("cancel");
+            confirm.choose.begin(this, null, (obj, res) => {
+                if (confirm.choose.end(res) == "accept") {
+                    pq.accept_peer_aik.begin(account, jid);
+                }
+            });
         }
 
         // When a member is removed/banned/kicked from a secret post-quantum
