@@ -870,16 +870,31 @@ public class StreamModule : XmppStreamModule {
             stream, null, Protocol.NS_AUDIT, item_id, entry, PUBLISH_OPTIONS);
     }
 
-    // Publish an opaque, owner-signed membership entry to a room's group:0 PEP
-    // node using standard XEP-0060 publish. Authenticity is enforced entirely
-    // client-side via the entry's hybrid AIK signature; we do not rely on the
-    // server restricting who may publish or on any item-size cap.
+    // Distribute an opaque, owner/admin-signed membership entry to a room by
+    // sending it as a <journal-entry> element inside an ordinary type='groupchat'
+    // <message> to the room JID. This replaces the previous room-JID XEP-0060
+    // PubSub node, which stock MUC services (e.g. ejabberd mod_muc) do not serve
+    // to members: a joined member could never subscribe/fetch it. The MUC channel
+    // is a single shared, server-archived (MAM) log every member already reads;
+    // late joiners catch up via MUC MAM (see Manager.trigger_group_mam_catchup).
+    // Authenticity is enforced entirely client-side via the entry's hybrid AIK
+    // signature; the server sees only an opaque base64 blob. item_id is retained
+    // for API compatibility but is no longer a PubSub item id (dedup is by the
+    // entry's own seq/hash inside the signed bytes). A groupchat message carries
+    // no IQ result, so this returns true optimistically once queued.
     public async bool publish_membership_entry(XmppStream stream, Jid room_jid, string item_id, string base64_payload) {
-        StanzaNode entry = new StanzaNode.build("membership-entry", Protocol.NS_GROUP)
+        StanzaNode entry = new StanzaNode.build("journal-entry", Protocol.NS_ENVELOPE)
             .add_self_xmlns()
             .put_node(new StanzaNode.text(base64_payload));
-        return yield stream.get_module(Pubsub.Module.IDENTITY).publish(
-            stream, room_jid, Protocol.NS_GROUP, item_id, entry, PUBLISH_OPTIONS);
+        Xmpp.MessageStanza msg = new Xmpp.MessageStanza();
+        msg.to = room_jid;
+        msg.type_ = Xmpp.MessageStanza.TYPE_GROUPCHAT;
+        // A <body> is required for stock MUC services to archive the message in
+        // MAM (many only archive messages carrying a body); receivers suppress it.
+        msg.body = "[x3dhpq group membership update]";
+        msg.stanza.put_node(entry);
+        stream.get_module(Xmpp.MessageModule.IDENTITY).send_message.begin(stream, msg);
+        return true;
     }
 
     // Publish an owner-generated (or server-generated) membership audit entry

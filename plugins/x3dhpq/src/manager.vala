@@ -32,15 +32,12 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         if (stream == null || module == null) {
             return;
         }
-        // Subscribe first, then explicitly catch up on already-published
-        // items. XEP-0060 subscribers do NOT get a backfill of items
-        // published before they subscribed, so without the second step a
-        // late joiner sees an empty journal even if the owner published
-        // hours earlier.
-        module.subscribe_to_group_node.begin((!) stream, muc_jid, (obj, res) => {
-            module.subscribe_to_group_node.end(res);
-            module.fetch_group_items.begin((!) stream, muc_jid);
-        });
+        // WS1: the membership journal now rides the MUC groupchat channel and is
+        // archived by the room (MAM), not a room-JID PubSub node. On join we force
+        // a MUC MAM catch-up so a late joiner replays every <journal-entry> the
+        // owner/admins published before we arrived; each replayed groupchat message
+        // flows through the received pipeline into try_handle_journal_entry.
+        trigger_group_mam_catchup(account, muc_jid.bare_jid.to_string());
     }
 
     private void wipe_sessions_once(Account account) {
@@ -342,11 +339,16 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             // Diagnostic: show first 16 bytes so we can confirm whether the
             // wire prefix is the canonical 16-byte "X3DHPQ-Audit-v1\0".
             StringBuilder hex = new StringBuilder();
-            for (int i = 0; i < entry_bytes.length && i < 24; i++) {
+            for (int i = 0; i < entry_bytes.length && i < 80; i++) {
                 hex.append_printf("%02x", entry_bytes[i]);
             }
-            warning("membership-entry: unmarshal failed for %s (len=%d, head=%s)",
-                room_jid.to_string(), entry_bytes.length, hex.str);
+            // Also dump the trailing bytes so we can see the sig-length framing.
+            StringBuilder tail = new StringBuilder();
+            for (int i = int.max(0, entry_bytes.length - 16); i < entry_bytes.length; i++) {
+                tail.append_printf("%02x", entry_bytes[i]);
+            }
+            warning("membership-entry: unmarshal failed for %s (len=%d, head80=%s, tail16=%s)",
+                room_jid.to_string(), entry_bytes.length, hex.str, tail.str);
             return;
         }
         uint8[] aik_fp_raw;
@@ -835,9 +837,32 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         }
 
         public override async bool run(Entities.Message message, Xmpp.MessageStanza stanza, Conversation conversation) {
+            // A <journal-entry> is a group membership-journal record riding the MUC
+            // groupchat channel (WS1). It carries no user-visible content, so if we
+            // handle one we consume the message (return true) to keep it out of the
+            // conversation. Live delivery and MUC MAM catch-up both reach here.
+            if (manager.try_handle_journal_entry(stanza, conversation)) {
+                return true;
+            }
             manager.decrypt_message(message, stanza, conversation);
             return false;
         }
+    }
+
+    // Detect and ingest a <journal-entry> membership record carried in a
+    // type='groupchat' message (WS1 transport). Returns true if the stanza was a
+    // journal entry (and was fed to the verifier), so the caller suppresses it.
+    private bool try_handle_journal_entry(Xmpp.MessageStanza stanza, Conversation conversation) {
+        StanzaNode? entry = stanza.stanza.get_subnode("journal-entry", Protocol.NS_ENVELOPE);
+        if (entry == null) {
+            return false;
+        }
+        string? payload = entry.get_string_content();
+        if (payload != null && payload.strip() != "") {
+            // The room JID is the conversation counterpart for a groupchat.
+            on_membership_entry_received(conversation.account, conversation.counterpart.bare_jid, null, payload);
+        }
+        return true;
     }
 
     private bool decrypt_message(Entities.Message message, Xmpp.MessageStanza stanza, Conversation conversation) {
@@ -1205,14 +1230,13 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             } catch (GLib.Error e) {
                 return false;
             }
+            // WS1: broadcast genesis as a <journal-entry> groupchat message; the
+            // room archives it (MAM) for every future joiner. We also store it
+            // locally so the owner's own session has the member set immediately.
             if (!yield module.publish_membership_audit_entry(stream, room_jid.bare_jid, entry)) {
                 return false;
             }
             db.store_membership_journal_entry(account, room_jid_str, entry);
-            module.subscribe_to_group_node.begin((!) stream, room_jid.bare_jid, (obj, res) => {
-                module.subscribe_to_group_node.end(res);
-                module.fetch_group_items.begin((!) stream, room_jid.bare_jid);
-            });
             return true;
         } catch (GLib.Error e) {
             return false;

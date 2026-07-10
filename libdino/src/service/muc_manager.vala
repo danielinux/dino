@@ -236,6 +236,8 @@ public class MucManager : StreamInteractionModule, Object {
             yield stream.get_module(Xep.Muc.Module.IDENTITY).change_affiliation(stream, jid.bare_jid, member_jid.bare_jid, null, affiliation);
             return true;
         } catch (GLib.Error e) {
+            warning("x3dhpq affiliation change '%s' for %s in %s failed: %s",
+                affiliation, member_jid.to_string(), jid.to_string(), e.message);
             return false;
         }
     }

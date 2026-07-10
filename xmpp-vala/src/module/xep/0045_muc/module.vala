@@ -227,7 +227,7 @@ public class Module : XmppStreamModule {
         stream.get_module(Iq.Module.IDENTITY).send_iq(stream, iq);
     }
 
-    public async void change_affiliation(XmppStream stream, Jid muc_jid, Jid? user_jid, string? nick, string new_affiliation) {
+    public async void change_affiliation(XmppStream stream, Jid muc_jid, Jid? user_jid, string? nick, string new_affiliation) throws GLib.Error {
         StanzaNode item_node = new StanzaNode.build("item", NS_URI_ADMIN)
                 .put_attribute("affiliation", new_affiliation, NS_URI_ADMIN);
         if (user_jid != null) {
@@ -238,7 +238,17 @@ public class Module : XmppStreamModule {
 
         StanzaNode query = new StanzaNode.build("query", NS_URI_ADMIN).add_self_xmlns().put_node(item_node);
         Iq.Stanza iq = new Iq.Stanza.set(query) { to=muc_jid };
-        yield stream.get_module(Iq.Module.IDENTITY).send_iq_async(stream, iq);
+        Iq.Stanza result = yield stream.get_module(Iq.Module.IDENTITY).send_iq_async(stream, iq);
+        // Previously the server's response was ignored, so a rejected affiliation
+        // change (e.g. not-allowed/forbidden because we aren't really owner/admin,
+        // or the target JID is unknown) looked like success. Surface it instead.
+        if (result.type_ == "error") {
+            StanzaNode? error_node = result.stanza.get_subnode("error");
+            string detail = error_node != null ? error_node.to_string() : "unknown error";
+            throw new IOError.FAILED("MUC affiliation change to '%s' for %s in %s rejected: %s".printf(
+                new_affiliation, user_jid != null ? user_jid.bare_jid.to_string() : (nick ?? "?"),
+                muc_jid.to_string(), detail));
+        }
     }
 
     public async DataForms.DataForm? get_config_form(XmppStream stream, Jid jid) {

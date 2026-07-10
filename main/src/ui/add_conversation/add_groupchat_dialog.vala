@@ -262,6 +262,11 @@ protected class AddGroupchatDialog : Gtk.Dialog {
             }
         }
         yield stream_interactor.get_module(MucManager.IDENTITY).set_config_form(account, conference.jid, data_form);
+        // The room's disco#info features (muc_membersonly, muc_nonanonymous) only
+        // reflect the config we just applied after a fresh disco. Refresh now so
+        // is_private_room() is reliable immediately (invite type, member ops, etc.)
+        // instead of staying false until the next app restart / room reopen.
+        yield stream_interactor.get_module(Dino.EntityInfo.IDENTITY).refresh_features(account, conference.jid);
     }
 }
 

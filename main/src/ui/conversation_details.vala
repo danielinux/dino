@@ -267,7 +267,8 @@ namespace Dino.Ui.ConversationDetails {
                 return;
             }
             if (pq != null) {
-                if (!(yield pq.add_private_group_member(conversation.account, conversation.counterpart, jid))) {
+                bool added = yield pq.add_private_group_member(conversation.account, conversation.counterpart, jid);
+                if (!added) {
                     show_group_error(_("Could not invite contact"), _("Dino could not publish x3dhpq membership data for %s in this private channel.").printf(jid.to_string()));
                     return;
                 }

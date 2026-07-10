@@ -20,7 +20,10 @@ public abstract class Xmpp.XmppStream : Object {
     public StanzaNode? features { get; private set; default = new StanzaNode.build("features", NS_URI); }
     public Jid remote_name;
 
-    public XmppLog log = new XmppLog();
+    // Raw stanza logging is off unless DINO_XMPP_LOG is set (e.g. DINO_XMPP_LOG=all
+    // to dump every stanza, or a filter like "iq" / "message"). Lets us see the
+    // actual wire exchange (affiliation IQ results, MUC invites, presences).
+    public XmppLog log = new XmppLog("dino", GLib.Environment.get_variable("DINO_XMPP_LOG"));
     public bool negotiation_complete { get; set; default=false; }
     public bool expect_further_negotiation_stanzas = false;
     protected bool non_negotiation_modules_attached = false;
