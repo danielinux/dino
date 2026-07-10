@@ -159,6 +159,15 @@ public class EntityInfo : StreamInteractionModule, Object {
         return has_feature_cached_int(account, jid, feature) == 1;
     }
 
+    // Force a fresh disco#info fetch for `jid` and refresh the cached feature set.
+    // Needed after a MUC room's configuration changes (e.g. it is made
+    // members-only + non-anonymous): otherwise has_feature_offline() keeps
+    // returning the pre-config cache, so is_private_room() stays false right after
+    // creating a private/secret group.
+    public async void refresh_features(Account account, Jid jid) {
+        yield get_info_result(account, jid);
+    }
+
     private int has_feature_cached_int(Account account, Jid jid, string feature) {
         if (jid_features.has_key(jid)) {
             return jid_features[jid].contains(feature) ? 1 : 0;
