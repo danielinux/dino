@@ -30,10 +30,15 @@ public class DeviceListDevice : Object {
 
 public class DeviceListSigned : Object {
     // "X3DHPQ-DeviceList-v1\x00" — 20 ASCII chars + one trailing 0x00 = 21 bytes.
-    // Built byte-by-byte because a Vala string literal would drop the NUL.
-    private static uint8[] PREFIX = {
-        'X','3','D','H','P','Q','-','D','e','v','i','c','e','L','i','s','t','-','v','1', 0x00
-    };
+    // Domain separator "X3DHPQ-DeviceList-v1\0" (21 bytes). Returned as a fresh
+    // LOCAL each call: a `static uint8[]` FIELD initializer reports .length == 0
+    // at runtime in this valac (the data initializes but the length metadata does
+    // not), which silently dropped this prefix from the signed input and broke
+    // cross-client signature verification (Dino↔PQonversations). Built byte-by-byte
+    // because a Vala string literal would drop the trailing NUL.
+    private static uint8[] prefix() {
+        return { 'X','3','D','H','P','Q','-','D','e','v','i','c','e','L','i','s','t','-','v','1', 0x00 };
+    }
 
     private static void put_u64(uint8[] buf, ref int off, uint64 v) {
         for (int i = 7; i >= 0; i--) {
@@ -51,6 +56,7 @@ public class DeviceListSigned : Object {
     // Build the canonical SignedPart (layout A). The device list is sorted by
     // device_id ascending here so callers need not pre-sort.
     public static uint8[] signed_part(uint64 version, int64 issued_at, Gee.List<DeviceListDevice> devices) {
+        uint8[] PREFIX = prefix();
         var sorted = new Gee.ArrayList<DeviceListDevice>();
         sorted.add_all(devices);
         sorted.sort((a, b) => {

@@ -28,11 +28,15 @@ public class MemberAuditEntry : Object {
     // string.data because the embedded NUL terminates the C string view, so
     // we build the prefix byte-by-byte to match the canonical wire layout
     // (Conversations Java + Go reference both write 16 bytes).
-    private static uint8[] AUDIT_PREFIX = {
-        'X','3','D','H','P','Q','-','A','u','d','i','t','-','v','1', 0x00
-    };
+    // Returned as a fresh LOCAL each call — a `static uint8[]` field initializer
+    // reports .length == 0 at runtime in this valac, which dropped the prefix and
+    // broke cross-client signing AND parsing (peer entries misaligned by 16 bytes).
+    private static uint8[] audit_prefix() {
+        return { 'X','3','D','H','P','Q','-','A','u','d','i','t','-','v','1', 0x00 };
+    }
 
     public uint8[] signed_part() {
+        uint8[] AUDIT_PREFIX = audit_prefix();
         int size = AUDIT_PREFIX.length + 8 + 32 + 1 + 4 + payload.length + 8;
         uint8[] buf = new uint8[size];
         int off = 0;
@@ -112,7 +116,7 @@ public class MemberAuditEntry : Object {
     }
 
     public static MemberAuditEntry? unmarshal(uint8[] b) {
-        uint8[] PREFIX = AUDIT_PREFIX;
+        uint8[] PREFIX = audit_prefix();
         int min_size = PREFIX.length + 8 + 32 + 1 + 4 + 8 + 2 + 2;
         if (b.length < min_size) return null;
         int off = 0;

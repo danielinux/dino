@@ -35,14 +35,18 @@ public class AuditEntry : Object {
     public uint8[] mldsa_signature { get; set; }  // ML-DSA-65, 3309 bytes
 
     // Exactly 16 bytes: "X3DHPQ-Audit-v1" (15) + 0x00.
-    // Built byte-by-byte so embedded NUL is not truncated by C string semantics.
-    private static uint8[] AUDIT_PREFIX = {
-        'X','3','D','H','P','Q','-','A','u','d','i','t','-','v','1', 0x00
-    };
+    // Domain separator "X3DHPQ-Audit-v1\0" (16 bytes). Returned as a fresh LOCAL
+    // each call — a `static uint8[]` field initializer reports .length == 0 at
+    // runtime in this valac, which dropped the prefix and broke cross-client
+    // signing/parsing. Built byte-by-byte so the embedded NUL isn't truncated.
+    private static uint8[] audit_prefix() {
+        return { 'X','3','D','H','P','Q','-','A','u','d','i','t','-','v','1', 0x00 };
+    }
 
     // §11.3 SignedPart: prefix | seq(8 BE) | prev_hash(32) | action(1) |
     //                   payload_len(4 BE) | payload | timestamp(8 BE)
     public uint8[] signed_part() {
+        uint8[] AUDIT_PREFIX = audit_prefix();
         int size = AUDIT_PREFIX.length + 8 + 32 + 1 + 4 + payload.length + 8;
         uint8[] buf = new uint8[size];
         int off = 0;
@@ -121,7 +125,7 @@ public class AuditEntry : Object {
 
     // Static factory from wire bytes; returns null on malformed input.
     public static AuditEntry? unmarshal(uint8[] b) {
-        uint8[] PREFIX = AUDIT_PREFIX;
+        uint8[] PREFIX = audit_prefix();
         int min_size = PREFIX.length + 8 + 32 + 1 + 4 + 8 + 2 + 2;
         if (b.length < min_size) return null;
         int off = 0;
