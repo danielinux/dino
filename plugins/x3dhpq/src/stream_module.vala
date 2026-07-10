@@ -249,7 +249,7 @@ public class StreamModule : XmppStreamModule {
         foreach (Protocol.DeviceListDevice d in devices) {
             new_ids.add(d.device_id);
         }
-        Gee.Set<uint32> prev_ids = yield parse_own_devicelist_ids(db.get_device_list_payload_xml(account, own_jid));
+        Gee.Set<uint32> prev_ids = parse_own_devicelist_ids(db.get_device_list_content_key(account, own_jid));
         Gee.List<uint32> missing = Protocol.devicelist_shrink_drops(prev_ids, new_ids, allow_removals);
         if (missing.size > 0) {
             var missing_str = new StringBuilder();
@@ -344,21 +344,24 @@ public class StreamModule : XmppStreamModule {
     // payload (Database.get_device_list_payload_xml). Returns an empty set for
     // null/empty input or on parse failure. Used only by the publish-time shrink
     // guard, whose reference set is the last authoritative own devicelist.
-    private async Gee.Set<uint32> parse_own_devicelist_ids(string? xml) {
+    // Device ids from the last committed own devicelist, read from the stored
+    // content_key ("id|added_at|flags|cert" entries joined by ';'; see
+    // build_device_content_key). This is the independent last-committed reference
+    // for the shrink guard. NB: the stored payload is StanzaNode.to_string()'s
+    // internal "{ns}:name" debug form, NOT real XML, so it cannot be re-parsed —
+    // the content_key is the reparseable source.
+    private Gee.Set<uint32> parse_own_devicelist_ids(string? content_key) {
         var ids = new Gee.HashSet<uint32>();
-        if (xml == null || ((!) xml).length == 0) {
+        if (content_key == null || ((!) content_key).length == 0) {
             return ids;
         }
-        try {
-            StanzaNode root = yield new StanzaReader.for_string((!) xml).read_node();
-            foreach (StanzaNode device_node in root.get_subnodes("device", Protocol.NS_DEVICELIST)) {
-                int id = device_node.get_attribute_int("id");
-                if (id > 0) {
-                    ids.add((uint32) id);
-                }
+        foreach (string entry in ((!) content_key).split(";")) {
+            if (entry.length == 0) continue;
+            string[] parts = entry.split("|", 2);
+            int id = int.parse(parts[0]);
+            if (id > 0) {
+                ids.add((uint32) id);
             }
-        } catch (GLib.Error e) {
-            warning("x3dhpq: failed to parse stored own devicelist for shrink guard: %s", e.message);
         }
         return ids;
     }

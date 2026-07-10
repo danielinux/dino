@@ -250,15 +250,26 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     // impersonation-aware decision.
     public async bool accept_peer_aik(Account account, Jid jid) {
         string bare = jid.bare_jid.to_string();
-        db.set_peer_aik_verified(account, bare);
-        db.reset_peer_devicelist(account, bare);
         XmppStream? stream = app.stream_interactor.get_stream(account);
         StreamModule? module = app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
         if (stream == null || module == null) {
             return false;
         }
+        // A peer's AIK is learned ONLY from their bundle, and their (new-AIK-
+        // signed) devicelist is rejected against our STALE stored AIK — so we
+        // can never fetch the new bundle to learn the new AIK: a deadlock.
+        // Forget everything for this peer and re-learn their CURRENT identity
+        // fresh (first-contact: devicelist accepted unverified, bundle fetched,
+        // new AIK stored). Safe because this is an explicit user accept.
+        db.forget_peer(account, bare);
         yield module.request_device_list((!) stream, jid);
-        return yield ensure_get_keys_for_jid(account, jid);
+        bool ok = yield ensure_get_keys_for_jid(account, jid);
+        if (ok) {
+            // Pin the freshly-learned AIK as user-verified (the user vouched by
+            // accepting). They should still compare the now-correct fingerprint.
+            db.set_peer_aik_verified(account, bare);
+        }
+        return ok;
     }
 
     public async void prefetch_for_conversation(Conversation conversation) {

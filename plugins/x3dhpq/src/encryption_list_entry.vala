@@ -40,8 +40,24 @@ public class EncryptionListEntry : Plugins.EncryptionListEntry, Object {
         }
 
         if (conversation.type_ == Conversation.Type.CHAT) {
+            // Enforce peer AIK trust in 1:1 too, consistently with groups. A
+            // ROTATED identity (was trusted, key changed) is NOT authenticated —
+            // refuse to send until the user reviews & accepts it (spec §12.3
+            // RotationTrustStrict). Without this, 1:1 chat would silently encrypt
+            // to an unverified new identity while groups correctly reject it, so
+            // authenticity would not actually be guaranteed for direct chats.
+            if (plugin.manager.peer_aik_needs_review(conversation.account, conversation.counterpart)) {
+                input_status_callback(new Plugins.InputFieldStatus("This contact's identity key changed and hasn't been reviewed. Open Contact details → x3dhpq → Review identity before sending.", Plugins.InputFieldStatus.MessageType.ERROR, Plugins.InputFieldStatus.InputState.NO_SEND));
+                return;
+            }
             if (!(yield plugin.manager.ensure_get_keys_for_jid(conversation.account, conversation.counterpart.bare_jid))) {
                 input_status_callback(new Plugins.InputFieldStatus("This contact does not publish usable x3dhpq bundle data.", Plugins.InputFieldStatus.MessageType.ERROR, Plugins.InputFieldStatus.InputState.NO_SEND));
+                return;
+            }
+            // First contact (never verified out-of-band) is opportunistic —
+            // allowed, but flagged so the user knows authenticity isn't confirmed.
+            if (plugin.manager.get_member_trust_state(conversation.account, conversation.counterpart) == global::Dino.Plugins.MemberTrustState.UNVERIFIED) {
+                input_status_callback(new Plugins.InputFieldStatus("Encrypting to an unverified identity — verify the fingerprint in Contact details for full authenticity.", Plugins.InputFieldStatus.MessageType.WARNING, Plugins.InputFieldStatus.InputState.NORMAL));
                 return;
             }
         } else if (conversation.type_ == Conversation.Type.GROUPCHAT) {
