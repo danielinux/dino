@@ -113,6 +113,11 @@ public class View : Popover {
             outer_box.append(ban_button);
             ban_button.clicked.connect(() => {
                 stream_interactor.get_module(MucManager.IDENTITY).change_affiliation_for_jid(conversation.account, conversation.counterpart, real_jid, "outcast");
+                // Banning must also revoke the member from the x3dhpq membership
+                // journal and rotate the group epoch, exactly like a kick — a MUC
+                // outcast that stays in the crypto member set would still receive
+                // future group keys.
+                remove_x3dhpq_member.begin(jid);
             });
         }
         if (stream_interactor.get_module(MucManager.IDENTITY).is_moderated_room(conversation.account, conversation.counterpart) && role ==  Xmpp.Xep.Muc.Role.MODERATOR){
