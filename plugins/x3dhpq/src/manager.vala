@@ -1364,6 +1364,11 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                     global::X3dhpq.Crypto.ed25519_sign(aik_priv_ed, new Bytes(sp)));
                 entry.mldsa_signature = bytes_to_uint8_array(
                     global::X3dhpq.Crypto.mldsa65_sign(aik_priv_mldsa, new Bytes(sp)));
+                StringBuilder sphex = new StringBuilder();
+                for (int i = 0; i < int.min(sp.length, 60); i++) sphex.append_printf("%02x", sp[i]);
+                warning("x3dhpq-DIAG genesis sign: room=%s ownerFp=%s spLen=%d edSig=%d mlSig=%d spHead=%s",
+                    room_jid_str, Protocol.hex_of(aik_fp_raw), sp.length,
+                    entry.signature.length, entry.mldsa_signature.length, sphex.str);
             } catch (GLib.Error e) {
                 return false;
             }
