@@ -173,15 +173,17 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
             "Reset this account's identity?",
             "This performs an ACCOUNT RESET: it creates a brand-new post-quantum identity for " +
             "this account instead of joining the one your other devices already use.\n\n" +
-            "This is DESTRUCTIVE and cannot be undone:\n" +
-            " • All prior messages under the previous identity are lost.\n" +
-            " • The previous identity is revoked and every other device of yours is de-associated " +
-            "from this one — they will no longer be trusted as this account.\n" +
-            " • This account is removed from every prior group (your old identity is no longer a " +
-            "journal member) and MUST be re-invited to each one.\n" +
-            " • Every contact will see your identity change and MUST manually re-verify you " +
-            "out-of-band before trusting you again — messaging with them does not resume until " +
-            "they do.\n\n" +
+            "This is DESTRUCTIVE and CANNOT BE UNDONE:\n" +
+            " • Your current identity (key) is permanently lost. The old private key is wiped " +
+            "from this device and cannot be recovered, and every other device of yours is " +
+            "de-associated from it — they will no longer be trusted as this account.\n" +
+            " • Every contact will have to re-verify you. They will see your identity change and " +
+            "MUST manually re-verify you out-of-band before trusting you again — messaging with " +
+            "them does not resume until they do.\n" +
+            " • You will lose ALL message history from ALL groups. This account is removed from " +
+            "every group it belongs to (your old identity is no longer a journal member), and " +
+            "that history stays inaccessible until this account is re-invited to each group " +
+            "individually.\n\n" +
             "Only do this if you have no other working device for this account."
         );
         dialog.add_response("cancel", "Cancel");

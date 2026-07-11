@@ -13,6 +13,15 @@ public class Plugin : RootInterface, Object {
     private EncryptionListEntry list_entry;
     private ContactDetailsProvider contact_details_provider;
 
+    // §10.6.4/§11.8 UX: accounts for which the "pair this device" screen has
+    // already been auto-opened (or attempted) once during THIS pending state,
+    // this app session. Purely in-memory/transient — reset on restart, and
+    // explicitly cleared below whenever an account leaves the pending state,
+    // so a LATER disable (e.g. a fresh revocation, §11.8) is offered again.
+    // This is what makes on_stream_negotiated's auto-open fire once per
+    // pending state rather than on every reconnect.
+    private Gee.HashSet<int> pending_pair_prompt_shown = new Gee.HashSet<int>();
+
     public void registered(Dino.Application app) {
         instance = this;
         this.app = app;
@@ -68,6 +77,59 @@ public class Plugin : RootInterface, Object {
         if (module != null) {
             module.publish_current_state.begin(stream);
         }
+        maybe_prompt_pairing(account, stream);
+    }
+
+    // §10.6.4 UX: a disabled (not-yet-authorized) device only ever showed a
+    // passive banner on the encryption-preferences page, which a user could
+    // easily never open. Once this account has actually logged in while still
+    // pending, surface the "pair this device" screen directly instead of
+    // waiting for the user to stumble onto the banner — dismissible (Cancel is
+    // right there in the dialog's header bar), fired at most once per pending
+    // state (see pending_pair_prompt_shown above), and NEVER for an account
+    // that is already authorized.
+    private void maybe_prompt_pairing(Account account, Xmpp.XmppStream stream) {
+        if (!db.is_pending_enrollment(account)) {
+            // Authorized (or resolved either way) — never prompt, and clear the
+            // guard so a LATER disable (e.g. a fresh §11.8 revocation) is
+            // offered the auto-open again exactly once.
+            pending_pair_prompt_shown.remove(account.id);
+            return;
+        }
+        if (pending_pair_prompt_shown.contains(account.id)) {
+            return;
+        }
+
+        // No main window yet (e.g. this account finished its very first
+        // handshake before the UI finished starting up) — do NOT mark the
+        // guard as consumed; the passive banner still covers this case, and
+        // we'll retry the auto-open on the account's next reconnect.
+        Gtk.Application? gtk_app = GLib.Application.get_default() as Gtk.Application;
+        Gtk.Window? parent = gtk_app != null ? ((!) gtk_app).get_active_window() : null;
+        if (parent == null) {
+            return;
+        }
+
+        StreamModule? module = app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
+        if (module == null) {
+            return;
+        }
+
+        pending_pair_prompt_shown.add(account.id);
+
+        // Mirror the pending-enrollment banner's "Associate" button: also
+        // persist a queued enrollment request (§11.8) so an authorized device
+        // that is offline right now still discovers it on its next connect, in
+        // addition to the live handshake the dialog itself attempts.
+        module.publish_enrollment_request.begin(stream);
+
+        var dialog = new UI.PairToExistingDialog((!) parent, db, account, module, stream);
+        dialog.pairing_completed.connect((result) => {
+            db.apply_paired_identity(account, result);
+            db.store_local_device_certificate(account, (int) result.cert.device_id, Base64.encode(result.cert.marshal()));
+            module.publish_current_state.begin(stream);
+        });
+        dialog.present();
     }
 
     private void prefetch_and_refresh(Conversation conversation) {
