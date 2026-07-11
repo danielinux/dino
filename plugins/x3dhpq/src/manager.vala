@@ -417,6 +417,16 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     // Frame a group-sync payload (see PAYLOAD_TYPE_GROUP_SYNC): the sender-chain
     // announcement bytes followed by the current membership journal entries.
     private static uint8[] build_group_sync_bytes(uint8[] ann_bytes, Gee.List<Protocol.MemberAuditEntry> entries) {
+        if (entries.size > 0) {
+            Protocol.MemberAuditEntry g = entries[0];
+            uint8[] sp = g.signed_part();
+            StringBuilder h = new StringBuilder();
+            for (int i = 0; i < int.min(sp.length, 60); i++) h.append_printf("%02x", sp[i]);
+            uint8[] gfp; uint32 gep;
+            Protocol.MemberAuditEntry.parse_member_payload(g.payload, out gfp, out gep);
+            warning("x3dhpq-DIAG bundle genesis: seq=%llu ownerFp=%s spLen=%d edSig=%d mlSig=%d spHead=%s",
+                g.seq, Protocol.hex_of(gfp), sp.length, g.signature.length, g.mldsa_signature.length, h.str);
+        }
         var marshalled = new Gee.ArrayList<Bytes>();
         int total = 2 + 4 + ann_bytes.length + 4;
         foreach (Protocol.MemberAuditEntry e in entries) {

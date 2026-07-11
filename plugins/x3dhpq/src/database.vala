@@ -778,6 +778,32 @@ public class Database : Qlite.Database {
                 continue;
             }
         }
+        // Fallback: the peer's AIK may only be cached in the bundle table (from a
+        // 1:1 bundle fetch) and not yet mirrored into peer_account_identity.
+        var brows = bundle.select().with(bundle.account_id, "=", account.id);
+        foreach (Row r in brows) {
+            string? ed_b64 = r[bundle.aik_pub_ed25519_base64];
+            string? ml_b64 = r[bundle.aik_pub_mldsa_base64];
+            if (ed_b64 == null || ml_b64 == null) continue;
+            try {
+                uint8[] ed_arr = bytes_to_uint8_array(bytes_from_base64(ed_b64));
+                uint8[] ml_arr = bytes_to_uint8_array(bytes_from_base64(ml_b64));
+                int total = 3 + ed_arr.length + ml_arr.length;
+                uint8[] enc = new uint8[total];
+                enc[0] = 0; enc[1] = 1; enc[2] = 1;
+                Memory.copy((uint8*) enc + 3, ed_arr, ed_arr.length);
+                Memory.copy((uint8*) enc + 3 + ed_arr.length, ml_arr, ml_arr.length);
+                Bytes digest = global::X3dhpq.Crypto.blake2b160(new Bytes(enc));
+                unowned uint8[] dig = digest.get_data();
+                bool match = true;
+                for (int i = 0; i < 20; i++) {
+                    if (dig[i] != aik_fp_raw_20[i]) { match = false; break; }
+                }
+                if (match) return r[bundle.bare_jid];
+            } catch (Error e) {
+                continue;
+            }
+        }
         return null;
     }
 
