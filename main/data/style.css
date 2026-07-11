@@ -132,6 +132,14 @@ picture.avatar {
     margin-bottom: 0;
 }
 
+/* Dark-mode overrides. Adwaita deprecated the separate style-dark.css resource;
+   the modern approach is a single style.css with a prefers-color-scheme query. */
+@media (prefers-color-scheme: dark) {
+    .compact-card-toolbar {
+        background-color: shade(@view_bg_color, 1.5);
+    }
+}
+
 /* File Widget */
 
 window.dino-main .file-box-outer,

@@ -54,7 +54,9 @@ namespace Dino.Ui.ConversationDetails {
             model.notify["notification-is-default"].connect(update_notification_button_visibility);
 
             model.about_rows.items_changed.connect(populate_about_tab);
-            model.settings_rows.items_changed.connect(populate_about_tab);
+            // Settings rows (Channel Type, Invitations) now render in the Room
+            // Configuration tab, so a change there rebuilds that tab, not About.
+            model.settings_rows.items_changed.connect(add_room_configuration_tab_element);
             // TODO add_room_configuration_tab_element gets called even after the window is closed
             model.notify["room-configuration-rows"].connect(add_room_configuration_tab_element);
 
@@ -323,12 +325,8 @@ namespace Dino.Ui.ConversationDetails {
             if (model.about_rows.get_n_items() > 0) {
                 about_box.append(Util.rows_to_preference_group(model.about_rows, _("About")));
             }
-            if (model.settings_rows.get_n_items() > 0) {
-                about_box.append(Util.rows_to_preference_group(model.settings_rows, _("Settings")));
-            }
-            if (model.room_configuration_rows != null && model.room_configuration_rows.get_n_items() > 0) {
-                add_room_configuration_tab_element();
-            }
+            // "Settings" (Channel Type, Invitations) now lives under Room Configuration.
+            add_room_configuration_tab_element();
 
             if (model.account_jid != null) {
                 var account_label = new Label(@"via $(model.account_jid)") { halign=Align.START, margin_start=14, margin_top=4 };
@@ -338,7 +336,9 @@ namespace Dino.Ui.ConversationDetails {
         }
 
         public void add_room_configuration_tab_element() {
-            if (model.room_configuration_rows == null || model.room_configuration_rows.get_n_items() == 0) return;
+            bool has_config = model.room_configuration_rows != null && model.room_configuration_rows.get_n_items() > 0;
+            bool has_settings = model.settings_rows.get_n_items() > 0;
+            if (!has_config && !has_settings) return;
 
             if (room_config_stack_page == null) {
                 room_config_box = new Box(Orientation.VERTICAL, 12) { margin_end = 12, margin_start = 12, margin_top = 18, margin_bottom = 40 };
@@ -350,8 +350,22 @@ namespace Dino.Ui.ConversationDetails {
                 room_config_stack_page.title = _("Room Configuration");
                 room_config_stack_page.name = "room_config";
             }
-            foreach (Adw.PreferencesGroup preferences_group in Util.rows_to_preference_window_split_at_text(model.room_configuration_rows)) {
-                room_config_box.append(preferences_group);
+            // Rebuild from scratch — this is re-triggered when either the settings rows
+            // or the room-configuration data-form change, and must not duplicate groups.
+            var child = room_config_box.get_first_child();
+            while (child != null) {
+                room_config_box.remove(child);
+                child = room_config_box.get_first_child();
+            }
+            // Room-management settings (Channel Type, Invitations) belong with the room
+            // configuration, at the top of this tab, rather than under About.
+            if (has_settings) {
+                room_config_box.append(Util.rows_to_preference_group(model.settings_rows, _("Settings")));
+            }
+            if (has_config) {
+                foreach (Adw.PreferencesGroup preferences_group in Util.rows_to_preference_window_split_at_text(model.room_configuration_rows)) {
+                    room_config_box.append(preferences_group);
+                }
             }
         }
 
