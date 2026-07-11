@@ -8,6 +8,9 @@ public const string NS_PAIR = "urn:xmppqr:x3dhpq:pair:0";
 public const string NS_AUDIT = "urn:xmppqr:x3dhpq:audit:0";
 public const string NS_RECOVERY = "urn:xmppqr:x3dhpq:recovery:0";
 public const string NS_GROUP = "urn:xmppqr:x3dhpq:group:0";
+// §11.8: sealed device-state tracker + queued enrollment request (persisted on
+// the existing NS_PAIR node, see StreamModule.publish_enrollment_request).
+public const string NS_DEVTRACKER = "urn:xmppqr:x3dhpq:devtracker:0";
 
 public const string PAYLOAD_TYPE_SENDER_CHAIN = "sender-chain";
 // A group-sync payload bundles the sender-chain announcement with the current
@@ -28,6 +31,7 @@ public string[] get_disco_features() {
         NS_AUDIT,
         NS_RECOVERY,
         NS_GROUP,
+        NS_DEVTRACKER,
     };
 }
 

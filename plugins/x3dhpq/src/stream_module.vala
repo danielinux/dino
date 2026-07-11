@@ -49,6 +49,14 @@ public class StreamModule : XmppStreamModule {
     // existing device reacts by initiating the pairing FSM (PAKE1) toward the
     // full JID using this sid.
     public signal void pair_hello_received(Jid new_full_jid, uint device_id, uint8[] sid);
+    // §11.8 queued enrollment request: a disabled/pending device's persisted
+    // <enroll-request> item was seen (live +notify or an explicit
+    // refresh_pair_hello fetch) and its DIK hybrid signature verified. Carries
+    // the same addressing pair_hello_received does (full JID, device id, sid)
+    // plus the requester's DIK public keys, so the pairing UI can surface it
+    // without needing the human to already know a device is waiting.
+    public signal void enrollment_request_received(Jid new_full_jid, uint device_id, uint8[] sid,
+        uint8[] dik_ed25519, uint8[] dik_x25519, uint8[] dik_mldsa);
     // Emitted for each verified account audit entry (action code + human detail).
     public signal void account_audit_event(int action, string detail);
 
@@ -90,6 +98,13 @@ public class StreamModule : XmppStreamModule {
         pubsub.add_filtered_notification(stream, Protocol.NS_PAIR, (stream, jid, id, node) => {
             handle_pair_hello_event(stream, jid, id, node);
         }, null, null);
+        // §11.8 sealed device-state tracker: a live +notify delivery of the
+        // account's own devtracker:0 item (in addition to the explicit fetch in
+        // interpret_device_tracker, used at login/resolve_pending_primary time).
+        // Only self-PEP is meaningful; handle_devtracker_event ignores the rest.
+        pubsub.add_filtered_notification(stream, Protocol.NS_DEVTRACKER, (stream, jid, id, node) => {
+            handle_devtracker_event(stream, jid, node);
+        }, null, null);
 
         attached_stream = stream;
         stream.get_module(Xmpp.MessageModule.IDENTITY).received_message.connect(on_received_message);
@@ -111,6 +126,7 @@ public class StreamModule : XmppStreamModule {
         pubsub.remove_filtered_notification(stream, Protocol.NS_AUDIT);
         pubsub.remove_filtered_notification(stream, Protocol.NS_GROUP);
         pubsub.remove_filtered_notification(stream, Protocol.NS_PAIR);
+        pubsub.remove_filtered_notification(stream, Protocol.NS_DEVTRACKER);
 
         stream.get_module(Xmpp.MessageModule.IDENTITY).received_message.disconnect(on_received_message);
         attached_stream = null;
@@ -137,6 +153,15 @@ public class StreamModule : XmppStreamModule {
         // pending device's bundle is harmless-but-orphaned (nobody has a reason to
         // fetch a device_id no devicelist has ever announced).
         yield publish_bundle(stream);
+        // §11.8: an authorized device (one able to complete pairing / append
+        // AddDevice — same AIK_priv gate as publish_device_list) proactively
+        // checks pair:0 for a queued enrollment request on every connect,
+        // rather than only when the human happens to already have the
+        // "Confirm a device" dialog open. Fire-and-forget: any outcome is
+        // surfaced via enrollment_request_received / pair_hello_received.
+        if (db.is_local_primary(account)) {
+            refresh_pair_hello.begin(stream);
+        }
     }
 
     // §10.6.1: resolves a not-yet-primary local identity by fetching the
@@ -148,6 +173,25 @@ public class StreamModule : XmppStreamModule {
     // pairing (§10.6.2), which calls apply_paired_identity and sets is_primary
     // explicitly (true if share_primary, false otherwise — either way "resolved").
     private async void resolve_pending_primary(XmppStream stream) {
+        // §11.8 sealed device-state tracker: try it FIRST. Unlike the devicelist
+        // check below, it lets a device resolve while every other device is
+        // offline (no reliance on a devicelist round-trip actually existing) and
+        // additionally carries the offline revocation signal. It only ever
+        // mutates state on a CONCLUSIVE outcome (authorized / not-authorized);
+        // an absent tracker changes nothing and falls through unchanged to the
+        // legacy devicelist-only check, so a fresh account or a legacy peer that
+        // never published a tracker item bootstraps exactly as before.
+        Protocol.TrackerOutcome tracker_outcome = yield interpret_device_tracker(stream, null);
+        if (tracker_outcome != Protocol.TrackerOutcome.ABSENT) {
+            // AUTHORIZED or NOT_AUTHORIZED both fully resolve this login attempt
+            // (state already updated by interpret_device_tracker) — no need to
+            // additionally consult the devicelist.
+            return;
+        }
+
+        // Legacy fallback (§10.6.1, unchanged): the tracker node does not exist
+        // for this account (e.g. it predates §11.8, or genuinely nobody has
+        // published anything yet) — fall back to the devicelist-only check.
         Jid own_bare = account.bare_jid;
         ArrayList<int> own_devices = yield request_device_list(stream, own_bare);
         // Re-check: a concurrent pairing confirmation may have completed while
@@ -159,6 +203,466 @@ public class StreamModule : XmppStreamModule {
             db.promote_to_primary(account);
         }
         // else: stays pending — no publish, no state change.
+    }
+
+    // §11.8: fetch (or accept an already-delivered `node`, for the live +notify
+    // path) the account's own devtracker:0 item and interpret it.
+    //
+    // Security note: a device that has NEVER been through human-verified
+    // pairing (db.is_pending_enrollment true) has no pinned account AIK to
+    // verify the outer hybrid signature against — accepting an "authorized"
+    // verdict for such a device without that check would let anyone who can
+    // read our (unauthenticated-by-design) public bundle forge a tracker item
+    // decryptable by us and hand us an attacker-chosen AIK_priv. For that
+    // population we therefore only ever look at ABSENT vs PRESENT (matching
+    // spec case 3 — "an account identity already exists" — which is exactly
+    // the existing pending-enrollment banner) and never attempt decryption.
+    // Only a device that already holds a pinned AIK pub (confirmed via a prior
+    // CPace pairing) verifies the signature and, on success, attempts to
+    // decrypt its own recipient copy.
+    private async Protocol.TrackerOutcome interpret_device_tracker(XmppStream stream, StanzaNode? node) {
+        StanzaNode? item = node;
+        if (item == null) {
+            item = yield fetch_devtracker_item(stream);
+        }
+        if (item == null) {
+            return Protocol.TrackerOutcome.ABSENT;
+        }
+
+        if (db.is_pending_enrollment(account)) {
+            // Never paired: presence alone is the "an identity already exists"
+            // signal (§11.8 case 3). Stay pending; the existing banner already
+            // covers this. Never attempt to decrypt (see security note above).
+            return Protocol.TrackerOutcome.NOT_AUTHORIZED;
+        }
+
+        Row? identity = db.get_local_identity(account.id);
+        if (identity == null) {
+            return Protocol.TrackerOutcome.NOT_AUTHORIZED;
+        }
+        string? aik_ed_b64 = ((!) identity)[db.account_identity.aik_pub_ed25519_base64];
+        string? aik_ml_b64 = ((!) identity)[db.account_identity.aik_pub_mldsa_base64];
+        if (aik_ed_b64 == null || aik_ml_b64 == null) {
+            return Protocol.TrackerOutcome.NOT_AUTHORIZED;
+        }
+
+        Protocol.DevTrackerParsed? parsed = parse_devtracker_node((!) item);
+        if (parsed == null) {
+            return Protocol.TrackerOutcome.ABSENT;   // malformed: treat as if absent, never punish
+        }
+        try {
+            Bytes aik_ed = bytes_from_base64((!) aik_ed_b64);
+            Bytes aik_mldsa = bytes_from_base64((!) aik_ml_b64);
+            var recipients_for_sp = new Gee.ArrayList<Protocol.DeviceTrackerRecipient>();
+            foreach (Protocol.DevTrackerRecipientWire rw in parsed.recipients) {
+                var rec = new Protocol.DeviceTrackerRecipient();
+                rec.device_id = rw.device_id;
+                rec.hdr_bytes = rw.hdr_bytes;
+                rec.emk_bytes = rw.emk_bytes;
+                recipients_for_sp.add(rec);
+            }
+            uint8[] sp = Protocol.DeviceTrackerSigned.signed_part(
+                parsed.issued_at, parsed.sealer_device_id, parsed.ct, recipients_for_sp);
+            bool sig_ok = global::X3dhpq.Crypto.ed25519_verify(aik_ed, new Bytes(sp), new Bytes(parsed.sig_ed))
+                && global::X3dhpq.Crypto.mldsa65_verify(aik_mldsa, new Bytes(sp), new Bytes(parsed.sig_mldsa));
+            if (!sig_ok) {
+                warning("x3dhpq devtracker for %s failed AIK signature verification — ignoring",
+                    account.bare_jid.to_string());
+                return Protocol.TrackerOutcome.ABSENT;   // unverifiable: ignore, do not punish
+            }
+        } catch (GLib.Error e) {
+            warning("interpret_device_tracker: signature decode/verify error: %s", e.message);
+            return Protocol.TrackerOutcome.ABSENT;
+        }
+
+        int? local_device_id = db.get_local_device_id(account);
+        if (local_device_id == null) {
+            return Protocol.TrackerOutcome.NOT_AUTHORIZED;
+        }
+        Protocol.DevTrackerRecipientWire? mine = null;
+        foreach (Protocol.DevTrackerRecipientWire r in parsed.recipients) {
+            if (r.device_id == (uint32) (!) local_device_id) {
+                mine = r;
+                break;
+            }
+        }
+        if (mine == null) {
+            db.mark_tracker_not_authorized(account);
+            return Protocol.TrackerOutcome.NOT_AUTHORIZED;
+        }
+
+        Bytes transport_key;
+        try {
+            transport_key = try_decrypt_tracker_recipient(account, (!) mine);
+        } catch (GLib.Error e) {
+            // Cannot decrypt our own copy: either just-revoked or a stale/
+            // corrupt item — either way, not currently authorized.
+            db.mark_tracker_not_authorized(account);
+            return Protocol.TrackerOutcome.NOT_AUTHORIZED;
+        }
+
+        Protocol.DeviceTrackerPayload? payload;
+        try {
+            Bytes plaintext = Protocol.decrypt_payload_bytes(transport_key, new Bytes(parsed.ct));
+            payload = Protocol.DeviceTrackerPayload.unmarshal(bytes_to_uint8_array(plaintext));
+        } catch (GLib.Error e) {
+            warning("interpret_device_tracker: payload AEAD-open failed: %s", e.message);
+            db.mark_tracker_not_authorized(account);
+            return Protocol.TrackerOutcome.NOT_AUTHORIZED;
+        }
+        if (payload == null) {
+            db.mark_tracker_not_authorized(account);
+            return Protocol.TrackerOutcome.NOT_AUTHORIZED;
+        }
+
+        // Adopt our own DC from the fold, if present, so publish_device_list /
+        // bundle fetches can serve it without waiting on an inbound devicelist.
+        foreach (Protocol.DeviceTrackerDevice d in ((!) payload).devices) {
+            if (d.device_id == (uint32) (!) local_device_id && d.cert_bytes.length > 0) {
+                db.store_local_device_certificate(account, (int) d.device_id, Base64.encode(d.cert_bytes));
+                break;
+            }
+        }
+
+        Protocol.AccountIdentityKey? aik_priv = null;
+        if (((!) payload).aik_priv_ed25519 != null && ((!) payload).aik_priv_mldsa != null) {
+            var key = new Protocol.AccountIdentityKey();
+            key.priv_ed25519 = bytes_to_uint8_array((!) ((!) payload).aik_priv_ed25519);
+            key.priv_mldsa = bytes_to_uint8_array((!) ((!) payload).aik_priv_mldsa);
+            aik_priv = key;
+        }
+        db.mark_tracker_authorized(account, aik_priv);
+        return Protocol.TrackerOutcome.AUTHORIZED;
+    }
+
+    // Attempt to decrypt one tracker recipient copy addressed to THIS device,
+    // reusing the exact 1:1 envelope decrypt primitives (Protocol.respond_session
+    // / Protocol.decrypt_transport_key — the same call sequence Manager.
+    // decrypt_message uses for an inbound prekey message). Deliberately
+    // stateless: unlike ordinary 1:1 messaging, a tracker item is always a
+    // fresh, full re-seal (§11.8: "re-publishes it on every device-set
+    // change... adding/removing recipient copies"), so there is never a prior
+    // session to continue and nothing is persisted via db.store_session — this
+    // keeps tracker sealing/opening from ever interacting with real 1:1
+    // conversation session state between the same device pair.
+    private Bytes try_decrypt_tracker_recipient(Account account, Protocol.DevTrackerRecipientWire r) throws GLib.Error {
+        if (r.prekey == null) {
+            throw new IOError.FAILED("tracker recipient has no prekey block");
+        }
+        Protocol.DevTrackerPrekeyWire prekey = (!) r.prekey;
+        Protocol.DeviceCertificate? peer_cert = Protocol.DeviceCertificate.unmarshal(new Bytes(prekey.dc));
+        if (peer_cert == null) {
+            throw new IOError.FAILED("tracker recipient prekey has undecodable DC");
+        }
+        // Defensive: db.get_required_local_bundle() would assert()-abort if no
+        // bundle row exists yet. That should be unreachable here (ensure_local_
+        // prekeys() always runs earlier in publish_current_state, and a device
+        // that can reach this point is already confirmed, so its bundle row was
+        // created at pairing time), but interpret_device_tracker's whole point
+        // is to be resilient to unexpected/adversarial input — never crash the
+        // login path — so use the nullable accessor and fail closed instead.
+        Row? local_bundle = db.get_local_bundle(account);
+        if (local_bundle == null) {
+            throw new IOError.FAILED("no local bundle yet — cannot attempt tracker decrypt");
+        }
+        Row? local_spk = db.get_local_signed_pre_key(account, ((!) local_bundle)[db.bundle.signed_pre_key_id]);
+        Row? local_kem = db.get_local_kem_pre_key(account, (int) prekey.kemkey_id);
+        if (local_spk == null || local_kem == null) {
+            throw new IOError.FAILED("no matching local SPK/KEM prekey for tracker recipient");
+        }
+        Row? local_opk = null;
+        if (prekey.opk_id > 0) {
+            local_opk = db.get_local_one_time_pre_key(account, (int) prekey.opk_id);
+        }
+
+        Protocol.SessionState state = Protocol.respond_session(
+            db.get_local_identity_bytes(account, db.account_identity.dik_priv_x25519_base64),
+            db.get_local_identity_bytes(account, db.account_identity.dik_pub_x25519_base64),
+            bytes_from_base64(((!) local_spk)[db.signed_pre_key.private_base64]),
+            bytes_from_base64(((!) local_spk)[db.signed_pre_key.public_base64]),
+            local_opk != null ? bytes_from_base64(((!) local_opk)[db.one_time_pre_key.private_base64]) : null,
+            bytes_from_base64(((!) local_kem)[db.kem_pre_key.private_base64]),
+            peer_cert,
+            new Bytes(prekey.aik_ed25519),
+            new Bytes(prekey.aik_mldsa),
+            new Bytes(prekey.ek),
+            new Bytes(prekey.kem_ct)
+        );
+        if (local_opk != null) {
+            db.mark_local_one_time_pre_key_consumed(account, (int) prekey.opk_id);
+        }
+
+        Protocol.MessageHeader? header = Protocol.MessageHeader.unmarshal(new Bytes(r.hdr_bytes));
+        if (header == null) {
+            throw new IOError.FAILED("tracker recipient has undecodable header");
+        }
+        return Protocol.decrypt_transport_key(state, header, new Bytes(r.emk_bytes));
+    }
+
+    // §11.8: fetch the current devtracker:0 item for our own account, or null
+    // if the node does not exist / has no item / the fetch errors.
+    private async StanzaNode? fetch_devtracker_item(XmppStream stream) {
+        StanzaNode pubsub_node = new StanzaNode.build("pubsub", Pubsub.NS_URI).add_self_xmlns()
+            .put_node(new StanzaNode.build("items", Pubsub.NS_URI)
+                .put_attribute("node", Protocol.NS_DEVTRACKER));
+        Iq.Stanza iq = new Iq.Stanza.get(pubsub_node) { to = account.bare_jid };
+        try {
+            Iq.Stanza result = yield stream.get_module(Iq.Module.IDENTITY).send_iq_async(stream, iq);
+            if (result.is_error()) return null;
+            StanzaNode? item = result.stanza.get_deep_subnode(
+                Pubsub.NS_URI + ":pubsub", Pubsub.NS_URI + ":items", Pubsub.NS_URI + ":item");
+            if (item != null && item.sub_nodes.size > 0) {
+                return item.sub_nodes[0];
+            }
+        } catch (Error e) {
+            // Node-does-not-exist (item-not-found / feature-not-implemented) is
+            // the expected steady state for any account that has never
+            // published a tracker item — not a warning-worthy condition.
+        }
+        return null;
+    }
+
+    // Live +notify delivery of our own devtracker:0 item. Only meaningful for a
+    // device that is not (yet) the genuine primary — a primary/share_primary
+    // device always holds AIK_priv directly and is never subject to the tracker
+    // revocation signal. Fire-and-forget: any outcome just updates local state
+    // via interpret_device_tracker, exactly as the explicit login-time fetch
+    // would.
+    private void handle_devtracker_event(XmppStream stream, Jid from, StanzaNode? item_node) {
+        if (!from.bare_jid.equals(account.bare_jid) || item_node == null) {
+            return;
+        }
+        if (db.is_local_primary(account)) {
+            return;
+        }
+        interpret_device_tracker.begin(stream, item_node);
+    }
+
+    // §11.8: decode a <devtracker> item's XML shape into a Protocol.DevTrackerParsed.
+    // Kept here (rather than in device_tracker.vala) so the Protocol namespace's
+    // byte-codec classes stay free of an Xmpp/StanzaNode dependency, mirroring
+    // how devicelist/bundle parsing lives in this file too.
+    private Protocol.DevTrackerParsed? parse_devtracker_node(StanzaNode item) {
+        if (item.name != "devtracker") {
+            return null;
+        }
+        var parsed = new Protocol.DevTrackerParsed();
+        parsed.issued_at = (uint64) (int64.parse(item.get_attribute("issued-at") ?? "0"));
+        parsed.sealer_device_id = (uint32) (int64.parse(item.get_attribute("sealer-device") ?? "0"));
+
+        StanzaNode? ct_node = item.get_subnode("ct", Protocol.NS_DEVTRACKER);
+        string? ct_b64 = ct_node != null ? ct_node.get_string_content() : null;
+        if (ct_b64 == null) return null;
+        try {
+            parsed.ct = bytes_to_uint8_array(bytes_from_base64(ct_b64));
+        } catch (GLib.Error e) {
+            return null;
+        }
+
+        foreach (StanzaNode rn in item.get_subnodes("recipient", Protocol.NS_DEVTRACKER)) {
+            string? rid_str = rn.get_attribute("rid");
+            StanzaNode? hdr_node = rn.get_subnode("hdr", Protocol.NS_DEVTRACKER);
+            StanzaNode? emk_node = rn.get_subnode("emk", Protocol.NS_DEVTRACKER);
+            if (rid_str == null || hdr_node == null || emk_node == null) continue;
+            string? hdr_b64 = hdr_node.get_string_content();
+            string? emk_b64 = emk_node.get_string_content();
+            if (hdr_b64 == null || emk_b64 == null) continue;
+
+            var rec = new Protocol.DevTrackerRecipientWire();
+            try {
+                rec.device_id = (uint32) int64.parse(rid_str);
+                rec.hdr_bytes = bytes_to_uint8_array(bytes_from_base64(hdr_b64));
+                rec.emk_bytes = bytes_to_uint8_array(bytes_from_base64(emk_b64));
+            } catch (GLib.Error e) {
+                continue;
+            }
+
+            StanzaNode? prekey_node = rn.get_subnode("prekey", Protocol.NS_DEVTRACKER);
+            if (prekey_node != null) {
+                try {
+                    var pk = new Protocol.DevTrackerPrekeyWire();
+                    pk.ek = bytes_to_uint8_array(bytes_from_base64(prekey_node.get_attribute("ek") ?? ""));
+                    pk.opk_id = (uint32) prekey_node.get_attribute_int("opk-id");
+                    pk.kemkey_id = (uint32) prekey_node.get_attribute_int("kemkey-id");
+                    pk.kem_ct = bytes_to_uint8_array(bytes_from_base64(prekey_node.get_attribute("kem-ct") ?? ""));
+                    pk.dc = bytes_to_uint8_array(bytes_from_base64(prekey_node.get_deep_string_content("dc") ?? ""));
+                    pk.aik_ed25519 = bytes_to_uint8_array(bytes_from_base64(prekey_node.get_deep_string_content("aik-ed25519") ?? ""));
+                    pk.aik_mldsa = bytes_to_uint8_array(bytes_from_base64(prekey_node.get_deep_string_content("aik-mldsa") ?? ""));
+                    rec.prekey = pk;
+                } catch (GLib.Error e) {
+                    rec.prekey = null;
+                }
+            }
+            parsed.recipients.add(rec);
+        }
+
+        StanzaNode? sig_node = item.get_subnode("sig", Protocol.NS_DEVTRACKER);
+        StanzaNode? mldsa_node = item.get_subnode("mldsa-sig", Protocol.NS_DEVTRACKER);
+        string? sig_b64 = sig_node != null ? sig_node.get_string_content() : null;
+        string? mldsa_b64 = mldsa_node != null ? mldsa_node.get_string_content() : null;
+        if (sig_b64 == null || mldsa_b64 == null) return null;
+        try {
+            parsed.sig_ed = bytes_to_uint8_array(bytes_from_base64(sig_b64));
+            parsed.sig_mldsa = bytes_to_uint8_array(bytes_from_base64(mldsa_b64));
+        } catch (GLib.Error e) {
+            return null;
+        }
+        return parsed;
+    }
+
+    // §11.8: the DAG's current head hashes (Protocol.DeviceDag.current_heads()),
+    // included in the tracker plaintext as a self-contained catch-up anchor.
+    // Best-effort: an empty/unfoldable local DAG just yields an empty list, same
+    // as try_derive_devices_from_dag's SAFETY FALLBACK philosophy elsewhere in
+    // this file.
+    private Gee.ArrayList<Bytes> compute_dag_current_heads() {
+        var dag = new Protocol.DeviceDag();
+        foreach (Protocol.DeviceAuditEntryV2 e in db.list_device_audit_entries(account)) {
+            dag.ingest(e.marshal());
+        }
+        return dag.current_heads();
+    }
+
+    // §11.8: seal and publish the device-state tracker item to the given
+    // authorized device set (the SAME fold `publish_device_list` just
+    // published, passed in so it is computed exactly once). REUSES the exact
+    // 1:1 hybrid envelope construction — Protocol.initiate_session (X3DH +
+    // ML-KEM-768 bootstrap) and Protocol.encrypt_transport_key (AES-256-GCM
+    // wrap of the random content key under the freshly-derived session) — once
+    // per authorized device's currently-published bundle, exactly mirroring
+    // Manager.build_encrypted_message's <key rid><hdr/><emk/><prekey/></key>
+    // shape. Never persists a pairwise session (db.store_session): §11.8 has
+    // "ANY authorized device re-publishes it on every device-set change", i.e.
+    // every publish is a fresh, full re-seal, not a ratchet continuation, so
+    // there is nothing to persist and no interaction with real 1:1 conversation
+    // session state between the same device pair.
+    //
+    // Best-effort by design (§11.8 guardrail): ANY failure here — a bundle not
+    // yet fetched for some device, a signing error, a publish IQ error — is
+    // logged and swallowed. It must never block publish_device_list, which has
+    // already succeeded by the time this is called, nor account bootstrap.
+    public async void publish_device_tracker(XmppStream stream, Gee.List<Protocol.DeviceListDevice> authorized_devices) {
+        try {
+            int? local_device_id = db.get_local_device_id(account);
+            if (local_device_id == null) return;
+            string? aik_priv_ed_b64 = db.get_local_identity_string(account, db.account_identity.aik_priv_ed25519_base64);
+            string? aik_priv_ml_b64 = db.get_local_identity_string(account, db.account_identity.aik_priv_mldsa_base64);
+            if (aik_priv_ed_b64 == null || aik_priv_ed_b64 == "" || aik_priv_ml_b64 == null || aik_priv_ml_b64 == "") {
+                // A confirmed-but-not-share_primary secondary has no AIK_priv and
+                // cannot sign a tracker item; only an AIK_priv holder republishes it.
+                return;
+            }
+
+            var payload = new Protocol.DeviceTrackerPayload();
+            foreach (Protocol.DeviceListDevice d in authorized_devices) {
+                var td = new Protocol.DeviceTrackerDevice();
+                td.device_id = d.device_id;
+                td.cert_bytes = d.cert_bytes;
+                payload.devices.add(td);
+            }
+            payload.dag_heads = compute_dag_current_heads();
+            // §11.8: MAY carry the shared AIK_priv (self-refreshing, device-key-
+            // sealed recovery) — this implementation always includes it, sealed
+            // per-recipient exactly like the rest of the payload.
+            payload.aik_priv_ed25519 = bytes_from_base64((!) aik_priv_ed_b64);
+            payload.aik_priv_mldsa = bytes_from_base64((!) aik_priv_ml_b64);
+            uint8[] plaintext = payload.marshal();
+
+            Bytes payload_key = global::X3dhpq.Crypto.random_bytes(32);
+            Bytes payload_nonce = global::X3dhpq.Crypto.random_bytes(12);
+            Bytes payload_transport_key = bytes_from_uint8_array(
+                concat_byte_arrays(bytes_to_uint8_array(payload_key), bytes_to_uint8_array(payload_nonce)));
+            Bytes ct = Protocol.encrypt_payload_bytes(new Bytes(plaintext), payload_transport_key);
+
+            Bytes my_dik_priv_x = db.get_local_identity_bytes(account, db.account_identity.dik_priv_x25519_base64);
+            Bytes my_dik_pub_x = db.get_local_identity_bytes(account, db.account_identity.dik_pub_x25519_base64);
+            string own_jid = account.bare_jid.to_string();
+
+            var recipients = new Gee.ArrayList<Protocol.DeviceTrackerRecipient>();
+            var recipient_nodes = new Gee.ArrayList<StanzaNode>();
+            foreach (Protocol.DeviceListDevice d in authorized_devices) {
+                Protocol.PeerBundle? peer_bundle = db.get_remote_bundle(account, own_jid, (int) d.device_id);
+                if (peer_bundle == null) {
+                    continue;   // bundle not fetched yet — best-effort, seal what we can
+                }
+                bool verified;
+                try {
+                    verified = ((!) peer_bundle).verify();
+                } catch (GLib.Error e) {
+                    verified = false;
+                }
+                if (!verified) continue;
+
+                try {
+                    Protocol.SessionBootstrap bootstrap = Protocol.initiate_session(my_dik_priv_x, my_dik_pub_x, (!) peer_bundle);
+                    Protocol.MessageHeader header;
+                    Bytes emk;
+                    Protocol.encrypt_transport_key(bootstrap.state, payload_transport_key, out header, out emk);
+
+                    var rec = new Protocol.DeviceTrackerRecipient();
+                    rec.device_id = d.device_id;
+                    rec.hdr_bytes = bytes_to_uint8_array(header.marshal());
+                    rec.emk_bytes = bytes_to_uint8_array(emk);
+                    recipients.add(rec);
+
+                    StanzaNode prekey_node = new StanzaNode.build("prekey", Protocol.NS_DEVTRACKER)
+                        .put_attribute("ek", bytes_to_base64((!) bootstrap.prekey_ephemeral_pub))
+                        .put_attribute("opk-id", bootstrap.opk_id.to_string())
+                        .put_attribute("kemkey-id", bootstrap.kem_key_id.to_string())
+                        .put_attribute("kem-ct", bytes_to_base64((!) bootstrap.kem_ciphertext))
+                        .put_node(new StanzaNode.build("dc", Protocol.NS_DEVTRACKER).put_node(new StanzaNode.text(db.ensure_local_device_certificate(account))))
+                        .put_node(new StanzaNode.build("aik-ed25519", Protocol.NS_DEVTRACKER).put_node(new StanzaNode.text(db.get_local_identity_string(account, db.account_identity.aik_pub_ed25519_base64))))
+                        .put_node(new StanzaNode.build("aik-mldsa", Protocol.NS_DEVTRACKER).put_node(new StanzaNode.text(db.get_local_identity_string(account, db.account_identity.aik_pub_mldsa_base64))));
+
+                    StanzaNode recipient_node = new StanzaNode.build("recipient", Protocol.NS_DEVTRACKER)
+                        .put_attribute("rid", d.device_id.to_string())
+                        .put_node(new StanzaNode.build("hdr", Protocol.NS_DEVTRACKER).put_node(new StanzaNode.text(bytes_to_base64(new Bytes(rec.hdr_bytes)))))
+                        .put_node(new StanzaNode.build("emk", Protocol.NS_DEVTRACKER).put_node(new StanzaNode.text(bytes_to_base64(emk))))
+                        .put_node(prekey_node);
+                    recipient_nodes.add(recipient_node);
+                } catch (GLib.Error e) {
+                    warning("publish_device_tracker: failed to seal to device %u: %s", d.device_id, e.message);
+                    continue;
+                }
+            }
+
+            if (recipients.size == 0) {
+                // Nothing sealable yet (no bundles fetched for any authorized
+                // device, not even our own) — try again on the next
+                // republish/device-set change rather than publishing an item
+                // nobody could ever decrypt.
+                return;
+            }
+
+            long issued_at = (long) new DateTime.now_utc().to_unix();
+            uint8[] sp = Protocol.DeviceTrackerSigned.signed_part(
+                (uint64) issued_at, (uint32) (!) local_device_id, bytes_to_uint8_array(ct), recipients);
+            Bytes aik_priv_ed = bytes_from_base64((!) aik_priv_ed_b64);
+            Bytes aik_priv_ml = bytes_from_base64((!) aik_priv_ml_b64);
+            string sig_b64 = Base64.encode(bytes_to_uint8_array(global::X3dhpq.Crypto.ed25519_sign(aik_priv_ed, new Bytes(sp))));
+            string mldsa_sig_b64 = Base64.encode(bytes_to_uint8_array(global::X3dhpq.Crypto.mldsa65_sign(aik_priv_ml, new Bytes(sp))));
+
+            StanzaNode node = new StanzaNode.build("devtracker", Protocol.NS_DEVTRACKER)
+                .add_self_xmlns()
+                .put_attribute("issued-at", issued_at.to_string())
+                .put_attribute("sealer-device", ((!) local_device_id).to_string())
+                .put_node(new StanzaNode.build("ct", Protocol.NS_DEVTRACKER).put_node(new StanzaNode.text(bytes_to_base64(ct))));
+            foreach (StanzaNode rn in recipient_nodes) {
+                node.put_node(rn);
+            }
+            node.put_node(new StanzaNode.build("sig", Protocol.NS_DEVTRACKER).put_node(new StanzaNode.text(sig_b64)))
+                .put_node(new StanzaNode.build("mldsa-sig", Protocol.NS_DEVTRACKER).put_node(new StanzaNode.text(mldsa_sig_b64)));
+
+            if (yield stream.get_module(Pubsub.Module.IDENTITY).publish(stream, null, Protocol.NS_DEVTRACKER, "current", node, PUBLISH_OPTIONS)) {
+                yield try_make_node_public(stream, Protocol.NS_DEVTRACKER);
+            }
+        } catch (GLib.Error e) {
+            // §11.8 guardrail: failure to publish/seal the tracker must ONLY log
+            // an error — it must never block the underlying devicelist publish
+            // or account bind/bootstrap (this is always called AFTER
+            // publish_device_list has already succeeded).
+            warning("publish_device_tracker: failed for %s: %s", account.bare_jid.to_string(), e.message);
+        }
     }
 
     public async ArrayList<int> request_device_list(XmppStream stream, Jid jid) {
@@ -376,6 +880,13 @@ public class StreamModule : XmppStreamModule {
         if (yield stream.get_module(Pubsub.Module.IDENTITY).publish(stream, null, Protocol.NS_DEVICELIST, "current", node, PUBLISH_OPTIONS)) {
             yield try_make_node_public(stream, Protocol.NS_DEVICELIST);
             db.store_device_list_payload(account, own_jid, "current", node.to_string(), version, true, content_key);
+            // §11.8: re-seal and republish the sealed device-state tracker to the
+            // SAME device union just published, whenever a device is authorized
+            // and the device set changes (and, harmlessly, on every idempotent
+            // republish too). Best-effort — see publish_device_tracker's own
+            // guardrail comment; a failure here can never undo or block the
+            // devicelist publish that already succeeded above.
+            yield publish_device_tracker(stream, devices);
         }
         // The primary already persists a newly-enrolled device's DC under our own
         // bare JID at pairing completion (encryption_preferences_entry.vala's
@@ -1041,6 +1552,14 @@ public class StreamModule : XmppStreamModule {
         if (item_node == null) {
             return;
         }
+        // §11.8 queued enrollment request: same node, distinct persisted item id
+        // ("enroll-request") and element name — dispatch on the element rather
+        // than the pubsub item id so live delivery and the explicit
+        // refresh_pair_hello fetch (which also iterates by element name) agree.
+        if (item_node.name == "enroll-request") {
+            handle_enroll_request_node(stream, from, item_node);
+            return;
+        }
         handle_pair_hello_node(stream, from, item_node);
     }
 
@@ -1079,6 +1598,93 @@ public class StreamModule : XmppStreamModule {
         }
         uint device_id = (uint) int64.parse(device_id_str);
         uint8[] sid = base64url_decode(sid_b64url);
+        pair_hello_received(new_full_jid, device_id, sid);
+    }
+
+    // §11.8 queued enrollment request: parse+verify+surface the persisted
+    // <enroll-request> item (see publish_enrollment_request), dispatched from
+    // handle_pair_hello_event (live +notify) and refresh_pair_hello (explicit
+    // fetch) by element name, mirroring handle_pair_hello_node's structure.
+    // Verifies the DIK hybrid signature (proof the publisher holds the DIK
+    // priv it advertised — NOT account authority; the manual code/QR handshake
+    // is still what authorizes) before caching it and surfacing it.
+    private void handle_enroll_request_node(XmppStream stream, Jid from, StanzaNode item_node) {
+        if (!from.bare_jid.equals(account.bare_jid)) {
+            return;
+        }
+        if (item_node.name != "enroll-request") {
+            return;
+        }
+        string? full_jid_str  = item_node.get_attribute("full-jid");
+        string? device_id_str = item_node.get_attribute("device-id");
+        string? sid_b64url    = item_node.get_attribute("sid");
+        if (full_jid_str == null || device_id_str == null || sid_b64url == null) {
+            warning("handle_enroll_request_node: missing full-jid, device-id or sid attribute");
+            return;
+        }
+        Jid new_full_jid;
+        try {
+            new_full_jid = new Jid(full_jid_str);
+        } catch (InvalidJidError e) {
+            warning("handle_enroll_request_node: invalid full-jid '%s': %s", full_jid_str, e.message);
+            return;
+        }
+        // Ignore our own echo, exactly like handle_pair_hello_node.
+        Bind.Flag? bind_flag = stream.get_flag(Bind.Flag.IDENTITY);
+        Jid? my_jid = bind_flag != null ? bind_flag.my_jid : null;
+        if (my_jid != null && my_jid.equals(new_full_jid)) {
+            return;
+        }
+
+        string? dik_ed_b64 = item_node.get_deep_string_content("dik-ed25519");
+        string? dik_x_b64 = item_node.get_deep_string_content("dik-x25519");
+        string? dik_ml_b64 = item_node.get_deep_string_content("dik-mldsa");
+        string? sig_b64 = item_node.get_deep_string_content("sig");
+        string? mldsa_sig_b64 = item_node.get_deep_string_content("mldsa-sig");
+        if (dik_ed_b64 == null || dik_x_b64 == null || dik_ml_b64 == null || sig_b64 == null || mldsa_sig_b64 == null) {
+            warning("handle_enroll_request_node: missing key/signature material");
+            return;
+        }
+
+        uint device_id = (uint) int64.parse(device_id_str);
+        uint8[] sid = base64url_decode(sid_b64url);
+        uint8[] dik_ed;
+        uint8[] dik_x;
+        uint8[] dik_ml;
+        uint8[] sig;
+        uint8[] mldsa_sig;
+        try {
+            dik_ed = bytes_to_uint8_array(bytes_from_base64(dik_ed_b64));
+            dik_x = bytes_to_uint8_array(bytes_from_base64(dik_x_b64));
+            dik_ml = bytes_to_uint8_array(bytes_from_base64(dik_ml_b64));
+            sig = bytes_to_uint8_array(bytes_from_base64(sig_b64));
+            mldsa_sig = bytes_to_uint8_array(bytes_from_base64(mldsa_sig_b64));
+        } catch (GLib.Error e) {
+            warning("handle_enroll_request_node: decode error: %s", e.message);
+            return;
+        }
+
+        try {
+            uint8[] sp = Protocol.EnrollRequestSigned.signed_part(
+                device_id, string_to_bytes(full_jid_str), sid, dik_ed, dik_x, dik_ml);
+            bool ok = global::X3dhpq.Crypto.ed25519_verify(new Bytes(dik_ed), new Bytes(sp), new Bytes(sig))
+                && global::X3dhpq.Crypto.mldsa65_verify(new Bytes(dik_ml), new Bytes(sp), new Bytes(mldsa_sig));
+            if (!ok) {
+                warning("handle_enroll_request_node: DIK signature verification failed from %s", full_jid_str);
+                return;
+            }
+        } catch (GLib.Error e) {
+            warning("handle_enroll_request_node: verify error: %s", e.message);
+            return;
+        }
+
+        // Persist so the pairing UI can surface "device X wants to join" even
+        // without a "Confirm a device" dialog already open at delivery time,
+        // and reuse the SAME rendezvous signal the live pair-hello path fires
+        // so an already-open PairNewDeviceDialog (confirm mode) reacts to a
+        // queued request identically to a live one.
+        db.store_pending_enrollment_request(account, device_id, full_jid_str, sid_b64url, dik_ed_b64, dik_x_b64, dik_ml_b64);
+        enrollment_request_received(new_full_jid, device_id, sid, dik_ed, dik_x, dik_ml);
         pair_hello_received(new_full_jid, device_id, sid);
     }
 
@@ -1346,16 +1952,112 @@ public class StreamModule : XmppStreamModule {
             stream, null, Protocol.NS_PAIR, "current", hello, options);
     }
 
+    // §11.8 "Queued enrollment request": called when a disabled/pending
+    // device's user clicks Associate. Publishes a DIK-hybrid-signed enrollment
+    // request (this device's DIK public keys + a fresh pairing nonce) to ITS
+    // OWN pair-hello rendezvous node as a SEPARATE, PERSISTED item (id
+    // "enroll-request", distinct from the live "current" pair-hello item so
+    // the two never clobber each other), so it survives until an authorized
+    // device is next online to see it — rather than only firing while a
+    // listener happens to already be attached. Uses the SAME publish options
+    // (persist + whitelist) as publish_pair_hello. The nonce IS the rendezvous
+    // `sid` (reused verbatim so an authorized device that later confirms this
+    // request drives the exact same §10.3 FSM/sid convention as a live hello).
+    public async bool publish_enrollment_request(XmppStream stream) {
+        int? device_id = db.get_local_device_id(account);
+        if (device_id == null) {
+            warning("publish_enrollment_request: no local device id yet");
+            return false;
+        }
+        string full_jid = account.bare_jid.to_string();
+        XmppStream? s = attached_stream;
+        if (s != null) {
+            Bind.Flag? bind_flag = s.get_flag(Bind.Flag.IDENTITY);
+            if (bind_flag != null && bind_flag.my_jid != null) {
+                full_jid = ((!) bind_flag.my_jid).to_string();
+            }
+        }
+        Bytes sid;
+        Bytes dik_ed;
+        Bytes dik_x;
+        Bytes dik_ml;
+        try {
+            sid = global::X3dhpq.Crypto.random_bytes(32);
+            dik_ed = db.get_local_identity_bytes(account, db.account_identity.dik_pub_ed25519_base64);
+            dik_x = db.get_local_identity_bytes(account, db.account_identity.dik_pub_x25519_base64);
+            dik_ml = db.get_local_identity_bytes(account, db.account_identity.dik_pub_mldsa_base64);
+        } catch (GLib.Error e) {
+            warning("publish_enrollment_request: unable to read local DIK: %s", e.message);
+            return false;
+        }
+
+        uint8[] dik_ed_bytes = bytes_to_uint8_array(dik_ed);
+        uint8[] dik_x_bytes = bytes_to_uint8_array(dik_x);
+        uint8[] dik_ml_bytes = bytes_to_uint8_array(dik_ml);
+        uint8[] sid_bytes = bytes_to_uint8_array(sid);
+        string sig_b64;
+        string mldsa_sig_b64;
+        try {
+            // A disabled/pending device holds no AIK_priv yet — sign with its
+            // own DIK instead (both Ed25519 and ML-DSA-65), which it always has
+            // from ensure_local_identity(). See EnrollRequestSigned's doc: this
+            // only proves possession of the advertised DIK, not account
+            // authority — the manual code/QR handshake still grants that.
+            Bytes dik_priv_ed = db.get_local_identity_bytes(account, db.account_identity.dik_priv_ed25519_base64);
+            Bytes dik_priv_ml = db.get_local_identity_bytes(account, db.account_identity.dik_priv_mldsa_base64);
+            uint8[] sp = Protocol.EnrollRequestSigned.signed_part(
+                (uint32) (!) device_id, string_to_bytes(full_jid), sid_bytes, dik_ed_bytes, dik_x_bytes, dik_ml_bytes);
+            sig_b64 = Base64.encode(bytes_to_uint8_array(global::X3dhpq.Crypto.ed25519_sign(dik_priv_ed, new Bytes(sp))));
+            mldsa_sig_b64 = Base64.encode(bytes_to_uint8_array(global::X3dhpq.Crypto.mldsa65_sign(dik_priv_ml, new Bytes(sp))));
+        } catch (GLib.Error e) {
+            warning("publish_enrollment_request: signing failed: %s", e.message);
+            return false;
+        }
+
+        StanzaNode request = new StanzaNode.build("enroll-request", Protocol.NS_PAIR)
+            .add_self_xmlns()
+            .put_attribute("device-id", ((!) device_id).to_string())
+            .put_attribute("full-jid", full_jid)
+            .put_attribute("sid", base64url_encode(sid_bytes))
+            .put_node(new StanzaNode.build("dik-ed25519", Protocol.NS_PAIR).put_node(new StanzaNode.text(Base64.encode(dik_ed_bytes))))
+            .put_node(new StanzaNode.build("dik-x25519", Protocol.NS_PAIR).put_node(new StanzaNode.text(Base64.encode(dik_x_bytes))))
+            .put_node(new StanzaNode.build("dik-mldsa", Protocol.NS_PAIR).put_node(new StanzaNode.text(Base64.encode(dik_ml_bytes))))
+            .put_node(new StanzaNode.build("sig", Protocol.NS_PAIR).put_node(new StanzaNode.text(sig_b64)))
+            .put_node(new StanzaNode.build("mldsa-sig", Protocol.NS_PAIR).put_node(new StanzaNode.text(mldsa_sig_b64)));
+
+        Pubsub.PublishOptions options = new Pubsub.PublishOptions()
+            .set_persist_items(true)
+            .set_access_model(Pubsub.ACCESS_MODEL_WHITELIST);
+        return yield stream.get_module(Pubsub.Module.IDENTITY).publish(
+            stream, null, Protocol.NS_PAIR, "enroll-request", request, options);
+    }
+
+    // §11.8: called by the authorizing device once it has completed the manual
+    // code/QR handshake for a queued request, so the request does not linger
+    // and get re-surfaced after it has already been fulfilled. Best-effort —
+    // a retract failure just leaves a stale (harmless) item behind.
+    public async void retract_enrollment_request(XmppStream stream) {
+        try {
+            yield stream.get_module(Pubsub.Module.IDENTITY).retract_item(stream, null, Protocol.NS_PAIR, "enroll-request");
+        } catch (Error e) {
+            warning("retract_enrollment_request: failed: %s", e.message);
+        }
+        db.clear_pending_enrollment_request(account);
+    }
+
     // §10.6.2 "Confirm a device" entry point: the existing/primary device's
     // "confirm a waiting device" dialog is opened by the human AFTER (or
     // before) the pending device has already published its <pair-hello>. The
     // live +notify path (handle_pair_hello_event) only fires for a dialog that
     // was already listening at delivery time, so a hello published first would
-    // otherwise be missed. This proactively fetches the current pair:0 item —
-    // the same one +notify would have delivered — and, if present, routes it
-    // through the identical handle_pair_hello_node path (so the outcome, and
-    // the pair_hello_received signal any listening dialog reacts to, is
-    // byte-identical regardless of ordering).
+    // otherwise be missed. This proactively fetches ALL current pair:0 items —
+    // the same ones +notify would have delivered — and routes each through the
+    // identical handle_pair_hello_node / handle_enroll_request_node path (by
+    // element name) so the outcome, and the pair_hello_received /
+    // enrollment_request_received signals a listening dialog reacts to, are
+    // byte-identical regardless of ordering. This is also how a §11.8 queued
+    // enrollment request (persisted, not just live) is discovered on next
+    // connect — see publish_enrollment_request.
     public async void refresh_pair_hello(XmppStream stream) {
         StanzaNode pubsub_node = new StanzaNode.build("pubsub", Pubsub.NS_URI).add_self_xmlns()
             .put_node(new StanzaNode.build("items", Pubsub.NS_URI)
@@ -1364,10 +2066,17 @@ public class StreamModule : XmppStreamModule {
         try {
             Iq.Stanza result = yield stream.get_module(Iq.Module.IDENTITY).send_iq_async(stream, iq);
             if (result.is_error()) return;
-            StanzaNode? item = result.stanza.get_deep_subnode(
-                Pubsub.NS_URI + ":pubsub", Pubsub.NS_URI + ":items", Pubsub.NS_URI + ":item");
-            if (item != null && item.sub_nodes.size > 0) {
-                handle_pair_hello_node(stream, account.bare_jid, item.sub_nodes[0]);
+            StanzaNode? items_node = result.stanza.get_deep_subnode(
+                Pubsub.NS_URI + ":pubsub", Pubsub.NS_URI + ":items");
+            if (items_node == null) return;
+            foreach (StanzaNode item in items_node.get_subnodes("item", Pubsub.NS_URI)) {
+                if (item.sub_nodes.size == 0) continue;
+                StanzaNode child = item.sub_nodes[0];
+                if (child.name == "enroll-request") {
+                    handle_enroll_request_node(stream, account.bare_jid, child);
+                } else {
+                    handle_pair_hello_node(stream, account.bare_jid, child);
+                }
             }
         } catch (Error e) {
             warning("refresh_pair_hello: request failed: %s", e.message);

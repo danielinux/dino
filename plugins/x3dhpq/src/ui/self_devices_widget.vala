@@ -104,6 +104,29 @@ public class SelfDevicesWidget : Gtk.Box {
         refresh();
     }
 
+    // §11.8 queued enrollment request: surfaces the most recently seen,
+    // persisted <enroll-request> item (StreamModule.handle_enroll_request_node
+    // / db.store_pending_enrollment_request) so a human opening this page sees
+    // "device X wants to join" and can act on it via the existing "Confirm a
+    // device" flow, even if the request arrived while nobody had a pairing
+    // dialog open to catch the live +notify.
+    private Gtk.Widget build_pending_enrollment_request_row(Row req) {
+        uint32 device_id = (uint32) req[db.pending_enrollment_request.device_id];
+        var row = new Adw.ActionRow() {
+            title = @"Device $device_id wants to join this account",
+            subtitle = "Received via this account's pairing rendezvous. Use “Confirm a device…” " +
+                "below and complete the manual code/QR handshake to admit it."
+        };
+        row.add_css_class("warning");
+        var confirm_button = new Gtk.Button.with_label("Review") {
+            valign = Gtk.Align.CENTER
+        };
+        confirm_button.add_css_class("suggested-action");
+        confirm_button.clicked.connect(() => confirm_device_requested());
+        row.add_suffix(confirm_button);
+        return row;
+    }
+
     public void refresh() {
         fingerprint_label.label = db.get_aik_fingerprint(account) ?? "Unavailable";
 
@@ -121,6 +144,11 @@ public class SelfDevicesWidget : Gtk.Box {
             Gtk.Widget next = ((!) child).get_next_sibling();
             devices_listbox.remove((!) child);
             child = next;
+        }
+
+        Row? pending_request = db.get_pending_enrollment_request_row(account);
+        if (pending_request != null) {
+            devices_listbox.append(build_pending_enrollment_request_row((!) pending_request));
         }
 
         string own_jid = account.bare_jid.to_string();

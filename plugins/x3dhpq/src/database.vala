@@ -5,7 +5,7 @@ using Xmpp;
 namespace Dino.Plugins.X3dhpq {
 
 public class Database : Qlite.Database {
-    private const int VERSION = 9;
+    private const int VERSION = 10;
 
     public class AccountIdentityTable : Table {
         public Column<int> id = new Column.Integer("id") { primary_key = true, auto_increment = true };
@@ -31,10 +31,22 @@ public class Database : Qlite.Database {
         // yet been resolved either way — the pending-enrollment window the
         // account-settings banner surfaces. Added at schema v8.
         public Column<bool> confirmed = new Column.BoolInt("confirmed") { min_version = 8, default = "0" };
+        // §11.8 sealed device-state tracker: true once this device has successfully
+        // decrypted its own <emk> copy of the tracker at least once. Used solely to
+        // distinguish "never authorized" from "revoked" the next time decryption
+        // fails (StreamModule.interpret_device_tracker) — losing the ability to
+        // decrypt after having had it is how revocation reaches an offline device.
+        // Added at schema v10.
+        public Column<bool> tracker_last_decryptable = new Column.BoolInt("tracker_last_decryptable") { min_version = 10, default = "0" };
+        // §11.8: set alongside clearing tracker_last_decryptable / confirmed when a
+        // previously-decryptable tracker copy stops decrypting — lets the pending-
+        // enrollment banner show a distinct "you were revoked" message instead of
+        // the generic "never confirmed" one. Added at schema v10.
+        public Column<bool> tracker_revoked = new Column.BoolInt("tracker_revoked") { min_version = 10, default = "0" };
 
         internal AccountIdentityTable(Database db) {
             base(db, "account_identity");
-            init({ id, account_id, device_id, is_primary, aik_pub_ed25519_base64, aik_priv_ed25519_base64, aik_pub_mldsa_base64, aik_priv_mldsa_base64, dik_pub_ed25519_base64, dik_priv_ed25519_base64, dik_pub_x25519_base64, dik_priv_x25519_base64, dik_pub_mldsa_base64, dik_priv_mldsa_base64, created_at, confirmed });
+            init({ id, account_id, device_id, is_primary, aik_pub_ed25519_base64, aik_priv_ed25519_base64, aik_pub_mldsa_base64, aik_priv_mldsa_base64, dik_pub_ed25519_base64, dik_priv_ed25519_base64, dik_pub_x25519_base64, dik_priv_x25519_base64, dik_pub_mldsa_base64, dik_priv_mldsa_base64, created_at, confirmed, tracker_last_decryptable, tracker_revoked });
             index("x3dhpq_account_identity_account_idx", { account_id }, true);
         }
     }
@@ -260,6 +272,32 @@ public class Database : Qlite.Database {
         }
     }
 
+    // §11.8 queued enrollment request: a local cache of the most recently seen
+    // <enroll-request> item on our own pair:0 node (StreamModule.
+    // handle_enroll_request_node), so the pairing UI can surface "device X wants
+    // to join" without an authorized device having to keep the "Confirm a
+    // device" dialog open at the exact moment the request was published. Keyed
+    // by a plain (not_null) account_id INTEGER with NO SQL FOREIGN KEY, mirroring
+    // DeviceAuditTable/MembershipJournalTable — this codebase never declares one.
+    // One row per account (unique account_id); a fresh request overwrites the
+    // previous one via upsert. Added at schema v10.
+    public class PendingEnrollmentRequestTable : Table {
+        public Column<int> account_id = new Column.Integer("account_id") { not_null = true };
+        public Column<int> device_id = new Column.Integer("device_id") { not_null = true };
+        public Column<string> full_jid = new Column.NonNullText("full_jid");
+        public Column<string> sid_base64 = new Column.NonNullText("sid_base64");
+        public Column<string?> dik_ed25519_base64 = new Column.Text("dik_ed25519_base64");
+        public Column<string?> dik_x25519_base64 = new Column.Text("dik_x25519_base64");
+        public Column<string?> dik_mldsa_base64 = new Column.Text("dik_mldsa_base64");
+        public Column<long> received_at = new Column.Long("received_at") { not_null = true };
+
+        internal PendingEnrollmentRequestTable(Database db) {
+            base(db, "pending_enrollment_request");
+            init({ account_id, device_id, full_jid, sid_base64, dik_ed25519_base64, dik_x25519_base64, dik_mldsa_base64, received_at });
+            unique({ account_id });
+        }
+    }
+
     public class AuditEntryTable : Table {
         public Column<int> account_id = new Column.Integer("account_id") { not_null = true };
         public Column<string> bare_jid = new Column.NonNullText("bare_jid");
@@ -340,6 +378,7 @@ public class Database : Qlite.Database {
     public AuditEntryTable audit_entry { get; private set; }
     public RecoveryBlobTable recovery_blob { get; private set; }
     public PairingSessionTable pairing_session { get; private set; }
+    public PendingEnrollmentRequestTable pending_enrollment_request { get; private set; }
 
     public Database(string file_name) {
         base(file_name, VERSION);
@@ -358,7 +397,8 @@ public class Database : Qlite.Database {
         audit_entry = new AuditEntryTable(this);
         recovery_blob = new RecoveryBlobTable(this);
         pairing_session = new PairingSessionTable(this);
-        init({ account_identity, peer_account_identity, peer_device, device_list, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, group_session, membership_journal, device_audit, audit_entry, recovery_blob, pairing_session });
+        pending_enrollment_request = new PendingEnrollmentRequestTable(this);
+        init({ account_identity, peer_account_identity, peer_device, device_list, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, group_session, membership_journal, device_audit, audit_entry, recovery_blob, pairing_session, pending_enrollment_request });
     }
 
     public Row? get_local_identity(int account_id) {
@@ -1496,6 +1536,97 @@ public class Database : Qlite.Database {
                 .set(account_identity.aik_priv_mldsa_base64, "");
         }
         update.perform();
+    }
+
+    // §11.8: true if this device currently holds the account AIK private key
+    // material (genuinely primary, or a share_primary=true paired secondary) —
+    // i.e. it can sign new devicelist/tracker/audit entries. Used to decide
+    // whether a decrypted tracker's (optional) sealed AIK_priv should be
+    // adopted (only when we don't already hold it).
+    public bool has_local_aik_priv(Account account) {
+        Row? row = get_local_identity(account.id);
+        if (row == null) return false;
+        string? ed = ((!) row)[account_identity.aik_priv_ed25519_base64];
+        string? ml = ((!) row)[account_identity.aik_priv_mldsa_base64];
+        return ed != null && ed != "" && ml != null && ml != "";
+    }
+
+    // §11.8: this device successfully decrypted its own <emk> copy of the
+    // sealed device-state tracker — re-affirms/records authorization. Only
+    // touches AIK private-key material if `aik_priv` is supplied AND we do not
+    // already hold our own (recovery path: "a newly-associated device recover[s]
+    // the shared account identity key"). Never flips is_primary — that stays
+    // reserved for the genuine first-device / explicit reset paths.
+    public void mark_tracker_authorized(Account account, Protocol.AccountIdentityKey? aik_priv = null) {
+        var update = account_identity.update()
+            .with(account_identity.account_id, "=", account.id)
+            .set(account_identity.confirmed, true)
+            .set(account_identity.tracker_last_decryptable, true)
+            .set(account_identity.tracker_revoked, false);
+        if (aik_priv != null && !has_local_aik_priv(account)) {
+            Protocol.AccountIdentityKey priv = (!) aik_priv;
+            update
+                .set(account_identity.aik_priv_ed25519_base64, Base64.encode(priv.priv_ed25519))
+                .set(account_identity.aik_priv_mldsa_base64, Base64.encode(priv.priv_mldsa));
+        }
+        update.perform();
+    }
+
+    // §11.8: our device's tracker recipient copy is absent or no longer
+    // decrypts. If it USED to decrypt (tracker_last_decryptable was true), this
+    // is a revocation reaching us offline — mark it distinctly and reopen the
+    // pending-enrollment banner. If it never decrypted (still-pending device
+    // that was never in the authorized set), this is a no-op: presence of the
+    // tracker without a matching recipient is already handled by leaving the
+    // device pending, which is the existing default state.
+    public void mark_tracker_not_authorized(Account account) {
+        Row? row = get_local_identity(account.id);
+        if (row == null) return;
+        bool was_decryptable = ((!) row)[account_identity.tracker_last_decryptable];
+        if (!was_decryptable) return;
+        account_identity.update()
+            .with(account_identity.account_id, "=", account.id)
+            .set(account_identity.tracker_last_decryptable, false)
+            .set(account_identity.tracker_revoked, true)
+            .set(account_identity.confirmed, false)
+            .perform();
+    }
+
+    // §11.8: true while this device was revoked (previously authorized, tracker
+    // no longer decryptable) — lets the pending-enrollment banner show a
+    // "you were revoked" message distinct from "never confirmed".
+    public bool is_tracker_revoked(Account account) {
+        Row? row = get_local_identity(account.id);
+        if (row == null) return false;
+        return ((!) row)[account_identity.tracker_revoked];
+    }
+
+    // §11.8 queued enrollment request cache (see PendingEnrollmentRequestTable).
+    // One row per account; a fresh request overwrites the previous one.
+    public void store_pending_enrollment_request(Account account, uint32 device_id, string full_jid,
+            string sid_base64, string? dik_ed25519_base64, string? dik_x25519_base64, string? dik_mldsa_base64) {
+        pending_enrollment_request.upsert()
+            .value(pending_enrollment_request.account_id, account.id, true)
+            .value(pending_enrollment_request.device_id, (int) device_id)
+            .value(pending_enrollment_request.full_jid, full_jid)
+            .value(pending_enrollment_request.sid_base64, sid_base64)
+            .value(pending_enrollment_request.dik_ed25519_base64, dik_ed25519_base64)
+            .value(pending_enrollment_request.dik_x25519_base64, dik_x25519_base64)
+            .value(pending_enrollment_request.dik_mldsa_base64, dik_mldsa_base64)
+            .value(pending_enrollment_request.received_at, (long) new DateTime.now_utc().to_unix())
+            .perform();
+    }
+
+    public Row? get_pending_enrollment_request_row(Account account) {
+        return pending_enrollment_request.select()
+            .with(pending_enrollment_request.account_id, "=", account.id)
+            .single().row().inner;
+    }
+
+    public void clear_pending_enrollment_request(Account account) {
+        pending_enrollment_request.delete()
+            .with(pending_enrollment_request.account_id, "=", account.id)
+            .perform();
     }
 
     private string? serialize_key_nodes(StanzaNode? parent_node, string child_name) {

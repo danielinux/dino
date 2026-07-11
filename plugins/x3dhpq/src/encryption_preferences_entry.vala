@@ -22,9 +22,14 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
 
         // §10.6.4 pending-enrollment banner: shown while this install has
         // detected an existing account identity and is waiting to be
-        // confirmed by one of the account's existing devices.
+        // confirmed by one of the account's existing devices. §11.8 extends
+        // this same banner to a SECOND trigger: a previously-confirmed device
+        // whose sealed device-state tracker copy stopped decrypting (i.e. it
+        // was revoked) is re-flagged pending too (db.mark_tracker_not_authorized
+        // in StreamModule.interpret_device_tracker), and gets a distinct
+        // "you were revoked" message instead of "never confirmed".
         if (plugin.db.is_pending_enrollment(account)) {
-            group.add(build_pending_enrollment_banner(account));
+            group.add(build_pending_enrollment_banner(account, plugin.db.is_tracker_revoked(account)));
         }
 
         var default_row = new SwitchRow() {
@@ -49,6 +54,19 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
         });
         group.add(devices_widget);
 
+        // §11.8: a queued enrollment request (persisted or live) or a pair-hello
+        // arriving while this page is open should refresh the pending-request
+        // row immediately, not only the next time the page is reopened.
+        StreamModule? live_module = plugin.app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
+        if (live_module != null) {
+            ulong enroll_handler = ((!) live_module).enrollment_request_received.connect((jid, did, sid, ed, x, ml) => {
+                devices_widget.refresh();
+            });
+            devices_widget.destroy.connect(() => {
+                ((!) live_module).disconnect(enroll_handler);
+            });
+        }
+
         var pair_existing_row = new ActionRow() {
             title = "Pair This Device to an Existing Account",
             subtitle = "Already have another device for this account? Enter its pairing code here to join instead of creating a new identity."
@@ -72,7 +90,7 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
     // the XEP requires the client to distinguish explicitly: associate with
     // the existing identity (the default, non-destructive path — either
     // direction of §10.6.2), or mint a brand-new identity (destructive).
-    private Gtk.Widget build_pending_enrollment_banner(Account account) {
+    private Gtk.Widget build_pending_enrollment_banner(Account account, bool revoked = false) {
         var box = new Gtk.Box(Gtk.Orientation.VERTICAL, 6) {
             margin_start = 6,
             margin_end = 6,
@@ -87,17 +105,23 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
             margin_top = 12,
             margin_bottom = 12
         };
-        var title = new Gtk.Label("This device is waiting to be confirmed") {
+        var title = new Gtk.Label(revoked
+            ? "This device was removed from the account"
+            : "This device is waiting to be confirmed") {
             halign = Gtk.Align.START,
             wrap = true
         };
         title.add_css_class("heading");
         inner.append(title);
 
-        var subtitle = new Gtk.Label(
-            "This account already has an identity on another device. Confirm this device from " +
-            "one of your existing devices to join it — your prior messages, groups and contacts' " +
-            "trust are preserved. Only generate a new identity if you have no working device left."
+        var subtitle = new Gtk.Label(revoked
+            ? ("Another device revoked this one's access (§11.8: its sealed device-state tracker copy " +
+                "no longer decrypts). If this was not you, treat this device as compromised. If it was, " +
+                "Associate again from one of your remaining devices to rejoin, or generate a new identity " +
+                "if you have no other working device left.")
+            : ("This account already has an identity on another device. Confirm this device from " +
+                "one of your existing devices to join it — your prior messages, groups and contacts' " +
+                "trust are preserved. Only generate a new identity if you have no working device left.")
         ) {
             halign = Gtk.Align.START,
             wrap = true
@@ -109,7 +133,19 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
 
         var associate_button = new Gtk.Button.with_label("Associate (enter code)");
         associate_button.add_css_class("suggested-action");
-        associate_button.clicked.connect(() => launch_pair_to_existing_dialog(account, box));
+        associate_button.clicked.connect(() => {
+            // §11.8 queued enrollment request: persist a signed request to our
+            // own pair-hello node so an authorized device that is offline RIGHT
+            // NOW still discovers it on its next connect, in addition to the
+            // live handshake attempted below (which succeeds immediately if one
+            // is already online).
+            StreamModule? module = plugin.app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
+            XmppStream? stream = plugin.app.stream_interactor.get_stream(account);
+            if (module != null && stream != null) {
+                module.publish_enrollment_request.begin((!) stream);
+            }
+            launch_pair_to_existing_dialog(account, box);
+        });
         button_box.append(associate_button);
 
         var show_code_button = new Gtk.Button.with_label("Show this device's code");
@@ -189,6 +225,11 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
             if (stream != null) {
                 module.publish_current_state.begin((!) stream);
                 module.publish_add_device_audit_entry.begin((!) stream, cert);
+                // §11.8: the newcomer is admitted now — retract its queued
+                // enrollment request (if any) so it stops being re-surfaced as
+                // still-pending on this or any other authorized device's next
+                // refresh_pair_hello.
+                module.retract_enrollment_request.begin((!) stream);
             }
         });
         dialog.present();
