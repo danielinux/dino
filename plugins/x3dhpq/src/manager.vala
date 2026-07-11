@@ -690,8 +690,18 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         if (occupants != null) {
             foreach (Jid occ in occupants) recipients.add(occ);
         }
-        foreach (var e in gs.get_members().entries) {
-            uint8[] fp_raw = hex_to_bytes_20(e.key);
+        // Resolve crypto members from the journal's raw 20-byte AIK fingerprints
+        // (gs.get_members() keys are the spaced display form, unusable for lookup).
+        var active_fps = new Gee.HashSet<string>();
+        foreach (Protocol.MemberAuditEntry je in db.list_membership_journal_entries(conversation.account, room_jid_str)) {
+            uint8[] fp; uint32 ep;
+            if (!Protocol.MemberAuditEntry.parse_member_payload(je.payload, out fp, out ep)) continue;
+            string fph = Protocol.hex_of(fp);
+            if (je.action == (uint8) Protocol.MemberAuditAction.ADD_MEMBER) active_fps.add(fph);
+            else if (je.action == (uint8) Protocol.MemberAuditAction.REMOVE_MEMBER) active_fps.remove(fph);
+        }
+        foreach (string fph in active_fps) {
+            uint8[] fp_raw = hex_to_bytes_20(fph);
             if (fp_raw.length != 20) continue;
             string? jid_str = db.find_peer_jid_by_aik_fp(conversation.account, fp_raw);
             if (jid_str == null) continue;
