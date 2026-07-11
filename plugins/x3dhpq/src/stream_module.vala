@@ -21,6 +21,16 @@ public class StreamModule : XmppStreamModule {
     private static Pubsub.PublishOptions PUBLISH_OPTIONS = new Pubsub.PublishOptions()
         .set_persist_items(true)
         .set_access_model(Pubsub.ACCESS_MODEL_OPEN);
+    // §11.8 canonical wire format: unlike the devicelist/bundle nodes (meant to
+    // be publicly readable), the devtracker node is account-internal state,
+    // never read by contacts — matches IqGenerator.generateX3dhpqPublishDevTracker's
+    // whitelist (owner-only) access model. Self-fetch (interpret_device_tracker /
+    // checkDeviceTrackerForRevocation's Iq addressed to our own bare JID) works
+    // regardless: the item owner always has full access to its own PEP node.
+    private static Pubsub.PublishOptions TRACKER_PUBLISH_OPTIONS = new Pubsub.PublishOptions()
+        .set_persist_items(true)
+        .set_max_items("1")
+        .set_access_model(Pubsub.ACCESS_MODEL_WHITELIST);
     private HashMap<Jid, Future<ArrayList<int>>> active_devicelist_requests = new HashMap<Jid, Future<ArrayList<int>>>(Jid.hash_func, Jid.equals_func);
 
     // pair stanza step counters keyed by base64(sid)
@@ -262,7 +272,7 @@ public class StreamModule : XmppStreamModule {
                 recipients_for_sp.add(rec);
             }
             uint8[] sp = Protocol.DeviceTrackerSigned.signed_part(
-                parsed.issued_at, parsed.sealer_device_id, parsed.ct, recipients_for_sp);
+                parsed.version, parsed.issued_at, parsed.ct, recipients_for_sp);
             bool sig_ok = global::X3dhpq.Crypto.ed25519_verify(aik_ed, new Bytes(sp), new Bytes(parsed.sig_ed))
                 && global::X3dhpq.Crypto.mldsa65_verify(aik_mldsa, new Bytes(sp), new Bytes(parsed.sig_mldsa));
             if (!sig_ok) {
@@ -317,7 +327,7 @@ public class StreamModule : XmppStreamModule {
 
         // Adopt our own DC from the fold, if present, so publish_device_list /
         // bundle fetches can serve it without waiting on an inbound devicelist.
-        foreach (Protocol.DeviceTrackerDevice d in ((!) payload).devices) {
+        foreach (Protocol.DeviceSnapshotDevice d in ((!) payload).devices) {
             if (d.device_id == (uint32) (!) local_device_id && d.cert_bytes.length > 0) {
                 db.store_local_device_certificate(account, (int) d.device_id, Base64.encode(d.cert_bytes));
                 break;
@@ -437,20 +447,28 @@ public class StreamModule : XmppStreamModule {
         interpret_device_tracker.begin(stream, item_node);
     }
 
-    // §11.8: decode a <devtracker> item's XML shape into a Protocol.DevTrackerParsed.
-    // Kept here (rather than in device_tracker.vala) so the Protocol namespace's
-    // byte-codec classes stay free of an Xmpp/StanzaNode dependency, mirroring
-    // how devicelist/bundle parsing lives in this file too.
+    // §11.8 canonical wire format: decode a <devtracker> item's XML shape
+    // (reusing the 1:1 pairwise-envelope element shapes — <key rid=.. xmlns=
+    // envelope:0>, <payload xmlns=envelope:0>, <sig>/<mldsa-sig> xmlns=
+    // devicelist:0 — verbatim, mirroring PQonversations' DevTracker element,
+    // which literally reuses the envelope/devicelist Key/Payload/Sig/MldsaSig
+    // Java classes) into a Protocol.DevTrackerParsed. Kept here (rather than
+    // in device_tracker.vala) so the Protocol namespace's byte-codec classes
+    // stay free of an Xmpp/StanzaNode dependency, mirroring how devicelist/
+    // bundle parsing lives in this file too.
     private Protocol.DevTrackerParsed? parse_devtracker_node(StanzaNode item) {
         if (item.name != "devtracker") {
             return null;
         }
         var parsed = new Protocol.DevTrackerParsed();
-        parsed.issued_at = (uint64) (int64.parse(item.get_attribute("issued-at") ?? "0"));
-        parsed.sealer_device_id = (uint32) (int64.parse(item.get_attribute("sealer-device") ?? "0"));
+        parsed.sender_device = (uint32) (int64.parse(item.get_attribute("sender-device") ?? "0"));
+        parsed.sender_jid = item.get_attribute("sender-jid") ?? "";
+        parsed.ts = item.get_attribute("ts") ?? "";
+        parsed.version = uint64.parse(item.get_attribute("version") ?? "0");
+        parsed.issued_at = uint64.parse(item.get_attribute("issued-at") ?? "0");
 
-        StanzaNode? ct_node = item.get_subnode("ct", Protocol.NS_DEVTRACKER);
-        string? ct_b64 = ct_node != null ? ct_node.get_string_content() : null;
+        StanzaNode? payload_node = item.get_subnode("payload", Protocol.NS_ENVELOPE);
+        string? ct_b64 = payload_node != null ? payload_node.get_string_content() : null;
         if (ct_b64 == null) return null;
         try {
             parsed.ct = bytes_to_uint8_array(bytes_from_base64(ct_b64));
@@ -458,10 +476,10 @@ public class StreamModule : XmppStreamModule {
             return null;
         }
 
-        foreach (StanzaNode rn in item.get_subnodes("recipient", Protocol.NS_DEVTRACKER)) {
-            string? rid_str = rn.get_attribute("rid");
-            StanzaNode? hdr_node = rn.get_subnode("hdr", Protocol.NS_DEVTRACKER);
-            StanzaNode? emk_node = rn.get_subnode("emk", Protocol.NS_DEVTRACKER);
+        foreach (StanzaNode kn in item.get_subnodes("key", Protocol.NS_ENVELOPE)) {
+            string? rid_str = kn.get_attribute("rid");
+            StanzaNode? hdr_node = kn.get_subnode("hdr", Protocol.NS_ENVELOPE);
+            StanzaNode? emk_node = kn.get_subnode("emk", Protocol.NS_ENVELOPE);
             if (rid_str == null || hdr_node == null || emk_node == null) continue;
             string? hdr_b64 = hdr_node.get_string_content();
             string? emk_b64 = emk_node.get_string_content();
@@ -476,7 +494,7 @@ public class StreamModule : XmppStreamModule {
                 continue;
             }
 
-            StanzaNode? prekey_node = rn.get_subnode("prekey", Protocol.NS_DEVTRACKER);
+            StanzaNode? prekey_node = kn.get_subnode("prekey", Protocol.NS_ENVELOPE);
             if (prekey_node != null) {
                 try {
                     var pk = new Protocol.DevTrackerPrekeyWire();
@@ -495,8 +513,8 @@ public class StreamModule : XmppStreamModule {
             parsed.recipients.add(rec);
         }
 
-        StanzaNode? sig_node = item.get_subnode("sig", Protocol.NS_DEVTRACKER);
-        StanzaNode? mldsa_node = item.get_subnode("mldsa-sig", Protocol.NS_DEVTRACKER);
+        StanzaNode? sig_node = item.get_subnode("sig", Protocol.NS_DEVICELIST);
+        StanzaNode? mldsa_node = item.get_subnode("mldsa-sig", Protocol.NS_DEVICELIST);
         string? sig_b64 = sig_node != null ? sig_node.get_string_content() : null;
         string? mldsa_b64 = mldsa_node != null ? mldsa_node.get_string_content() : null;
         if (sig_b64 == null || mldsa_b64 == null) return null;
@@ -551,20 +569,35 @@ public class StreamModule : XmppStreamModule {
                 // cannot sign a tracker item; only an AIK_priv holder republishes it.
                 return;
             }
+            string? aik_pub_ed_b64 = db.get_local_identity_string(account, db.account_identity.aik_pub_ed25519_base64);
+            string? aik_pub_ml_b64 = db.get_local_identity_string(account, db.account_identity.aik_pub_mldsa_base64);
+            if (aik_pub_ed_b64 == null || aik_pub_ml_b64 == null) return;
+            uint8[] aik_pub_ed = bytes_to_uint8_array(bytes_from_base64((!) aik_pub_ed_b64));
+            uint8[] aik_pub_ml = bytes_to_uint8_array(bytes_from_base64((!) aik_pub_ml_b64));
 
+            // §11.8 canonical inner payload: domain-separated §11.7 Snapshot (owner_
+            // aik_fp | epoch=0 | authorized devices) + current DAG heads + optionally
+            // the sealed AIK_priv, byte-for-byte matching
+            // X3dhpqService.buildDeviceTrackerPlaintextPayload.
             var payload = new Protocol.DeviceTrackerPayload();
+            payload.owner_aik_fp = bytes_to_uint8_array(
+                global::X3dhpq.Crypto.blake2b160(new Bytes(Protocol.DeviceAuditEntryV2.aik_pub_marshal(aik_pub_ed, aik_pub_ml))));
             foreach (Protocol.DeviceListDevice d in authorized_devices) {
-                var td = new Protocol.DeviceTrackerDevice();
-                td.device_id = d.device_id;
-                td.cert_bytes = d.cert_bytes;
-                payload.devices.add(td);
+                var sd = new Protocol.DeviceSnapshotDevice();
+                sd.device_id = d.device_id;
+                sd.cert_bytes = d.cert_bytes;
+                payload.devices.add(sd);
             }
             payload.dag_heads = compute_dag_current_heads();
             // §11.8: MAY carry the shared AIK_priv (self-refreshing, device-key-
             // sealed recovery) — this implementation always includes it, sealed
-            // per-recipient exactly like the rest of the payload.
+            // per-recipient exactly like the rest of the payload. Embedded using
+            // the canonical AccountIdentityKey.marshal() layout (§11.8), not the
+            // pairing-issuance format.
             payload.aik_priv_ed25519 = bytes_from_base64((!) aik_priv_ed_b64);
             payload.aik_priv_mldsa = bytes_from_base64((!) aik_priv_ml_b64);
+            payload.aik_pub_ed25519 = aik_pub_ed;
+            payload.aik_pub_mldsa = aik_pub_ml;
             uint8[] plaintext = payload.marshal();
 
             Bytes payload_key = global::X3dhpq.Crypto.random_bytes(32);
@@ -577,8 +610,12 @@ public class StreamModule : XmppStreamModule {
             Bytes my_dik_pub_x = db.get_local_identity_bytes(account, db.account_identity.dik_pub_x25519_base64);
             string own_jid = account.bare_jid.to_string();
 
+            // §11.8 canonical outer element: one <key rid=.. xmlns=envelope:0> per
+            // authorized device, reusing the exact 1:1 pairwise-envelope shape
+            // (Manager.build_encrypted_message's <key>/<hdr>/<emk>/<prekey>),
+            // instead of the old bespoke <recipient> wrapper.
             var recipients = new Gee.ArrayList<Protocol.DeviceTrackerRecipient>();
-            var recipient_nodes = new Gee.ArrayList<StanzaNode>();
+            var key_nodes = new Gee.ArrayList<StanzaNode>();
             foreach (Protocol.DeviceListDevice d in authorized_devices) {
                 Protocol.PeerBundle? peer_bundle = db.get_remote_bundle(account, own_jid, (int) d.device_id);
                 if (peer_bundle == null) {
@@ -604,21 +641,23 @@ public class StreamModule : XmppStreamModule {
                     rec.emk_bytes = bytes_to_uint8_array(emk);
                     recipients.add(rec);
 
-                    StanzaNode prekey_node = new StanzaNode.build("prekey", Protocol.NS_DEVTRACKER)
+                    // isFirst=true always: every seal is a fresh, self-contained
+                    // PQXDH "first message" (§11.8), so <prekey> is always present.
+                    StanzaNode prekey_node = new StanzaNode.build("prekey", Protocol.NS_ENVELOPE)
                         .put_attribute("ek", bytes_to_base64((!) bootstrap.prekey_ephemeral_pub))
                         .put_attribute("opk-id", bootstrap.opk_id.to_string())
                         .put_attribute("kemkey-id", bootstrap.kem_key_id.to_string())
                         .put_attribute("kem-ct", bytes_to_base64((!) bootstrap.kem_ciphertext))
-                        .put_node(new StanzaNode.build("dc", Protocol.NS_DEVTRACKER).put_node(new StanzaNode.text(db.ensure_local_device_certificate(account))))
-                        .put_node(new StanzaNode.build("aik-ed25519", Protocol.NS_DEVTRACKER).put_node(new StanzaNode.text(db.get_local_identity_string(account, db.account_identity.aik_pub_ed25519_base64))))
-                        .put_node(new StanzaNode.build("aik-mldsa", Protocol.NS_DEVTRACKER).put_node(new StanzaNode.text(db.get_local_identity_string(account, db.account_identity.aik_pub_mldsa_base64))));
+                        .put_node(new StanzaNode.build("dc", Protocol.NS_ENVELOPE).put_node(new StanzaNode.text(db.ensure_local_device_certificate(account))))
+                        .put_node(new StanzaNode.build("aik-ed25519", Protocol.NS_ENVELOPE).put_node(new StanzaNode.text((!) aik_pub_ed_b64)))
+                        .put_node(new StanzaNode.build("aik-mldsa", Protocol.NS_ENVELOPE).put_node(new StanzaNode.text((!) aik_pub_ml_b64)));
 
-                    StanzaNode recipient_node = new StanzaNode.build("recipient", Protocol.NS_DEVTRACKER)
+                    StanzaNode key_node = new StanzaNode.build("key", Protocol.NS_ENVELOPE)
                         .put_attribute("rid", d.device_id.to_string())
-                        .put_node(new StanzaNode.build("hdr", Protocol.NS_DEVTRACKER).put_node(new StanzaNode.text(bytes_to_base64(new Bytes(rec.hdr_bytes)))))
-                        .put_node(new StanzaNode.build("emk", Protocol.NS_DEVTRACKER).put_node(new StanzaNode.text(bytes_to_base64(emk))))
+                        .put_node(new StanzaNode.build("hdr", Protocol.NS_ENVELOPE).put_node(new StanzaNode.text(bytes_to_base64(new Bytes(rec.hdr_bytes)))))
+                        .put_node(new StanzaNode.build("emk", Protocol.NS_ENVELOPE).put_node(new StanzaNode.text(bytes_to_base64(emk))))
                         .put_node(prekey_node);
-                    recipient_nodes.add(recipient_node);
+                    key_nodes.add(key_node);
                 } catch (GLib.Error e) {
                     warning("publish_device_tracker: failed to seal to device %u: %s", d.device_id, e.message);
                     continue;
@@ -634,8 +673,9 @@ public class StreamModule : XmppStreamModule {
             }
 
             long issued_at = (long) new DateTime.now_utc().to_unix();
+            uint64 version = (uint64) db.next_tracker_version(account);
             uint8[] sp = Protocol.DeviceTrackerSigned.signed_part(
-                (uint64) issued_at, (uint32) (!) local_device_id, bytes_to_uint8_array(ct), recipients);
+                version, (uint64) issued_at, bytes_to_uint8_array(ct), recipients);
             Bytes aik_priv_ed = bytes_from_base64((!) aik_priv_ed_b64);
             Bytes aik_priv_ml = bytes_from_base64((!) aik_priv_ml_b64);
             string sig_b64 = Base64.encode(bytes_to_uint8_array(global::X3dhpq.Crypto.ed25519_sign(aik_priv_ed, new Bytes(sp))));
@@ -643,18 +683,29 @@ public class StreamModule : XmppStreamModule {
 
             StanzaNode node = new StanzaNode.build("devtracker", Protocol.NS_DEVTRACKER)
                 .add_self_xmlns()
-                .put_attribute("issued-at", issued_at.to_string())
-                .put_attribute("sealer-device", ((!) local_device_id).to_string())
-                .put_node(new StanzaNode.build("ct", Protocol.NS_DEVTRACKER).put_node(new StanzaNode.text(bytes_to_base64(ct))));
-            foreach (StanzaNode rn in recipient_nodes) {
-                node.put_node(rn);
+                .put_attribute("sender-device", ((!) local_device_id).to_string())
+                .put_attribute("sender-jid", own_jid)
+                .put_attribute("ts", new DateTime.now_utc().format_iso8601())
+                .put_attribute("version", version.to_string())
+                .put_attribute("issued-at", issued_at.to_string());
+            foreach (StanzaNode kn in key_nodes) {
+                node.put_node(kn);
             }
-            node.put_node(new StanzaNode.build("sig", Protocol.NS_DEVTRACKER).put_node(new StanzaNode.text(sig_b64)))
-                .put_node(new StanzaNode.build("mldsa-sig", Protocol.NS_DEVTRACKER).put_node(new StanzaNode.text(mldsa_sig_b64)));
+            // type="devtracker" matches XmppX3dhpqMessage#toExtension's
+            // payloadTypeOverride, set via setPayloadType("devtracker") on the PQ
+            // publish path — purely descriptive (disambiguates this reused-envelope
+            // payload from a "sender-chain"/"group-sync" one); not itself checked
+            // by either side's tracker interpreter, but reproduced for byte-for-
+            // byte outer-element fidelity with the canonical wire format.
+            node.put_node(new StanzaNode.build("payload", Protocol.NS_ENVELOPE)
+                    .put_attribute("type", "devtracker")
+                    .put_node(new StanzaNode.text(bytes_to_base64(ct))))
+                .put_node(new StanzaNode.build("sig", Protocol.NS_DEVICELIST).put_node(new StanzaNode.text(sig_b64)))
+                .put_node(new StanzaNode.build("mldsa-sig", Protocol.NS_DEVICELIST).put_node(new StanzaNode.text(mldsa_sig_b64)));
 
-            if (yield stream.get_module(Pubsub.Module.IDENTITY).publish(stream, null, Protocol.NS_DEVTRACKER, "current", node, PUBLISH_OPTIONS)) {
-                yield try_make_node_public(stream, Protocol.NS_DEVTRACKER);
-            }
+            // §11.8: whitelist (owner-only) access — this node is never meant to
+            // be public, unlike devicelist/bundle, so no try_make_node_public call.
+            yield stream.get_module(Pubsub.Module.IDENTITY).publish(stream, null, Protocol.NS_DEVTRACKER, "current", node, TRACKER_PUBLISH_OPTIONS);
         } catch (GLib.Error e) {
             // §11.8 guardrail: failure to publish/seal the tracker must ONLY log
             // an error — it must never block the underlying devicelist publish

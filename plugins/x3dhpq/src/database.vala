@@ -5,7 +5,7 @@ using Xmpp;
 namespace Dino.Plugins.X3dhpq {
 
 public class Database : Qlite.Database {
-    private const int VERSION = 10;
+    private const int VERSION = 11;
 
     public class AccountIdentityTable : Table {
         public Column<int> id = new Column.Integer("id") { primary_key = true, auto_increment = true };
@@ -43,10 +43,16 @@ public class Database : Qlite.Database {
         // enrollment banner show a distinct "you were revoked" message instead of
         // the generic "never confirmed" one. Added at schema v10.
         public Column<bool> tracker_revoked = new Column.BoolInt("tracker_revoked") { min_version = 10, default = "0" };
+        // §11.8 canonical wire format: "Monotonic per-account counter (§8.2-style
+        // rollback guard), advanced on every republish" — mirrors
+        // X3dhpqService.nextTrackerVersion. Distinct from the devicelist's own
+        // list_version (device_list table); this one only guards the devtracker
+        // item. Added at schema v11.
+        public Column<long> tracker_version = new Column.Long("tracker_version") { min_version = 11, default = "0" };
 
         internal AccountIdentityTable(Database db) {
             base(db, "account_identity");
-            init({ id, account_id, device_id, is_primary, aik_pub_ed25519_base64, aik_priv_ed25519_base64, aik_pub_mldsa_base64, aik_priv_mldsa_base64, dik_pub_ed25519_base64, dik_priv_ed25519_base64, dik_pub_x25519_base64, dik_priv_x25519_base64, dik_pub_mldsa_base64, dik_priv_mldsa_base64, created_at, confirmed, tracker_last_decryptable, tracker_revoked });
+            init({ id, account_id, device_id, is_primary, aik_pub_ed25519_base64, aik_priv_ed25519_base64, aik_pub_mldsa_base64, aik_priv_mldsa_base64, dik_pub_ed25519_base64, dik_priv_ed25519_base64, dik_pub_x25519_base64, dik_priv_x25519_base64, dik_pub_mldsa_base64, dik_priv_mldsa_base64, created_at, confirmed, tracker_last_decryptable, tracker_revoked, tracker_version });
             index("x3dhpq_account_identity_account_idx", { account_id }, true);
         }
     }
@@ -1614,6 +1620,20 @@ public class Database : Qlite.Database {
             .set(account_identity.tracker_revoked, true)
             .set(account_identity.confirmed, false)
             .perform();
+    }
+
+    // §11.8 canonical wire format: monotonic per-account devtracker version
+    // counter (rollback guard, mirrors X3dhpqService.nextTrackerVersion).
+    // Advanced on every republish, independent of the devicelist's own
+    // list_version. Returns 1 on the very first call for an account.
+    public long next_tracker_version(Account account) {
+        Row? row = get_local_identity(account.id);
+        long next = (row != null ? ((!) row)[account_identity.tracker_version] : 0) + 1;
+        account_identity.update()
+            .with(account_identity.account_id, "=", account.id)
+            .set(account_identity.tracker_version, next)
+            .perform();
+        return next;
     }
 
     // §11.8: true while this device was revoked (previously authorized, tracker
