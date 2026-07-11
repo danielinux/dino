@@ -693,6 +693,8 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             } catch (Xmpp.InvalidJidError err) { }
         }
 
+        warning("x3dhpq-DIAG broadcast_sender_chain: room=%s occupants=%d journal_members=%d recipients=%d",
+            room_jid_str, (occupants != null) ? occupants.size : -1, gs.get_members().size, recipients.size);
         StreamModule? module = app.stream_interactor.module_manager.get_module(conversation.account, StreamModule.IDENTITY);
         int sent = 0;
         foreach (Jid occ in recipients) {
@@ -702,6 +704,7 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             if (exclude_bare != null && occ.equals_bare((!) exclude_bare)) continue;
             string peer_bare = occ.bare_jid.to_string();
             Gee.List<int> device_ids = db.get_remote_device_ids(conversation.account, peer_bare);
+            warning("x3dhpq-DIAG broadcast: recipient=%s devices=%d", peer_bare, device_ids.size);
             if (device_ids.size == 0) {
                 if (module != null) {
                     module.request_device_list.begin((!) stream, occ.bare_jid);
@@ -712,6 +715,7 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                 string key = "%s/%d".printf(peer_bare, device_id);
                 Protocol.PeerBundle? bundle = db.get_remote_bundle(conversation.account, peer_bare, device_id);
                 if (bundle == null || !bundle.verify()) {
+                    warning("x3dhpq-DIAG broadcast: %s/%d bundle missing/invalid, requesting", peer_bare, device_id);
                     if (module != null) {
                         module.request_bundle.begin((!) stream, occ.bare_jid, device_id);
                     }
@@ -725,7 +729,10 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                 // installed the chain, every send re-announces — peers
                 // dedup on (sender_aik_fp, device, epoch) when accepting
                 // and reinstalling the same recv chain is a no-op.
-                if (send_sender_chain_to_device(conversation, occ.bare_jid, device_id, bundle, ann_bytes)) {
+                bool ok_send = send_sender_chain_to_device(conversation, occ.bare_jid, device_id, bundle, ann_bytes);
+                warning("x3dhpq-DIAG broadcast: sent group-sync to %s/%d ok=%s (payload=%d bytes)",
+                    peer_bare, device_id, ok_send.to_string(), ann_bytes.length);
+                if (ok_send) {
                     already.add(key);
                     sent++;
                 }
@@ -1446,7 +1453,12 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                 is_active_member = false;
             }
         }
+        warning("x3dhpq-DIAG add_private_group_member: room=%s member=%s is_active_member=%s entries=%d",
+            room_jid.bare_jid.to_string(), member_jid.bare_jid.to_string(), is_active_member.to_string(), entries.size);
         if (is_active_member) {
+            // Even if already a member, (re)announce so the member receives the
+            // current journal + sender chain over the pairwise channel.
+            announce_group_to_members(account, room_jid.bare_jid);
             return true;
         }
 
@@ -1525,6 +1537,8 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         }
         rebuild_group_session_from_journal(account, room_jid_str, (!) gs);
         db.store_group_session(account, room_jid_str, (!) gs);
+        warning("x3dhpq-DIAG announce_group_to_members: room=%s journal_members=%d",
+            room_jid_str, gs.get_members().size);
         broadcast_sender_chain(conversation, (!) gs, room_jid_str, aik_ed, aik_mldsa);
     }
 
