@@ -19,6 +19,7 @@ class MembershipDagTest : Gee.TestCase {
 
     public MembershipDagTest() {
         base("MembershipDag");
+        add_test("v2_signed_part_vector", test_signed_part_vector);
         add_test("v2_marshal_roundtrip", test_marshal_roundtrip);
         add_test("genesis_and_linear_add", test_genesis_linear);
         add_test("admin_can_add_after_promotion", test_admin_promotion);
@@ -69,6 +70,31 @@ class MembershipDagTest : Gee.TestCase {
 
     private uint8[] mp(uint8[] fp) {
         return JournalEntryV2.build_member_payload(fp, 0);
+    }
+
+    // Fixed, deterministic v2 signed_part vector — identical to the Java engine's
+    // MembershipDagTest.V2_SIGNEDPART_VECTOR, so the two clients are byte-compatible.
+    private const string V2_SIGNEDPART_VECTOR =
+        "5833444850512d41756469742d763200" +
+        "0000000000000001" +
+        "abababababababababababababababababababab" +
+        "0000" +
+        "05" +
+        "00000018" +
+        "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd00000000" +
+        "0000000000000000";
+
+    private void test_signed_part_vector() {
+        uint8[] fp = new uint8[20]; for (int i = 0; i < 20; i++) fp[i] = 0xAB;
+        uint8[] subj = new uint8[20]; for (int i = 0; i < 20; i++) subj[i] = 0xCD;
+        var e = new JournalEntryV2();
+        e.lamport = 1;
+        e.signer_fp = fp;
+        e.parents = new Gee.ArrayList<Bytes>();
+        e.action = (uint8) MemberAuditActionV2.ADD_MEMBER;
+        e.payload = JournalEntryV2.build_member_payload(subj, 0);
+        e.timestamp = 0;
+        fail_if_not_eq_str(hex(e.signed_part()), V2_SIGNEDPART_VECTOR, "v2 signed_part must match the cross-client vector");
     }
 
     private void test_marshal_roundtrip() {
