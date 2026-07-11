@@ -402,6 +402,74 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         db.store_membership_journal_entry(account, room_jid.bare_jid.to_string(), entry);
     }
 
+    // Ingest a raw MemberAuditEntry (bytes) delivered inside a group-sync payload
+    // (bundled with the sender-chain announcement over the pairwise channel).
+    private void on_membership_entry_bytes(Account account, string room_jid_str, uint8[] entry_bytes) {
+        Jid room_jid;
+        try {
+            room_jid = new Jid(room_jid_str);
+        } catch (Xmpp.InvalidJidError e) {
+            return;
+        }
+        on_membership_entry_received(account, room_jid, null, Base64.encode(entry_bytes));
+    }
+
+    // Frame a group-sync payload (see PAYLOAD_TYPE_GROUP_SYNC): the sender-chain
+    // announcement bytes followed by the current membership journal entries.
+    private static uint8[] build_group_sync_bytes(uint8[] ann_bytes, Gee.List<Protocol.MemberAuditEntry> entries) {
+        var marshalled = new Gee.ArrayList<Bytes>();
+        int total = 2 + 4 + ann_bytes.length + 4;
+        foreach (Protocol.MemberAuditEntry e in entries) {
+            uint8[] eb = e.marshal();
+            marshalled.add(new Bytes(eb));
+            total += 4 + eb.length;
+        }
+        uint8[] buf = new uint8[total];
+        int off = 0;
+        buf[off++] = 0; buf[off++] = 1;   // version = 1
+        gs_put_u32(buf, ref off, (uint32) ann_bytes.length);
+        Memory.copy((uint8*) buf + off, ann_bytes, ann_bytes.length); off += ann_bytes.length;
+        gs_put_u32(buf, ref off, (uint32) marshalled.size);
+        foreach (Bytes eb in marshalled) {
+            unowned uint8[] d = eb.get_data();
+            gs_put_u32(buf, ref off, (uint32) d.length);
+            Memory.copy((uint8*) buf + off, d, d.length); off += d.length;
+        }
+        return buf;
+    }
+
+    // Parse a group-sync payload into the announcement bytes and journal entries.
+    private static bool parse_group_sync_bytes(uint8[] b, out uint8[] ann_bytes, out Gee.ArrayList<Bytes> entries) {
+        ann_bytes = new uint8[0];
+        entries = new Gee.ArrayList<Bytes>();
+        if (b.length < 6) return false;
+        int off = 0;
+        int ver = (b[0] << 8) | b[1]; off += 2;
+        if (ver != 1) return false;
+        int64 ann_len = gs_read_u32(b, off); off += 4;
+        if ((int64) off + ann_len + 4 > (int64) b.length) return false;
+        ann_bytes = new uint8[(int) ann_len];
+        Memory.copy(ann_bytes, (uint8*) b + off, (int) ann_len); off += (int) ann_len;
+        int64 n = gs_read_u32(b, off); off += 4;
+        for (int64 i = 0; i < n; i++) {
+            if ((int64) off + 4 > (int64) b.length) return false;
+            int64 el = gs_read_u32(b, off); off += 4;
+            if ((int64) off + el > (int64) b.length) return false;
+            uint8[] eb = new uint8[(int) el];
+            Memory.copy(eb, (uint8*) b + off, (int) el); off += (int) el;
+            entries.add(new Bytes(eb));
+        }
+        return true;
+    }
+
+    private static void gs_put_u32(uint8[] b, ref int off, uint32 v) {
+        b[off++] = (uint8)(v >> 24); b[off++] = (uint8)(v >> 16);
+        b[off++] = (uint8)(v >> 8); b[off++] = (uint8) v;
+    }
+    private static int64 gs_read_u32(uint8[] b, int off) {
+        return ((int64) b[off] << 24) | ((int64) b[off+1] << 16) | ((int64) b[off+2] << 8) | (int64) b[off+3];
+    }
+
     // Returns the AIK fp (raw 20 bytes) embedded in the seq=0 AddMember entry
     // already stored for the given room, or null if not yet seen.
     private uint8[]? first_stored_owner_fp(Account account, string room_jid_str) {
@@ -567,7 +635,12 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             warning("announce_sender_chain failed for %s: %s", room_jid_str, e.message);
             return;
         }
-        uint8[] ann_bytes = ann.marshal();
+        // Bundle the current membership journal with the announcement (group-sync).
+        // The journal thus rides the pairwise rekey fan-out that epoch rotation
+        // already requires, so members receive it reliably over the 1:1 channel
+        // without depending on MUC MAM.
+        uint8[] ann_bytes = build_group_sync_bytes(ann.marshal(),
+            db.list_membership_journal_entries(conversation.account, room_jid_str));
 
         Gee.Set<string> already = announced_to.get(room_jid_str);
         if (already == null) {
@@ -682,7 +755,7 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             }
             envelope.put_node(key_node);
             envelope.put_node(new StanzaNode.build("payload", Protocol.NS_ENVELOPE)
-                .put_attribute("type", Protocol.PAYLOAD_TYPE_SENDER_CHAIN)
+                .put_attribute("type", Protocol.PAYLOAD_TYPE_GROUP_SYNC)
                 .put_node(new StanzaNode.text(bytes_to_base64(payload_ciphertext))));
 
             Xmpp.MessageStanza msg = new Xmpp.MessageStanza();
@@ -994,15 +1067,33 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             StanzaNode? typed_payload = envelope.get_subnode("payload", Protocol.NS_ENVELOPE);
             if (typed_payload != null) {
                 string? ptype = typed_payload.get_attribute("type");
-                if (ptype == Protocol.PAYLOAD_TYPE_SENDER_CHAIN) {
-                    // Decrypt and route the sender chain announcement.
+                if (ptype == Protocol.PAYLOAD_TYPE_SENDER_CHAIN || ptype == Protocol.PAYLOAD_TYPE_GROUP_SYNC) {
+                    // Decrypt and route the sender chain announcement (and, for a
+                    // group-sync payload, the bundled membership journal).
                     string? sc_b64 = typed_payload.get_string_content();
                     if (sc_b64 != null) {
                         try {
                             Bytes sc_bytes_decrypted = Protocol.decrypt_payload_bytes(transport_key, bytes_from_base64(sc_b64));
-                            Protocol.SenderChainAnnouncement? ann = Protocol.SenderChainAnnouncement.unmarshal(
-                                bytes_to_uint8_array(sc_bytes_decrypted));
+                            uint8[] decrypted = bytes_to_uint8_array(sc_bytes_decrypted);
+                            uint8[] ann_only = decrypted;
+                            Gee.ArrayList<Bytes>? journal_entries = null;
+                            if (ptype == Protocol.PAYLOAD_TYPE_GROUP_SYNC) {
+                                Gee.ArrayList<Bytes> je;
+                                if (parse_group_sync_bytes(decrypted, out ann_only, out je)) {
+                                    journal_entries = je;
+                                }
+                            }
+                            Protocol.SenderChainAnnouncement? ann = Protocol.SenderChainAnnouncement.unmarshal(ann_only);
                             if (ann != null) {
+                                // Ingest the bundled journal BEFORE accepting the
+                                // sender chain, so rebuild_group_session_from_journal
+                                // sees the members and accept_sender_chain succeeds.
+                                if (journal_entries != null) {
+                                    foreach (Bytes eb in journal_entries) {
+                                        on_membership_entry_bytes(conversation.account,
+                                            ann.room_jid, bytes_to_uint8_array(eb));
+                                    }
+                                }
                                 on_sender_chain_announcement(conversation.account, ann);
                             } else {
                                 warning("x3dhpq sender-chain unmarshal returned null from %s/%d",

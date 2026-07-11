@@ -234,9 +234,10 @@ public class MucManager : StreamInteractionModule, Object {
         if (stream == null) return false;
         try {
             yield stream.get_module(Xep.Muc.Module.IDENTITY).change_affiliation(stream, jid.bare_jid, member_jid.bare_jid, null, affiliation);
+            warning("x3dhpq-DIAG affiliation change '%s' for %s in %s -> OK", affiliation, member_jid.to_string(), jid.to_string());
             return true;
         } catch (GLib.Error e) {
-            warning("x3dhpq affiliation change '%s' for %s in %s failed: %s",
+            warning("x3dhpq-DIAG affiliation change '%s' for %s in %s FAILED: %s",
                 affiliation, member_jid.to_string(), jid.to_string(), e.message);
             return false;
         }

@@ -10,6 +10,13 @@ public const string NS_RECOVERY = "urn:xmppqr:x3dhpq:recovery:0";
 public const string NS_GROUP = "urn:xmppqr:x3dhpq:group:0";
 
 public const string PAYLOAD_TYPE_SENDER_CHAIN = "sender-chain";
+// A group-sync payload bundles the sender-chain announcement with the current
+// membership journal, delivered over the pairwise channel (the epoch-rotation
+// rekey already fans out to every member device). This makes journal delivery
+// independent of MUC MAM. Decrypted plaintext layout (all integers big-endian):
+//   uint16 version(=1) | uint32 ann_len | <ann bytes> | uint32 n_entries |
+//   { uint32 entry_len | <MemberAuditEntry.marshal()> } * n_entries
+public const string PAYLOAD_TYPE_GROUP_SYNC = "group-sync";
 
 public string[] get_disco_features() {
     return {
