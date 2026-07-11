@@ -470,6 +470,26 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         return ((int64) b[off] << 24) | ((int64) b[off+1] << 16) | ((int64) b[off+2] << 8) | (int64) b[off+3];
     }
 
+    // Decode a 40-char lowercase/uppercase hex fingerprint into 20 raw bytes.
+    private static uint8[] hex_to_bytes_20(string hex) {
+        unowned uint8[] d = hex.data;
+        if (d.length < 40) return new uint8[0];
+        uint8[] b = new uint8[20];
+        for (int i = 0; i < 20; i++) {
+            int hi = hex_nibble(d[i * 2]);
+            int lo = hex_nibble(d[i * 2 + 1]);
+            if (hi < 0 || lo < 0) return new uint8[0];
+            b[i] = (uint8) ((hi << 4) | lo);
+        }
+        return b;
+    }
+    private static int hex_nibble(uint8 c) {
+        if (c >= '0' && c <= '9') return (int) (c - '0');
+        if (c >= 'a' && c <= 'f') return (int) (c - 'a' + 10);
+        if (c >= 'A' && c <= 'F') return (int) (c - 'A' + 10);
+        return -1;
+    }
+
     // Returns the AIK fp (raw 20 bytes) embedded in the seq=0 AddMember entry
     // already stored for the given room, or null if not yet seen.
     private uint8[]? first_stored_owner_fp(Account account, string room_jid_str) {
@@ -648,15 +668,34 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             announced_to.set(room_jid_str, already);
         }
 
-        // Iterate occupants of the MUC, skip ourselves, send pairwise envelope
-        // tagged <payload type='sender-chain'> to each remaining device.
+        // Recipients = MUC occupants UNION crypto members from the journal. A
+        // freshly-added member (just granted + added to the journal) may not yet
+        // be in the MUC affiliation cache, but must still receive the sender
+        // chain + bundled journal (group-sync) over the 1:1 channel. Resolving
+        // journal member AIK fingerprints to JIDs makes delivery independent of
+        // MUC occupancy (and of the MUC being reachable at all).
         Gee.List<Jid>? occupants = app.stream_interactor.get_module(MucManager.IDENTITY)
             .get_offline_members(conversation.counterpart, conversation.account);
-        if (occupants == null) return;
+        var recipients = new Gee.ArrayList<Jid>();
+        if (occupants != null) {
+            foreach (Jid occ in occupants) recipients.add(occ);
+        }
+        foreach (var e in gs.get_members().entries) {
+            uint8[] fp_raw = hex_to_bytes_20(e.key);
+            if (fp_raw.length != 20) continue;
+            string? jid_str = db.find_peer_jid_by_aik_fp(conversation.account, fp_raw);
+            if (jid_str == null) continue;
+            try {
+                Jid mj = new Jid(jid_str);
+                bool present = false;
+                foreach (Jid r in recipients) { if (r.equals_bare(mj)) { present = true; break; } }
+                if (!present) recipients.add(mj);
+            } catch (Xmpp.InvalidJidError err) { }
+        }
 
         StreamModule? module = app.stream_interactor.module_manager.get_module(conversation.account, StreamModule.IDENTITY);
         int sent = 0;
-        foreach (Jid occ in occupants) {
+        foreach (Jid occ in recipients) {
             if (occ.equals_bare(conversation.account.bare_jid)) continue;
             // Never hand a freshly rotated sender chain to a member we just
             // removed (epoch rotation would be pointless otherwise).
@@ -1456,7 +1495,37 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             return false;
         }
         db.store_membership_journal_entry(account, room_jid.bare_jid.to_string(), stored_entry);
+        // Proactively push the sender chain + updated journal (group-sync) to all
+        // members over the 1:1 channel, so the newly-added member becomes a crypto
+        // member immediately — without waiting for the next group message and
+        // without depending on MUC MAM or MUC occupancy.
+        announce_group_to_members(account, room_jid.bare_jid);
         return true;
+    }
+
+    // Rebuild the group session from the journal and broadcast the sender chain +
+    // bundled journal (group-sync) to every crypto member over the 1:1 channel.
+    private void announce_group_to_members(Account account, Jid room_jid) {
+        Conversation? conversation = app.stream_interactor.get_module(ConversationManager.IDENTITY)
+            .get_conversation(room_jid.bare_jid, account, Conversation.Type.GROUPCHAT);
+        if (conversation == null) return;
+        int? local_device_id = db.get_local_device_id(account);
+        if (local_device_id == null) return;
+        string room_jid_str = room_jid.bare_jid.to_string();
+        uint8[] aik_ed = bytes_to_uint8_array(db.get_local_identity_bytes(account, db.account_identity.aik_pub_ed25519_base64));
+        uint8[] aik_mldsa = bytes_to_uint8_array(db.get_local_identity_bytes(account, db.account_identity.aik_pub_mldsa_base64));
+        uint8[] canonical_aik = Manager.build_canonical_aik_bytes_static(aik_ed, aik_mldsa);
+        Protocol.GroupSession? gs = db.load_group_session(account, room_jid_str, canonical_aik, (uint32)(!) local_device_id);
+        if (gs == null) {
+            try {
+                gs = Protocol.GroupSession.new_session(room_jid_str, canonical_aik, (uint32)(!) local_device_id);
+            } catch (GLib.Error e) {
+                return;
+            }
+        }
+        rebuild_group_session_from_journal(account, room_jid_str, (!) gs);
+        db.store_group_session(account, room_jid_str, (!) gs);
+        broadcast_sender_chain(conversation, (!) gs, room_jid_str, aik_ed, aik_mldsa);
     }
 
     // Publish a hybrid-signed RemoveMember (action=6) journal entry to the
