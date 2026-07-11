@@ -220,8 +220,15 @@ protected class AddGroupchatDialog : Gtk.Dialog {
                     }
                     break;
                 case "muc#roomconfig_membersonly":
+                    // Secret PQ groups are NOT members-only. x3dhpq's membership
+                    // journal is the sole source of truth for who may decrypt;
+                    // the MUC stays agnostic (a dumb transport). An open room also
+                    // sidesteps server-side entry gating (affiliation grants,
+                    // CAPTCHA on members-only entry) that blocked invitees from
+                    // joining. Confidentiality is unaffected — a non-member can
+                    // join the MUC and see only ciphertext.
                     if (field.type_ == Xep.DataForms.DataForm.Type.BOOLEAN) {
-                        ((Xep.DataForms.DataForm.BooleanField) field).value = true;
+                        ((Xep.DataForms.DataForm.BooleanField) field).value = false;
                     }
                     break;
                 case "muc#roomconfig_changesubject":

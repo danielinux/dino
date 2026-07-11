@@ -417,17 +417,6 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     // Frame a group-sync payload (see PAYLOAD_TYPE_GROUP_SYNC): the sender-chain
     // announcement bytes followed by the current membership journal entries.
     private static uint8[] build_group_sync_bytes(uint8[] ann_bytes, Gee.List<Protocol.MemberAuditEntry> entries) {
-        if (entries.size > 0) {
-            Protocol.MemberAuditEntry g = entries[0];
-            uint8[] sp = g.signed_part();
-            StringBuilder h = new StringBuilder();
-            for (int i = 0; i < int.min(sp.length, 60); i++) h.append_printf("%02x", sp[i]);
-            uint8[] gfp; uint32 gep;
-            Protocol.MemberAuditEntry.parse_member_payload(g.payload, out gfp, out gep);
-            warning("x3dhpq-DIAG bundle genesis: seq=%llu ownerFp=%s spLen=%d edSig=%d mlSig=%d marshalHash=%s spHead=%s",
-                g.seq, Protocol.hex_of(gfp), sp.length, g.signature.length, g.mldsa_signature.length,
-                Protocol.hex_of(g.compute_hash()), h.str);
-        }
         var marshalled = new Gee.ArrayList<Bytes>();
         int total = 2 + 4 + ann_bytes.length + 4;
         foreach (Protocol.MemberAuditEntry e in entries) {
@@ -714,8 +703,6 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             } catch (Xmpp.InvalidJidError err) { }
         }
 
-        warning("x3dhpq-DIAG broadcast_sender_chain: room=%s occupants=%d journal_members=%d recipients=%d",
-            room_jid_str, (occupants != null) ? occupants.size : -1, gs.get_members().size, recipients.size);
         StreamModule? module = app.stream_interactor.module_manager.get_module(conversation.account, StreamModule.IDENTITY);
         int sent = 0;
         foreach (Jid occ in recipients) {
@@ -725,7 +712,6 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             if (exclude_bare != null && occ.equals_bare((!) exclude_bare)) continue;
             string peer_bare = occ.bare_jid.to_string();
             Gee.List<int> device_ids = db.get_remote_device_ids(conversation.account, peer_bare);
-            warning("x3dhpq-DIAG broadcast: recipient=%s devices=%d", peer_bare, device_ids.size);
             if (device_ids.size == 0) {
                 if (module != null) {
                     module.request_device_list.begin((!) stream, occ.bare_jid);
@@ -736,7 +722,6 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                 string key = "%s/%d".printf(peer_bare, device_id);
                 Protocol.PeerBundle? bundle = db.get_remote_bundle(conversation.account, peer_bare, device_id);
                 if (bundle == null || !bundle.verify()) {
-                    warning("x3dhpq-DIAG broadcast: %s/%d bundle missing/invalid, requesting", peer_bare, device_id);
                     if (module != null) {
                         module.request_bundle.begin((!) stream, occ.bare_jid, device_id);
                     }
@@ -751,8 +736,6 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                 // dedup on (sender_aik_fp, device, epoch) when accepting
                 // and reinstalling the same recv chain is a no-op.
                 bool ok_send = send_sender_chain_to_device(conversation, occ.bare_jid, device_id, bundle, ann_bytes);
-                warning("x3dhpq-DIAG broadcast: sent group-sync to %s/%d ok=%s (payload=%d bytes)",
-                    peer_bare, device_id, ok_send.to_string(), ann_bytes.length);
                 if (ok_send) {
                     already.add(key);
                     sent++;
@@ -1385,11 +1368,6 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                     global::X3dhpq.Crypto.ed25519_sign(aik_priv_ed, new Bytes(sp)));
                 entry.mldsa_signature = bytes_to_uint8_array(
                     global::X3dhpq.Crypto.mldsa65_sign(aik_priv_mldsa, new Bytes(sp)));
-                StringBuilder sphex = new StringBuilder();
-                for (int i = 0; i < int.min(sp.length, 60); i++) sphex.append_printf("%02x", sp[i]);
-                warning("x3dhpq-DIAG genesis sign: room=%s ownerFp=%s spLen=%d edSig=%d mlSig=%d spHead=%s",
-                    room_jid_str, Protocol.hex_of(aik_fp_raw), sp.length,
-                    entry.signature.length, entry.mldsa_signature.length, sphex.str);
             } catch (GLib.Error e) {
                 return false;
             }
@@ -1479,8 +1457,6 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                 is_active_member = false;
             }
         }
-        warning("x3dhpq-DIAG add_private_group_member: room=%s member=%s is_active_member=%s entries=%d",
-            room_jid.bare_jid.to_string(), member_jid.bare_jid.to_string(), is_active_member.to_string(), entries.size);
         if (is_active_member) {
             // Even if already a member, (re)announce so the member receives the
             // current journal + sender chain over the pairwise channel.
@@ -1563,8 +1539,6 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         }
         rebuild_group_session_from_journal(account, room_jid_str, (!) gs);
         db.store_group_session(account, room_jid_str, (!) gs);
-        warning("x3dhpq-DIAG announce_group_to_members: room=%s journal_members=%d",
-            room_jid_str, gs.get_members().size);
         broadcast_sender_chain(conversation, (!) gs, room_jid_str, aik_ed, aik_mldsa);
     }
 

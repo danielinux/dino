@@ -237,10 +237,9 @@ public class View : Popover {
                 show_invite_error(_("%s isn’t using a post-quantum client, so they can’t join this secret group.").printf(invitee_jid.to_string()));
                 return;
             }
-            bool success = yield muc_manager.yield_change_affiliation_for_jid(account, muc_jid, invitee_jid, "member");
-            if (!success) {
-                return;
-            }
+            // Membership is controlled exclusively by the x3dhpq journal (the MUC
+            // is open/agnostic); no affiliation grant. Add to the journal, then
+            // point the invitee at the room.
             if (pq != null) {
                 if (!(yield pq.add_private_group_member(account, muc_jid, invitee_jid))) {
                     return;

@@ -254,10 +254,6 @@ namespace Dino.Ui.ConversationDetails {
         // un-affiliated ("banned") and outside the membership journal.
         bool is_pq_group = pq != null && pq.is_secret_pq_group(conversation.account, conversation.counterpart);
         bool is_priv = muc_manager.is_private_room(conversation.account, conversation.counterpart);
-        warning("x3dhpq-DIAG send_invite: room=%s invitee=%s is_private_room=%s is_pq_group=%s pq=%s own_affiliation=%s",
-            conversation.counterpart.to_string(), jid.to_string(), is_priv.to_string(), is_pq_group.to_string(),
-            (pq != null).to_string(),
-            (muc_manager.get_affiliation(conversation.counterpart, muc_manager.get_own_jid(conversation.counterpart, conversation.account) ?? conversation.account.bare_jid, conversation.account) ?? Xmpp.Xep.Muc.Affiliation.NONE).to_string());
         if (is_priv || is_pq_group) {
             // Pre-flight: a secret post-quantum group can only include contacts
             // that publish an x3dhpq devicelist. Surface a clear message rather
@@ -266,12 +262,11 @@ namespace Dino.Ui.ConversationDetails {
                 show_group_error(_("Could not invite contact"), _("%s isn’t using a post-quantum client, so they can’t join this secret group.").printf(jid.to_string()));
                 return;
             }
-            bool success = yield muc_manager.yield_change_affiliation_for_jid(conversation.account, conversation.counterpart, jid, "member");
-            warning("x3dhpq-DIAG send_invite: grant member for %s -> success=%s", jid.to_string(), success.to_string());
-            if (!success) {
-                show_group_error(_("Could not invite contact"), _("Dino could not grant membership for %s in this private channel.").printf(jid.to_string()));
-                return;
-            }
+            // Membership is controlled EXCLUSIVELY by the x3dhpq journal — we do
+            // not manage MUC affiliations (the room is open; the MUC is an
+            // agnostic transport). Add the invitee to the journal (which delivers
+            // it to their device over the pairwise channel), then just point them
+            // at the room with a MUC invite.
             if (pq != null) {
                 bool added = yield pq.add_private_group_member(conversation.account, conversation.counterpart, jid);
                 if (!added) {
