@@ -1261,11 +1261,32 @@ public class Database : Qlite.Database {
         }
     }
 
+    // §10.6.1 fresh-device gating: a freshly-generated identity NEVER self-claims
+    // primary. It always mints device-level material (DIK) plus a throwaway AIK
+    // (account_identity's AIK columns are NOT NULL, so unlike PQ's two-table split
+    // some AIK bytes must exist locally even before this device is confirmed —
+    // this is exactly the "pending-enrollment flag" schema gap; see the WS4 final
+    // report's DDL note), but is_primary is left FALSE. Only two paths ever flip
+    // it to true: (1) apply_paired_identity, when an existing primary confirms
+    // this device via CPace pairing with share_primary=true, or (2) StreamModule's
+    // resolve_pending_primary (called once online), which promotes this device's
+    // OWN already-generated throwaway identity to primary ONLY after confirming
+    // via a live devicelist fetch that NO AIK exists anywhere for this account —
+    // i.e. this is genuinely the first device. Until either happens,
+    // is_primary=false blocks publish_device_list (§10.6.1 "MUST NOT publish an
+    // authoritative devicelist"); publish_bundle is unaffected (a confirmed
+    // non-primary device legitimately publishes its own bundle regardless).
     public void ensure_local_identity(Account account) {
         if (has_local_identity(account)) {
             return;
         }
+        generate_local_identity_row(account);
+    }
 
+    // Shared generation logic for ensure_local_identity (pending, is_primary=false)
+    // and mint_fresh_identity (§10.6.4b explicit override; caller sets is_primary
+    // afterwards via promote_to_primary once it has minted the row).
+    private void generate_local_identity_row(Account account) {
         try {
             Bytes aik_pub_ed25519;
             Bytes aik_priv_ed25519;
@@ -1287,7 +1308,7 @@ public class Database : Qlite.Database {
             account_identity.insert()
                 .value(account_identity.account_id, account.id)
                 .value(account_identity.device_id, build_random_device_id())
-                .value(account_identity.is_primary, true)
+                .value(account_identity.is_primary, false)
                 .value(account_identity.aik_pub_ed25519_base64, bytes_to_base64(aik_pub_ed25519))
                 .value(account_identity.aik_priv_ed25519_base64, bytes_to_base64(aik_priv_ed25519))
                 .value(account_identity.aik_pub_mldsa_base64, bytes_to_base64(aik_pub_mldsa))
@@ -1303,6 +1324,46 @@ public class Database : Qlite.Database {
         } catch (GLib.Error e) {
             warning("Unable to initialize x3dhpq identity for %s: %s", account.bare_jid.to_string(), e.message);
         }
+    }
+
+    // §10.6.4b: explicit, user-chosen "generate a new identity instead" override.
+    // Destructive — wipes this device's local AIK/DIK row and mints a brand-new
+    // one, becoming primary of a fresh identity. The caller (StreamModule, owned)
+    // is responsible for the network-visible side effects (publishing the fresh
+    // devicelist so contacts observe a reconstruction event per §10.6.5); this
+    // only replaces local key material.
+    public void mint_fresh_identity(Account account) {
+        account_identity.delete().with(account_identity.account_id, "=", account.id).perform();
+        generate_local_identity_row(account);
+        promote_to_primary(account);
+    }
+
+    // True if this device's local identity is confirmed primary (either
+    // genuinely the first device, promoted via promote_to_primary, or paired in
+    // with share_primary=true via apply_paired_identity). False while pending
+    // (§10.6.1, see ensure_local_identity) AND for a confirmed non-primary/
+    // non-shared secondary — both legitimately never self-publish an
+    // authoritative devicelist, which is the only thing this flag gates.
+    public bool is_local_primary(Account account) {
+        Row? row = get_local_identity(account.id);
+        if (row == null) return false;
+        return ((!) row)[account_identity.is_primary];
+    }
+
+    // §10.6.1: promotes THIS device's own already-generated (throwaway, pending)
+    // identity to genuine primary. Called by StreamModule.resolve_pending_primary
+    // ONLY after confirming via a live server round-trip that no AIK exists
+    // anywhere for this account yet (i.e. this is genuinely the first device).
+    // Idempotent/race-safe: a no-op if this row is already primary (e.g. a
+    // concurrent pairing completed first via apply_paired_identity).
+    public void promote_to_primary(Account account) {
+        if (is_local_primary(account)) {
+            return;
+        }
+        account_identity.update()
+            .with(account_identity.account_id, "=", account.id)
+            .set(account_identity.is_primary, true)
+            .perform();
     }
 
     // Adopt the pairing primary's account identity (AIK) into a new device's
@@ -1558,6 +1619,41 @@ public class Database : Qlite.Database {
         if (rotation_detected) {
             peer_identity_rotated(account, bare_jid, fingerprint);
         }
+    }
+
+    // §10.6.5: a signed devicelist from a peer we already have a pinned AIK for
+    // failed to verify against that AIK (stream_module.vala's verify_inbound_devicelist,
+    // both the "AIK signature does not verify" and the "same version, different
+    // content (fork)" rejections) — this is exactly the "same JID, different/
+    // reconstructed AIK" event that MUST NOT be auto-accepted. Unlike
+    // update_peer_identity (called from a freshly-fetched BUNDLE, where we already
+    // hold the new AIK bytes to store), here we only know the devicelist looked
+    // wrong — we do NOT yet know the new AIK, since verification against the OLD
+    // pinned one is exactly what failed. So this only flips trust_state to
+    // "rotated" (reusing the SAME column + signal + UI review flow that
+    // update_peer_identity/peer_identity_rotated already drive — contact_details_
+    // provider.vala's "Review"/"Accept new identity" button and manager.vala's
+    // accept_peer_aik, which re-learns the peer from scratch via db.forget_peer).
+    // Idempotent: only fires the signal on the transition into "rotated".
+    public void flag_peer_devicelist_fork(Account account, string bare_jid) {
+        Row? existing = get_peer_account_identity_row(account, bare_jid);
+        if (existing == null) {
+            // No prior pinned identity to have forked from; nothing to flag.
+            return;
+        }
+        string trust_state = ((!) existing)[peer_account_identity.trust_state];
+        if (trust_state == "rotated") {
+            return; // already flagged; avoid re-notifying on every rejected republish
+        }
+        string? fingerprint = ((!) existing)[peer_account_identity.aik_fingerprint];
+        peer_account_identity.update()
+            .with(peer_account_identity.account_id, "=", account.id)
+            .with(peer_account_identity.bare_jid, "=", bare_jid)
+            .set(peer_account_identity.trust_state, "rotated")
+            .set(peer_account_identity.downgraded, true)
+            .set(peer_account_identity.updated_at, (long) new DateTime.now_utc().to_unix())
+            .perform();
+        peer_identity_rotated(account, bare_jid, fingerprint);
     }
 
     public override void migrate(long old_version) {

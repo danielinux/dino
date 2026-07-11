@@ -119,8 +119,46 @@ public class StreamModule : XmppStreamModule {
     public async void publish_current_state(XmppStream stream) {
         db.ensure_local_identity(account);
         db.ensure_local_prekeys(account);
-        yield publish_device_list(stream);
+        // §10.6.1 fresh-device gating: a device that is not yet confirmed primary
+        // (is_primary=false — either still-pending, §10.6.1, or a legitimately
+        // confirmed non-primary/non-shared secondary from pairing) MUST NOT
+        // publish an authoritative devicelist. Resolve pending state first; a
+        // confirmed non-primary secondary's resolve is a no-op (already resolved
+        // via apply_paired_identity) and simply stays unpublished here, same as
+        // today's (correct) behavior for that case.
+        if (!db.is_local_primary(account)) {
+            yield resolve_pending_primary(stream);
+        }
+        if (db.is_local_primary(account)) {
+            yield publish_device_list(stream);
+        }
+        // publish_bundle is NOT gated: a confirmed non-primary device still needs
+        // its own bundle published so peers can PQXDH directly to it. A still-
+        // pending device's bundle is harmless-but-orphaned (nobody has a reason to
+        // fetch a device_id no devicelist has ever announced).
         yield publish_bundle(stream);
+    }
+
+    // §10.6.1: resolves a not-yet-primary local identity by fetching the
+    // account's own devicelist from the server. An EMPTY (or errored) response
+    // means no AIK has ever been published for this account anywhere — genuinely
+    // the first device — so it is promoted to primary. A NON-empty response means
+    // an existing primary already owns this account's AIK; this device remains
+    // pending (is_primary stays false) and waits to be confirmed via CPace
+    // pairing (§10.6.2), which calls apply_paired_identity and sets is_primary
+    // explicitly (true if share_primary, false otherwise — either way "resolved").
+    private async void resolve_pending_primary(XmppStream stream) {
+        Jid own_bare = account.bare_jid;
+        ArrayList<int> own_devices = yield request_device_list(stream, own_bare);
+        // Re-check: a concurrent pairing confirmation may have completed while
+        // the fetch was in flight.
+        if (db.is_local_primary(account)) {
+            return;
+        }
+        if (own_devices.size == 0) {
+            db.promote_to_primary(account);
+        }
+        // else: stays pending — no publish, no state change.
     }
 
     public async ArrayList<int> request_device_list(XmppStream stream, Jid jid) {
@@ -530,14 +568,115 @@ public class StreamModule : XmppStreamModule {
             return devices;
         }
 
+        // §10.6.3 trust gating for our OWN devicelist. Two independent checks,
+        // both fail-closed:
+        //  1. The list MUST verify against OUR OWN CURRENT AIK — never deferred.
+        //     A stale pre-reset list (signed by an OLD AIK the server still
+        //     happens to serve) must not resurrect its dead devices; unlike a
+        //     peer list we never defer this to "first contact" since we always
+        //     know our own AIK once ensure_local_identity has run.
+        //  2. Within an otherwise-valid list, a sibling device_id (not this
+        //     install's own local device_id) is only trusted as a co-account
+        //     device if it is covered by a valid, chain-verified AddDevice audit
+        //     entry (§11.4) — devicelist presence ALONE is never sufficient,
+        //     closing the "rogue self-addition silently trusted" gap.
+        int? local_device_id = db.get_local_device_id(account);
+        if (!verify_own_device_list_signature(node, entries)) {
+            warning("x3dhpq: OWN devicelist for %s failed AIK signature verification — " +
+                "ignoring (stale/forked list, §10.6.3)", bare);
+            foreach (int existing_id in db.get_remote_device_ids(account, bare)) {
+                devices.add(existing_id);
+            }
+            return devices;
+        }
+        Gee.Set<int> chain_confirmed = audit_chain_confirmed_device_ids();
+        var trusted_devices = new ArrayList<int>();
         foreach (Protocol.DeviceListDevice e in entries) {
             int did = (int) e.device_id;
             devices.add(did);
-            db.store_remote_device(account, bare, did, cert_by_id[did], added_by_id[did] ?? 0);
+            bool is_own_local = local_device_id != null && did == (!) local_device_id;
+            if (is_own_local || chain_confirmed.contains(did)) {
+                trusted_devices.add(did);
+                db.store_remote_device(account, bare, did, cert_by_id[did], added_by_id[did] ?? 0, e.flags);
+            } else {
+                warning("x3dhpq: sibling device %d appears in own devicelist but has NO " +
+                    "valid AddDevice audit entry — NOT auto-trusting (§10.6.3)", did);
+            }
         }
         db.store_device_list_payload(account, bare, id, node.to_string());
-        device_list_loaded(jid, devices);
-        return devices;
+        // Only prune to the CHAIN-CONFIRMED set, not the full announced set — an
+        // unconfirmed sibling must not linger in peer_device from an earlier,
+        // less strict acceptance either.
+        db.prune_remote_devices_not_in(account, bare, trusted_devices);
+        device_list_loaded(jid, trusted_devices);
+        return trusted_devices;
+    }
+
+    // Verifies an inbound OWN-account devicelist against our CURRENT local AIK
+    // (never deferred — see the §10.6.3 comment at the call site).
+    private bool verify_own_device_list_signature(StanzaNode node, Gee.List<Protocol.DeviceListDevice> entries) {
+        Row? identity = db.get_local_identity(account.id);
+        if (identity == null) {
+            return false; // no local AIK yet (still pending) — nothing to verify against
+        }
+        string? aik_ed_b64 = ((!) identity)[db.account_identity.aik_pub_ed25519_base64];
+        string? aik_ml_b64 = ((!) identity)[db.account_identity.aik_pub_mldsa_base64];
+        if (aik_ed_b64 == null || aik_ml_b64 == null) {
+            return false;
+        }
+        long version = (long) int64.parse(node.get_attribute("version") ?? "0");
+        long issued_at = (long) int64.parse(node.get_attribute("issued-at") ?? "0");
+        StanzaNode? sig_node = node.get_subnode("sig", Protocol.NS_DEVICELIST);
+        StanzaNode? mldsa_node = node.get_subnode("mldsa-sig", Protocol.NS_DEVICELIST);
+        string? sig_b64 = sig_node != null ? sig_node.get_string_content() : null;
+        string? mldsa_b64 = mldsa_node != null ? mldsa_node.get_string_content() : null;
+        if (sig_b64 == null || sig_b64 == "" || mldsa_b64 == null || mldsa_b64 == "") {
+            // Unsigned self-list: only acceptable before we ever bootstrapped an
+            // AIK, which can't be the case here since get_local_identity succeeded.
+            return false;
+        }
+        try {
+            Bytes aik_ed = bytes_from_base64(aik_ed_b64);
+            Bytes aik_mldsa = bytes_from_base64(aik_ml_b64);
+            uint8[] sp = Protocol.DeviceListSigned.signed_part((uint64) version, issued_at, entries);
+            Bytes ed_sig = bytes_from_base64((!) sig_b64);
+            Bytes ml_sig = bytes_from_base64((!) mldsa_b64);
+            return global::X3dhpq.Crypto.ed25519_verify(aik_ed, new Bytes(sp), ed_sig)
+                && global::X3dhpq.Crypto.mldsa65_verify(aik_mldsa, new Bytes(sp), ml_sig);
+        } catch (GLib.Error e) {
+            warning("verify_own_device_list_signature: decode/verify error: %s", e.message);
+            return false;
+        }
+    }
+
+    // §10.6.3: the set of device ids covered by a chain-verified AddDevice entry
+    // (minus any later chain-verified RemoveDevice) in OUR OWN account audit
+    // chain. Presence in db.list_account_audit_entries is itself proof of prior
+    // verification — store_account_audit_entry (database.vala) is only ever
+    // called after Protocol.AccountAuditChain.verify_and_apply succeeds
+    // (handle_audit_event, above), so this fails closed: an empty/unfetched
+    // chain confirms nothing.
+    private Gee.Set<int> audit_chain_confirmed_device_ids() {
+        var ids = new Gee.HashSet<int>();
+        foreach (Protocol.AuditEntry entry in db.list_account_audit_entries(account)) {
+            if (entry.action == (uint8) Protocol.AccountAuditAction.ADD_DEVICE) {
+                int? did = parse_device_id_from_audit_payload(entry.payload);
+                if (did != null) ids.add((!) did);
+            } else if (entry.action == (uint8) Protocol.AccountAuditAction.REMOVE_DEVICE) {
+                int? did = parse_device_id_from_audit_payload(entry.payload);
+                if (did != null) ids.remove((!) did);
+            }
+        }
+        return ids;
+    }
+
+    // AddDevice/RemoveDevice payload (§11.4): uint32(device_id) [| uint32(cert_len) | cert],
+    // big-endian. RemoveDevice payload is exactly the 4-byte device_id.
+    private int? parse_device_id_from_audit_payload(uint8[] payload) {
+        if (payload.length < 4) return null;
+        uint32 did = ((uint32) payload[0] << 24) | ((uint32) payload[1] << 16)
+                   | ((uint32) payload[2] << 8) | (uint32) payload[3];
+        return (int) did;
     }
 
     // Apply the §8.5 verification/version gate for an inbound peer devicelist.
@@ -593,6 +732,12 @@ public class StreamModule : XmppStreamModule {
                    && global::X3dhpq.Crypto.mldsa65_verify(aik_mldsa, new Bytes(sp), ml_sig);
             if (!ok) {
                 warning("x3dhpq devicelist from %s rejected: AIK signature does not verify", bare);
+                // §10.6.5: a signed list that fails to verify against the AIK we
+                // already have pinned for this peer looks like a silent identity
+                // reconstruction (new AIK, same JID) — never auto-accept it, and
+                // flag it for the existing "Review"/"Accept new identity" UX
+                // (contact_details_provider.vala) instead of silently dropping it.
+                db.flag_peer_devicelist_fork(account, bare);
                 return false;
             }
         } catch (GLib.Error e) {
@@ -857,6 +1002,76 @@ public class StreamModule : XmppStreamModule {
         } catch (Error e) {
             warning("fetch group:0 items on %s failed: %s", room_jid.to_string(), e.message);
         }
+    }
+
+    // §10.6.3: builds, persists and publishes a hybrid-signed AddDevice audit
+    // entry (§11.4) for a device that was just confirmed via CPace pairing.
+    // Called by the existing/primary side (encryption_preferences_entry.vala's
+    // pairing_completed handler for PairNewDeviceDialog) right after issuing the
+    // device its DC. This is what lets audit_chain_confirmed_device_ids (above)
+    // trust the sibling on every device — including this one — that later
+    // observes the account's own devicelist.
+    public async bool publish_add_device_audit_entry(XmppStream stream, Protocol.DeviceCertificate issued_cert) {
+        Row? identity = db.get_local_identity(account.id);
+        if (identity == null) {
+            warning("publish_add_device_audit_entry: no local AIK — cannot sign");
+            return false;
+        }
+        string? aik_priv_ed_b64 = ((!) identity)[db.account_identity.aik_priv_ed25519_base64];
+        string? aik_priv_ml_b64 = ((!) identity)[db.account_identity.aik_priv_mldsa_base64];
+        if (aik_priv_ed_b64 == null || aik_priv_ed_b64 == "" || aik_priv_ml_b64 == null || aik_priv_ml_b64 == "") {
+            warning("publish_add_device_audit_entry: no local AIK private key material — " +
+                "cannot sign (this device is not primary/shared-primary)");
+            return false;
+        }
+
+        var chain = db.list_account_audit_entries(account);
+        uint64 seq = 0;
+        uint8[] prev_hash = new uint8[32];
+        if (chain.size > 0) {
+            Protocol.AuditEntry last = chain[chain.size - 1];
+            seq = last.seq + 1;
+            prev_hash = last.compute_hash();
+        }
+
+        uint8[] cert_bytes = issued_cert.marshal();
+        uint8[] payload = new uint8[4 + 4 + cert_bytes.length];
+        uint32 device_id = issued_cert.device_id;
+        payload[0] = (uint8)(device_id >> 24);
+        payload[1] = (uint8)(device_id >> 16);
+        payload[2] = (uint8)(device_id >> 8);
+        payload[3] = (uint8) device_id;
+        uint32 cert_len = (uint32) cert_bytes.length;
+        payload[4] = (uint8)(cert_len >> 24);
+        payload[5] = (uint8)(cert_len >> 16);
+        payload[6] = (uint8)(cert_len >> 8);
+        payload[7] = (uint8) cert_len;
+        Memory.copy((uint8*) payload + 8, cert_bytes, cert_bytes.length);
+
+        Protocol.AuditEntry entry = new Protocol.AuditEntry();
+        entry.seq = seq;
+        entry.prev_hash = prev_hash;
+        entry.action = (uint8) Protocol.AccountAuditAction.ADD_DEVICE;
+        entry.payload = payload;
+        entry.timestamp = (int64) new DateTime.now_utc().to_unix();
+
+        try {
+            Bytes aik_priv_ed = bytes_from_base64((!) aik_priv_ed_b64);
+            Bytes aik_priv_ml = bytes_from_base64((!) aik_priv_ml_b64);
+            uint8[] sp = entry.signed_part();
+            entry.signature = bytes_to_uint8_array(global::X3dhpq.Crypto.ed25519_sign(aik_priv_ed, new Bytes(sp)));
+            entry.mldsa_signature = bytes_to_uint8_array(global::X3dhpq.Crypto.mldsa65_sign(aik_priv_ml, new Bytes(sp)));
+        } catch (GLib.Error e) {
+            warning("publish_add_device_audit_entry: signing failed: %s", e.message);
+            return false;
+        }
+
+        db.store_account_audit_entry(account, entry);
+        bool ok = yield publish_audit_entry(stream, seq.to_string(), Base64.encode(entry.marshal()));
+        if (!ok) {
+            warning("publish_add_device_audit_entry: publish failed for device %u", device_id);
+        }
+        return ok;
     }
 
     // Publish an opaque, client-signed audit entry to the per-account audit:0

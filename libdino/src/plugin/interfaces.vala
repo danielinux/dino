@@ -129,6 +129,21 @@ public interface X3dhpqGroupManager : Object {
     public abstract async bool add_private_group_member(Dino.Entities.Account account, Jid room_jid, Jid member_jid);
     public abstract async bool remove_private_group_member(Dino.Entities.Account account, Jid room_jid, Jid member_jid);
 
+    // WS2 multi-admin membership journal (v2). Promote/demote sign AddAdmin(7)/
+    // RemoveAdmin(8) entries; ban signs RemoveMember(6) with the ban flag. The
+    // first promote/demote by the owner bridges a legacy v1 room to the v2
+    // engine (virtual-genesis Snapshot importing the v1 member set).
+    public abstract async bool group_add_admin(Dino.Entities.Account account, Jid room_jid, Jid member_jid);
+    public abstract async bool group_remove_admin(Dino.Entities.Account account, Jid room_jid, Jid member_jid);
+    public abstract async bool group_ban_member(Dino.Entities.Account account, Jid room_jid, Jid member_jid);
+
+    // Whether the local account may perform admin/member ops in this room per the
+    // crypto authority (folded v2 admin set, or the v1 owner) — used to relax the
+    // owner-only member-management gates to owner-OR-admin.
+    public abstract bool local_is_group_admin(Dino.Entities.Account account, Jid room_jid);
+    // Whether a given member is currently an admin in the folded v2 state.
+    public abstract bool member_is_group_admin(Dino.Entities.Account account, Jid room_jid, Jid member_jid);
+
     // Whether the JID publishes an x3dhpq devicelist/bundle (i.e. can be added
     // to a secret post-quantum group at all). Non-PQ contacts return false so
     // the UI can surface a clear message instead of a silent failure.

@@ -35,6 +35,16 @@ public class MemberAuditEntry : Object {
         return { 'X','3','D','H','P','Q','-','A','u','d','i','t','-','v','1', 0x00 };
     }
 
+    // True iff the bytes begin with the canonical 16-byte v1 domain separator
+    // "X3DHPQ-Audit-v1\0". Used to route a group-sync entry to the v1 verifier
+    // vs. the v2 DAG (which self-describes via JournalEntryV2.is_v2).
+    public static bool is_v1(uint8[] b) {
+        uint8[] PREFIX = audit_prefix();
+        if (b.length < PREFIX.length) return false;
+        for (int i = 0; i < PREFIX.length; i++) if (b[i] != PREFIX[i]) return false;
+        return true;
+    }
+
     public uint8[] signed_part() {
         uint8[] AUDIT_PREFIX = audit_prefix();
         int size = AUDIT_PREFIX.length + 8 + 32 + 1 + 4 + payload.length + 8;

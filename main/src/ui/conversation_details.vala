@@ -203,13 +203,17 @@ namespace Dino.Ui.ConversationDetails {
         Jid? own_jid = muc_manager.get_own_jid(conversation.counterpart, conversation.account);
         if (own_jid != null) {
             Xmpp.Xep.Muc.Affiliation own_affiliation = muc_manager.get_affiliation(conversation.counterpart, own_jid, conversation.account) ?? Xmpp.Xep.Muc.Affiliation.NONE;
-            // In a secret post-quantum (members-only) group only the owner can
-            // manage membership, because the x3dhpq membership journal must be
-            // signed by the room owner's AIK. In public rooms admins may also
-            // invite. Non-owners see the member list but get no invite control.
+            // WS2/3: in a secret post-quantum group the owner OR any journal admin
+            // (folded v2 admin set, via local_is_group_admin) may manage membership.
+            // In public rooms MUC admins may also invite. Non-privileged members
+            // see the list but get no invite control.
+            Application? app_pq = GLib.Application.get_default() as Application;
+            var pq = (app_pq != null) ? app_pq.plugin_registry.x3dhpq_group_manager : null;
+            bool is_pq_group = pq != null && pq.is_secret_pq_group(conversation.account, conversation.counterpart);
+            bool pq_local_admin = is_pq_group && pq.local_is_group_admin(conversation.account, conversation.counterpart);
             bool is_private = muc_manager.is_private_room(conversation.account, conversation.counterpart);
-            bool can_invite = is_private ?
-                    own_affiliation == Xmpp.Xep.Muc.Affiliation.OWNER :
+            bool can_invite = (is_private || is_pq_group) ?
+                    ((own_affiliation == Xmpp.Xep.Muc.Affiliation.OWNER) || pq_local_admin) :
                     (own_affiliation == Xmpp.Xep.Muc.Affiliation.ADMIN || own_affiliation == Xmpp.Xep.Muc.Affiliation.OWNER);
             if (can_invite) {
                 invite_to_room(view_model, conversation, stream_interactor);

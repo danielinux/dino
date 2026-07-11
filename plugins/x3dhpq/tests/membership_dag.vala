@@ -27,6 +27,60 @@ class MembershipDagTest : Gee.TestCase {
         add_test("concurrent_remove_beats_promote", test_remove_beats_promote);
         add_test("mutual_admin_removal_one_survives", test_mutual_removal);
         add_test("convergence_independent_of_order", test_convergence);
+        add_test("snapshot_payload_roundtrip", test_snapshot_payload_roundtrip);
+        add_test("snapshot_virtual_genesis_import", test_snapshot_genesis);
+    }
+
+    // v1->v2 bridge Snapshot payload marshals/parses byte-for-byte.
+    private void test_snapshot_payload_roundtrip() {
+        try {
+            Id owner = make_id(); Id m1 = make_id(); Id m2 = make_id(); Id b1 = make_id();
+            var sp = new SnapshotPayload();
+            sp.owner_fp = owner.fp;
+            sp.epoch = 7;
+            sp.member_fps.add(new Bytes(m1.fp)); sp.member_is_admin.add(true);
+            sp.member_fps.add(new Bytes(m2.fp)); sp.member_is_admin.add(false);
+            sp.banned_fps.add(new Bytes(b1.fp)); sp.banned_epochs.add(3);
+            uint8[] payload = JournalEntryV2.build_snapshot_payload(sp);
+            SnapshotPayload? p2 = JournalEntryV2.parse_snapshot_payload(payload);
+            fail_if(p2 == null, "snapshot payload parse null");
+            fail_if_not_eq_str(hex(((!) p2).owner_fp), owner.fp_hex, "owner fp");
+            fail_if_not_eq_int((int) ((!) p2).epoch, 7, "epoch");
+            fail_if_not_eq_int(((!) p2).member_fps.size, 2, "member count");
+            fail_if_not(((!) p2).member_is_admin.get(0), "m1 is admin");
+            fail_if(((!) p2).member_is_admin.get(1), "m2 not admin");
+            fail_if_not_eq_int(((!) p2).banned_fps.size, 1, "banned count");
+            fail_if_not_eq_int((int) ((!) p2).banned_epochs.get(0), 3, "banned epoch");
+        } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    // A Snapshot as the first canonical entry is a virtual genesis: it imports
+    // the asserted member/admin set, TOFU-pins the owner, and later admin-signed
+    // entries fold on top of it.
+    private void test_snapshot_genesis() {
+        try {
+            Id owner = make_id(); Id m1 = make_id(); Id m2 = make_id(); Id newbie = make_id();
+            var sp = new SnapshotPayload();
+            sp.owner_fp = owner.fp;
+            sp.epoch = 0;
+            sp.member_fps.add(new Bytes(m1.fp)); sp.member_is_admin.add(false);
+            sp.member_fps.add(new Bytes(m2.fp)); sp.member_is_admin.add(false);
+            uint8[] snap_payload = JournalEntryV2.build_snapshot_payload(sp);
+            var snap = sign(owner, 1, heads(null), (uint8) MemberAuditActionV2.SNAPSHOT, snap_payload, 1000);
+            // owner promotes m1 to admin, then m1 adds newbie.
+            var prom = sign(owner, 2, heads(snap.compute_hash()), (uint8) MemberAuditActionV2.ADD_ADMIN, mp(m1.fp), 1001);
+            var add = sign(m1, 3, heads(prom.compute_hash()), (uint8) MemberAuditActionV2.ADD_MEMBER, mp(newbie.fp), 1002);
+            var dag = new MembershipDag();
+            foreach (var e in new JournalEntryV2[]{snap, prom, add}) dag.ingest(e.marshal());
+            DagState st = dag.recompute(resolver());
+            fail_if_not_eq_str(st.owner_fp, owner.fp_hex, "owner TOFU-pinned from snapshot");
+            fail_if_not(st.members.contains(owner.fp_hex), "owner imported as member");
+            fail_if_not(st.admins.contains(owner.fp_hex), "owner imported as admin");
+            fail_if_not(st.members.contains(m1.fp_hex), "m1 imported as member");
+            fail_if_not(st.members.contains(m2.fp_hex), "m2 imported as member");
+            fail_if_not(st.admins.contains(m1.fp_hex), "m1 promoted to admin");
+            fail_if_not(st.members.contains(newbie.fp_hex), "newbie added by promoted admin");
+        } catch (Error e) { fail_if_reached(e.message); }
     }
 
     private Id make_id() throws GLib.Error {

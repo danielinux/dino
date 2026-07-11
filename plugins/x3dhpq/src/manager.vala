@@ -11,6 +11,30 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     private Database db;
     private HashMap<Entities.Message, Conversation> pending_messages = new HashMap<Entities.Message, Conversation>(Entities.Message.hash_func, Entities.Message.equals_func);
 
+    // WS2: per-room multi-admin membership DAG (v2). Kept in memory and
+    // (re)populated from the group-sync bundle; NOT persisted (see report). A
+    // room is "v2-active" once its DAG holds at least one entry (a v2 genesis or
+    // a v1->v2 bridge Snapshot). Keyed by "<account_id>\0<room_bare_jid>".
+    private HashMap<string, Protocol.MembershipDag> dags = new HashMap<string, Protocol.MembershipDag>();
+
+    private static string dag_key(Account account, string room_jid_str) {
+        return "%d %s".printf(account.id, room_jid_str);
+    }
+    private Protocol.MembershipDag get_or_create_dag(Account account, string room_jid_str) {
+        string k = dag_key(account, room_jid_str);
+        Protocol.MembershipDag? d = dags.get(k);
+        if (d == null) { d = new Protocol.MembershipDag(); dags.set(k, d); }
+        return d;
+    }
+    private Protocol.MembershipDag? get_dag(Account account, string room_jid_str) {
+        return dags.get(dag_key(account, room_jid_str));
+    }
+    // A room has switched to the v2 multi-admin engine once we hold any v2 entry.
+    private bool is_v2_active(Account account, string room_jid_str) {
+        Protocol.MembershipDag? d = get_dag(account, room_jid_str);
+        return d != null && d.size > 0;
+    }
+
     public Manager(Dino.Application app, Database db) {
         this.app = app;
         this.db = db;
@@ -64,6 +88,12 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     // surface as "no recv chain".
     private void rebuild_group_session_from_journal(Account account, string room_jid_str,
             Protocol.GroupSession gs) {
+        // Once the room has switched to the v2 multi-admin engine, the folded
+        // DagState (not the linear v1 journal) is authoritative for membership.
+        if (is_v2_active(account, room_jid_str)) {
+            rebuild_group_session_from_dag(account, room_jid_str, gs);
+            return;
+        }
         var entries = db.list_membership_journal_entries(account, room_jid_str);
         int added = 0;
         int skipped_not_found = 0;
@@ -157,6 +187,60 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         }
     }
 
+    // WS2: drive the GroupSession member set from the folded v2 DagState. The
+    // admin set is enforced inside the fold (signer_fp must be an admin for an
+    // entry to apply). We diff the fold's member set against the session's
+    // current members: additions call add_initial_member; removals call
+    // remove_member_by_fp, which rotates the sender-chain epoch so a removed
+    // member cannot read future group messages. The fold only includes entries
+    // whose parents are all present (canonical_order), i.e. the causally-stable
+    // prefix, so rotation is bound to stable state, not a movable raw index.
+    private void rebuild_group_session_from_dag(Account account, string room_jid_str,
+            Protocol.GroupSession gs) {
+        Protocol.MembershipDag? dag = get_dag(account, room_jid_str);
+        if (dag == null) return;
+        Protocol.DagState st = dag.recompute(make_aik_resolver(account));
+
+        // Build the target set keyed by the session's display fingerprint.
+        var target = new Gee.HashMap<string, Protocol.GroupMember>();
+        foreach (string fp_hex in st.members) {
+            Bytes ed_b, ml_b;
+            if (!resolve_aik(account, fp_hex, out ed_b, out ml_b)) continue;
+            uint8[] aik_ed = bytes_to_uint8_array(ed_b);
+            uint8[] aik_mldsa = bytes_to_uint8_array(ml_b);
+            uint8[] canonical = Manager.build_canonical_aik_bytes_static(aik_ed, aik_mldsa);
+            var m = new Protocol.GroupMember();
+            m.aik_pub_bytes = canonical;
+            try {
+                target.set(m.fingerprint(), m);
+            } catch (GLib.Error e) {
+                warning("rebuild dag: fingerprint failed in %s: %s", room_jid_str, e.message);
+            }
+        }
+        // Additions.
+        foreach (var en in target.entries) {
+            if (!gs.get_members().has_key(en.key)) {
+                try {
+                    gs.add_initial_member(en.value);
+                } catch (GLib.Error e) {
+                    warning("rebuild dag: add member failed in %s: %s", room_jid_str, e.message);
+                }
+            }
+        }
+        // Removals (rotates the epoch on the way out).
+        var to_remove = new Gee.ArrayList<string>();
+        foreach (string fp in gs.get_members().keys) {
+            if (!target.has_key(fp)) to_remove.add(fp);
+        }
+        foreach (string fp in to_remove) {
+            try {
+                gs.remove_member_by_fp(fp);
+            } catch (GLib.Error e) {
+                warning("rebuild dag: remove member failed in %s: %s", room_jid_str, e.message);
+            }
+        }
+    }
+
     // Bundle-table fallback for AIK lookup when peer_account_identity hasn't
     // been populated yet. The bundle row stores the peer AIK halves verbatim
     // and is written by handle_inbound_bundle just before peer_account_identity.
@@ -196,6 +280,82 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             }
         }
         return false;
+    }
+
+    // Local account's raw AIK halves and canonical pub bytes + fingerprint.
+    private bool local_aik(Account account, out uint8[] ed, out uint8[] mldsa,
+            out uint8[] canonical, out uint8[] fp_raw) {
+        ed = bytes_to_uint8_array(db.get_local_identity_bytes(account, db.account_identity.aik_pub_ed25519_base64));
+        mldsa = bytes_to_uint8_array(db.get_local_identity_bytes(account, db.account_identity.aik_pub_mldsa_base64));
+        canonical = Manager.build_canonical_aik_bytes_static(ed, mldsa);
+        fp_raw = new uint8[0];
+        try {
+            fp_raw = bytes_to_uint8_array(global::X3dhpq.Crypto.blake2b160(new Bytes(canonical)));
+        } catch (GLib.Error e) {
+            return false;
+        }
+        return fp_raw.length == 20;
+    }
+
+    // Resolve an AIK signer's raw public-key halves from its 40-char hex
+    // fingerprint, mirroring rebuild_group_session_from_journal's lookup order:
+    // self, then peer_account_identity, then the bundle table fallback. Used as
+    // the AikResolver for MembershipDag.recompute so v2 entries can be verified
+    // against the signer's own AIK (any owner/admin may author).
+    private bool resolve_aik(Account account, string fp_hex, out Bytes ed_out, out Bytes ml_out) {
+        ed_out = new Bytes(new uint8[0]);
+        ml_out = new Bytes(new uint8[0]);
+        uint8[] fp_raw = hex_to_bytes_20(fp_hex);
+        if (fp_raw.length != 20) return false;
+
+        uint8[] my_ed, my_ml, my_canon, my_fp;
+        if (local_aik(account, out my_ed, out my_ml, out my_canon, out my_fp)) {
+            bool is_self = true;
+            for (int i = 0; i < 20; i++) if (my_fp[i] != fp_raw[i]) { is_self = false; break; }
+            if (is_self) { ed_out = new Bytes(my_ed); ml_out = new Bytes(my_ml); return true; }
+        }
+        uint8[] aik_ed, aik_ml;
+        if (db.find_peer_account_identity_by_aik_fp(account, fp_raw, out aik_ed, out aik_ml)) {
+            ed_out = new Bytes(aik_ed); ml_out = new Bytes(aik_ml); return true;
+        }
+        if (find_peer_aik_in_bundles(account, fp_raw, out aik_ed, out aik_ml)) {
+            ed_out = new Bytes(aik_ed); ml_out = new Bytes(aik_ml); return true;
+        }
+        return false;
+    }
+
+    private Protocol.AikResolver make_aik_resolver(Account account) {
+        return (fp_hex, out ed, out ml) => {
+            return resolve_aik(account, fp_hex, out ed, out ml);
+        };
+    }
+
+    // Author (sign) a v2 journal entry with the LOCAL account's AIK Ed25519 +
+    // ML-DSA-65 private keys. parents = current DAG heads, lamport = next_lamport.
+    // Mirrors the v1 signing pattern (ensure_private_group_bootstrapped etc.).
+    private Protocol.JournalEntryV2? build_signed_v2(Account account, string room_jid_str,
+            uint8 action, uint8[] payload) {
+        uint8[] my_ed, my_ml, my_canon, my_fp;
+        if (!local_aik(account, out my_ed, out my_ml, out my_canon, out my_fp)) return null;
+        Protocol.MembershipDag dag = get_or_create_dag(account, room_jid_str);
+        var entry = new Protocol.JournalEntryV2();
+        entry.lamport = dag.next_lamport();
+        entry.signer_fp = my_fp;
+        entry.parents = dag.current_heads();
+        entry.action = action;
+        entry.payload = payload;
+        entry.timestamp = new DateTime.now_utc().to_unix();
+        try {
+            uint8[] sp = entry.signed_part();
+            Bytes aik_priv_ed = bytes_from_base64((!) db.get_local_identity_string(account, db.account_identity.aik_priv_ed25519_base64));
+            Bytes aik_priv_mldsa = bytes_from_base64((!) db.get_local_identity_string(account, db.account_identity.aik_priv_mldsa_base64));
+            entry.signature = bytes_to_uint8_array(global::X3dhpq.Crypto.ed25519_sign(aik_priv_ed, new Bytes(sp)));
+            entry.mldsa_signature = bytes_to_uint8_array(global::X3dhpq.Crypto.mldsa65_sign(aik_priv_mldsa, new Bytes(sp)));
+        } catch (GLib.Error e) {
+            warning("x3dhpq v2 sign failed in %s: %s", room_jid_str, e.message);
+            return null;
+        }
+        return entry;
     }
 
     public async bool ensure_get_keys_for_jid(Account account, Jid jid) {
@@ -411,18 +571,31 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         } catch (Xmpp.InvalidJidError e) {
             return;
         }
+        // v2 (multi-admin DAG) and v1 (linear owner-signed) entries are
+        // self-describing by their domain-separator prefix and share the one
+        // flat group-sync entry list. Route each to the right engine. Signature
+        // verification for v2 happens in the fold (MembershipDag.recompute) via
+        // the AIK resolver, so ingest here just dedups by content hash.
+        if (Protocol.JournalEntryV2.is_v2(entry_bytes)) {
+            get_or_create_dag(account, room_jid_str).ingest(entry_bytes);
+            return;
+        }
         on_membership_entry_received(account, room_jid, null, Base64.encode(entry_bytes));
     }
 
     // Frame a group-sync payload (see PAYLOAD_TYPE_GROUP_SYNC): the sender-chain
     // announcement bytes followed by the current membership journal entries.
-    private static uint8[] build_group_sync_bytes(uint8[] ann_bytes, Gee.List<Protocol.MemberAuditEntry> entries) {
+    // entries is a FLAT list of already-marshaled journal entry blobs; each blob
+    // may be a v1 MemberAuditEntry.marshal() OR a v2 JournalEntryV2.marshal()
+    // (they self-describe by domain-separator prefix). The outer framing
+    // (version|ann_len|ann|n|{len|entry}*) is a cross-client contract and is
+    // unchanged — only the fact that an entry can now be v1-or-v2 is new.
+    private static uint8[] build_group_sync_bytes(uint8[] ann_bytes, Gee.List<Bytes> entries) {
         var marshalled = new Gee.ArrayList<Bytes>();
         int total = 2 + 4 + ann_bytes.length + 4;
-        foreach (Protocol.MemberAuditEntry e in entries) {
-            uint8[] eb = e.marshal();
-            marshalled.add(new Bytes(eb));
-            total += 4 + eb.length;
+        foreach (Bytes eb in entries) {
+            marshalled.add(eb);
+            total += 4 + (int) eb.get_size();
         }
         uint8[] buf = new uint8[total];
         int off = 0;
@@ -436,6 +609,23 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             Memory.copy((uint8*) buf + off, d, d.length); off += d.length;
         }
         return buf;
+    }
+
+    // Gather the entries to redistribute for a room: every persisted v1 entry
+    // PLUS (once the room is v2-active) every v2 DAG entry. Both v1 and v2 blobs
+    // ride the same flat list; the receiver routes each by prefix. Sending both
+    // keeps a legacy v1-only peer working while a bridged room's fresh joiner
+    // bootstraps from the v2 Snapshot (virtual genesis).
+    private Gee.ArrayList<Bytes> gather_group_sync_entries(Account account, string room_jid_str) {
+        var list = new Gee.ArrayList<Bytes>();
+        foreach (Protocol.MemberAuditEntry e in db.list_membership_journal_entries(account, room_jid_str)) {
+            list.add(new Bytes(e.marshal()));
+        }
+        Protocol.MembershipDag? dag = get_dag(account, room_jid_str);
+        if (dag != null) {
+            foreach (Bytes b in dag.all_marshaled()) list.add(b);
+        }
+        return list;
     }
 
     // Parse a group-sync payload into the announcement bytes and journal entries.
@@ -660,7 +850,7 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         // already requires, so members receive it reliably over the 1:1 channel
         // without depending on MUC MAM.
         uint8[] ann_bytes = build_group_sync_bytes(ann.marshal(),
-            db.list_membership_journal_entries(conversation.account, room_jid_str));
+            gather_group_sync_entries(conversation.account, room_jid_str));
 
         Gee.Set<string> already = announced_to.get(room_jid_str);
         if (already == null) {
@@ -689,6 +879,15 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             string fph = Protocol.hex_of(fp);
             if (je.action == (uint8) Protocol.MemberAuditAction.ADD_MEMBER) active_fps.add(fph);
             else if (je.action == (uint8) Protocol.MemberAuditAction.REMOVE_MEMBER) active_fps.remove(fph);
+        }
+        // Once the room is v2-active, the folded DagState is authoritative for
+        // membership — union its members so v2-added members receive the bundle
+        // over the pairwise channel even before they appear as MUC occupants.
+        if (is_v2_active(conversation.account, room_jid_str)) {
+            Protocol.DagState st = ((!) get_dag(conversation.account, room_jid_str))
+                .recompute(make_aik_resolver(conversation.account));
+            active_fps.clear();
+            foreach (string fph in st.members) active_fps.add(fph);
         }
         foreach (string fph in active_fps) {
             uint8[] fp_raw = hex_to_bytes_20(fph);
@@ -1425,6 +1624,10 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         if (!yield ensure_private_group_bootstrapped(account, room_jid)) {
             return false;
         }
+        // Room already runs the v2 multi-admin engine → author a v2 AddMember.
+        if (is_v2_active(account, room_jid.bare_jid.to_string())) {
+            return yield v2_add_member(account, room_jid, member_jid);
+        }
         if (!(yield ensure_get_keys_for_jid(account, member_jid.bare_jid))) {
             warning("x3dhpq member add failed for %s in %s: peer bundle unavailable",
                 member_jid.bare_jid.to_string(), room_jid.bare_jid.to_string());
@@ -1519,7 +1722,7 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
 
     // Rebuild the group session from the journal and broadcast the sender chain +
     // bundled journal (group-sync) to every crypto member over the 1:1 channel.
-    private void announce_group_to_members(Account account, Jid room_jid) {
+    private void announce_group_to_members(Account account, Jid room_jid, Jid? exclude_bare = null) {
         Conversation? conversation = app.stream_interactor.get_module(ConversationManager.IDENTITY)
             .get_conversation(room_jid.bare_jid, account, Conversation.Type.GROUPCHAT);
         if (conversation == null) return;
@@ -1539,7 +1742,7 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         }
         rebuild_group_session_from_journal(account, room_jid_str, (!) gs);
         db.store_group_session(account, room_jid_str, (!) gs);
-        broadcast_sender_chain(conversation, (!) gs, room_jid_str, aik_ed, aik_mldsa);
+        broadcast_sender_chain(conversation, (!) gs, room_jid_str, aik_ed, aik_mldsa, exclude_bare);
     }
 
     // Publish a hybrid-signed RemoveMember (action=6) journal entry to the
@@ -1558,6 +1761,11 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         if (!db.has_membership_journal(account, room_jid_str)) {
             // Room was never x3dhpq-bootstrapped; nothing to remove from.
             return false;
+        }
+        // Room already runs the v2 multi-admin engine → author a v2 RemoveMember
+        // (kick: no ban flag). Banning uses group_ban_member (ban flag set).
+        if (is_v2_active(account, room_jid_str)) {
+            return yield v2_remove_member(account, room_jid, member_jid, false);
         }
 
         uint8[] member_aik_fp_raw;
@@ -1666,6 +1874,177 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             }
         }
         return true;
+    }
+
+    // ---- WS2: v2 multi-admin emit path ------------------------------------
+
+    // Fold the persisted v1 journal to its final active member set (raw 20-byte
+    // AIK fingerprints), for the v1->v2 bridge Snapshot import.
+    private Gee.ArrayList<Bytes> compute_v1_member_fps(Account account, string room_jid_str) {
+        var active = new Gee.HashSet<string>();          // fp_hex -> present
+        var order = new Gee.ArrayList<string>();          // preserve first-seen order
+        foreach (Protocol.MemberAuditEntry e in db.list_membership_journal_entries(account, room_jid_str)) {
+            uint8[] fp; uint32 ep;
+            if (!Protocol.MemberAuditEntry.parse_member_payload(e.payload, out fp, out ep)) continue;
+            string h = Protocol.hex_of(fp);
+            if (e.action == (uint8) Protocol.MemberAuditAction.ADD_MEMBER) {
+                if (!active.contains(h)) { active.add(h); order.add(h); }
+            } else if (e.action == (uint8) Protocol.MemberAuditAction.REMOVE_MEMBER) {
+                active.remove(h);
+            }
+        }
+        var res = new Gee.ArrayList<Bytes>();
+        foreach (string h in order) {
+            if (!active.contains(h)) continue;
+            uint8[] raw = hex_to_bytes_20(h);
+            if (raw.length == 20) res.add(new Bytes(raw));
+        }
+        return res;
+    }
+
+    // v1->v2 bridge: emit a virtual-genesis Snapshot (action=10, empty parents)
+    // importing the v1 final member set with the local owner as the sole admin,
+    // then switch the room to the v2 engine. Only the v1 owner may bridge. No-op
+    // if the room is already v2-active. Returns false if we are not the owner.
+    private bool ensure_v2_bridged(Account account, string room_jid_str) {
+        if (is_v2_active(account, room_jid_str)) return true;
+        uint8[] my_ed, my_ml, my_canon, my_fp;
+        if (!local_aik(account, out my_ed, out my_ml, out my_canon, out my_fp)) return false;
+        uint8[]? owner_fp = first_stored_owner_fp(account, room_jid_str);
+        if (owner_fp == null) return false;
+        for (int i = 0; i < 20; i++) if (owner_fp[i] != my_fp[i]) return false; // owner only
+
+        var sp = new Protocol.SnapshotPayload();
+        sp.owner_fp = my_fp;
+        sp.epoch = 0;
+        foreach (Bytes fp in compute_v1_member_fps(account, room_jid_str)) {
+            string h = Protocol.hex_of(fp.get_data());
+            bool is_owner = true;
+            unowned uint8[] fpd = fp.get_data();
+            for (int i = 0; i < 20; i++) if (fpd[i] != my_fp[i]) { is_owner = false; break; }
+            if (is_owner) continue; // owner is imported as admin by the fold
+            sp.member_fps.add(fp);
+            sp.member_is_admin.add(false);
+        }
+        uint8[] payload = Protocol.JournalEntryV2.build_snapshot_payload(sp);
+        Protocol.JournalEntryV2? entry = build_signed_v2(account, room_jid_str,
+            (uint8) Protocol.MemberAuditActionV2.SNAPSHOT, payload);
+        if (entry == null) return false;
+        get_or_create_dag(account, room_jid_str).ingest(entry.marshal());
+        return true;
+    }
+
+    // Author a v2 entry, apply it locally (rebuild the group session from the
+    // updated fold), persist, and broadcast the whole journal (v1+v2) + fresh
+    // sender chain over the group-sync bundle. exclude_bare is dropped from the
+    // broadcast (used when the entry removes/bans that member).
+    private bool emit_v2(Account account, Jid room_jid, uint8 action, uint8[] payload, Jid? exclude_bare) {
+        string room_jid_str = room_jid.bare_jid.to_string();
+        Protocol.JournalEntryV2? entry = build_signed_v2(account, room_jid_str, action, payload);
+        if (entry == null) return false;
+        get_or_create_dag(account, room_jid_str).ingest(entry.marshal());
+        announce_group_to_members(account, room_jid, exclude_bare);
+        return true;
+    }
+
+    private async bool v2_add_member(Account account, Jid room_jid, Jid member_jid) {
+        if (!(yield ensure_get_keys_for_jid(account, member_jid.bare_jid))) {
+            warning("x3dhpq v2 add failed for %s: peer bundle unavailable", member_jid.to_string());
+            return false;
+        }
+        uint8[] fp;
+        if (!db.get_peer_aik_fingerprint_raw(account, member_jid.bare_jid.to_string(), out fp)) {
+            return false;
+        }
+        uint8[] payload = Protocol.JournalEntryV2.build_member_payload(fp, 0);
+        return emit_v2(account, room_jid, (uint8) Protocol.MemberAuditActionV2.ADD_MEMBER, payload, null);
+    }
+
+    private async bool v2_remove_member(Account account, Jid room_jid, Jid member_jid, bool ban) {
+        uint8[] fp;
+        if (!db.get_peer_aik_fingerprint_raw(account, member_jid.bare_jid.to_string(), out fp)) {
+            return false;
+        }
+        uint8[] payload = Protocol.JournalEntryV2.build_remove_payload(fp, 0, ban);
+        return emit_v2(account, room_jid, (uint8) Protocol.MemberAuditActionV2.REMOVE_MEMBER,
+            payload, member_jid.bare_jid);
+    }
+
+    // Promote a member to admin (action=7). Bridges a v1 room to v2 on first use
+    // (owner-only). Once v2, any admin may promote/demote another admin; the
+    // authorization is enforced in the fold (signer_fp must be an admin), so a
+    // non-admin author's entry is signed+relayed but ignored by every client.
+    public async bool group_add_admin(Dino.Entities.Account account, Jid room_jid, Jid member_jid) {
+        string room_jid_str = room_jid.bare_jid.to_string();
+        if (!yield ensure_private_group_bootstrapped(account, room_jid)) return false;
+        if (!ensure_v2_bridged(account, room_jid_str)) {
+            warning("x3dhpq make-admin refused in %s: only the owner can enable multi-admin", room_jid_str);
+            return false;
+        }
+        if (!(yield ensure_get_keys_for_jid(account, member_jid.bare_jid))) return false;
+        uint8[] fp;
+        if (!db.get_peer_aik_fingerprint_raw(account, member_jid.bare_jid.to_string(), out fp)) return false;
+        uint8[] payload = Protocol.JournalEntryV2.build_member_payload(fp, 0);
+        return emit_v2(account, room_jid, (uint8) Protocol.MemberAuditActionV2.ADD_ADMIN, payload, null);
+    }
+
+    // Demote an admin back to plain member (action=8). The owner is undemotable
+    // (guarded in the fold). Bridges a v1 room to v2 (owner-only) on first use.
+    public async bool group_remove_admin(Dino.Entities.Account account, Jid room_jid, Jid member_jid) {
+        string room_jid_str = room_jid.bare_jid.to_string();
+        if (!yield ensure_private_group_bootstrapped(account, room_jid)) return false;
+        if (!ensure_v2_bridged(account, room_jid_str)) {
+            warning("x3dhpq remove-admin refused in %s: only the owner can enable multi-admin", room_jid_str);
+            return false;
+        }
+        uint8[] fp;
+        if (!db.get_peer_aik_fingerprint_raw(account, member_jid.bare_jid.to_string(), out fp)) return false;
+        uint8[] payload = Protocol.JournalEntryV2.build_member_payload(fp, 0);
+        return emit_v2(account, room_jid, (uint8) Protocol.MemberAuditActionV2.REMOVE_ADMIN, payload, null);
+    }
+
+    // Ban (RemoveMember + ban flag). A banned AIK is never re-added without an
+    // explicit causal path. On a still-v1 room this falls back to a plain v1
+    // removal (no ban semantics) — the ban flag is only expressible in v2.
+    public async bool group_ban_member(Dino.Entities.Account account, Jid room_jid, Jid member_jid) {
+        string room_jid_str = room_jid.bare_jid.to_string();
+        if (!db.has_membership_journal(account, room_jid_str)) return false;
+        if (is_v2_active(account, room_jid_str)) {
+            return yield v2_remove_member(account, room_jid, member_jid, true);
+        }
+        return yield remove_private_group_member(account, room_jid, member_jid);
+    }
+
+    // Whether the LOCAL account may perform admin/member ops in this room, per
+    // the crypto authority (NOT the MUC affiliation): the folded v2 admin set if
+    // the room is v2-active, else the v1 owner (creator). Consumed by the GUI to
+    // relax the owner-only gates to owner-OR-admin. A not-yet-bootstrapped room
+    // returns true (the creator is about to become owner).
+    public bool local_is_group_admin(Dino.Entities.Account account, Jid room_jid) {
+        string room_jid_str = room_jid.bare_jid.to_string();
+        uint8[] my_ed, my_ml, my_canon, my_fp;
+        if (!local_aik(account, out my_ed, out my_ml, out my_canon, out my_fp)) return false;
+        string my_hex = Protocol.hex_of(my_fp);
+        if (is_v2_active(account, room_jid_str)) {
+            Protocol.DagState st = ((!) get_dag(account, room_jid_str)).recompute(make_aik_resolver(account));
+            return st.admins.contains(my_hex);
+        }
+        uint8[]? owner_fp = first_stored_owner_fp(account, room_jid_str);
+        if (owner_fp == null) return true; // not bootstrapped yet → creator/owner-to-be
+        for (int i = 0; i < 20; i++) if (owner_fp[i] != my_fp[i]) return false;
+        return true;
+    }
+
+    // Whether a specific member is currently an admin in the folded v2 state
+    // (false for a v1 room, which has no admin set beyond the owner). Lets the
+    // GUI choose between "Make admin" and "Remove admin".
+    public bool member_is_group_admin(Dino.Entities.Account account, Jid room_jid, Jid member_jid) {
+        string room_jid_str = room_jid.bare_jid.to_string();
+        if (!is_v2_active(account, room_jid_str)) return false;
+        uint8[] fp;
+        if (!db.get_peer_aik_fingerprint_raw(account, member_jid.bare_jid.to_string(), out fp)) return false;
+        Protocol.DagState st = ((!) get_dag(account, room_jid_str)).recompute(make_aik_resolver(account));
+        return st.admins.contains(Protocol.hex_of(fp));
     }
 
     // Revoke one of the account's own devices (§8.6). Publishes a RemoveDevice

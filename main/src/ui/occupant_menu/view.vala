@@ -86,12 +86,17 @@ public class View : Popover {
         Xmpp.Xep.Muc.Role? role = stream_interactor.get_module(MucManager.IDENTITY).get_role(own_jid, conversation.account);
         Xmpp.Xep.Muc.Affiliation? own_affiliation = own_jid != null ? stream_interactor.get_module(MucManager.IDENTITY).get_affiliation(conversation.counterpart, own_jid, conversation.account) : Xmpp.Xep.Muc.Affiliation.NONE;
 
-        // In a secret post-quantum (members-only) group only the owner can add
-        // members, since the x3dhpq membership journal is signed by the owner's
-        // AIK. Public rooms keep the usual admin-or-owner rule.
+        // WS2/3: in a secret post-quantum group the owner OR any journal admin
+        // may add/manage members (crypto authority = the folded v2 admin set,
+        // queried via local_is_group_admin). Public rooms keep the usual MUC
+        // admin-or-owner rule.
+        Application? app_pq = GLib.Application.get_default() as Application;
+        var pq = (app_pq != null) ? app_pq.plugin_registry.x3dhpq_group_manager : null;
+        bool is_pq_group = pq != null && pq.is_secret_pq_group(conversation.account, conversation.counterpart);
+        bool pq_local_admin = is_pq_group && pq.local_is_group_admin(conversation.account, conversation.counterpart);
         bool is_private_room = stream_interactor.get_module(MucManager.IDENTITY).is_private_room(conversation.account, conversation.counterpart);
-        bool can_invite = is_private_room ?
-                own_affiliation == Xmpp.Xep.Muc.Affiliation.OWNER :
+        bool can_invite = (is_private_room || is_pq_group) ?
+                ((own_affiliation == Xmpp.Xep.Muc.Affiliation.OWNER) || pq_local_admin) :
                 (own_affiliation == Xmpp.Xep.Muc.Affiliation.ADMIN || own_affiliation == Xmpp.Xep.Muc.Affiliation.OWNER);
         if (can_invite && invite_list == null) {
             invite_list = new ListBox();
@@ -108,37 +113,43 @@ public class View : Popover {
             outer_box.append(kick_button);
             kick_button.clicked.connect(kick_button_clicked);
         }
-        if (real_jid != null && (own_affiliation == Xmpp.Xep.Muc.Affiliation.ADMIN || own_affiliation == Xmpp.Xep.Muc.Affiliation.OWNER)) {
+        bool can_admin_ops = (own_affiliation == Xmpp.Xep.Muc.Affiliation.ADMIN || own_affiliation == Xmpp.Xep.Muc.Affiliation.OWNER) || pq_local_admin;
+        if (real_jid != null && can_admin_ops) {
             Button ban_button = new Button.with_label(_("Ban"));
             outer_box.append(ban_button);
             ban_button.clicked.connect(() => {
                 stream_interactor.get_module(MucManager.IDENTITY).change_affiliation_for_jid(conversation.account, conversation.counterpart, real_jid, "outcast");
                 // Banning must also revoke the member from the x3dhpq membership
-                // journal and rotate the group epoch, exactly like a kick — a MUC
-                // outcast that stays in the crypto member set would still receive
-                // future group keys.
-                remove_x3dhpq_member.begin(jid);
+                // journal (RemoveMember + ban flag) and rotate the group epoch — a
+                // MUC outcast that stays in the crypto member set would still
+                // receive future group keys, and a ban (unlike a kick) must block
+                // silent re-admission.
+                ban_x3dhpq_member.begin(jid);
             });
 
-            // Admin promotion/demotion (owner-only). Mirrors the fuller member
-            // dialog; changes the MUC affiliation. (Crypto-layer admin authority
-            // over the membership journal is handled by the x3dhpq plugin.)
-            if (own_affiliation == Xmpp.Xep.Muc.Affiliation.OWNER) {
-                Xmpp.Xep.Muc.Affiliation? target_aff = stream_interactor.get_module(MucManager.IDENTITY)
-                    .get_affiliation(conversation.counterpart, real_jid, conversation.account);
-                if (target_aff != Xmpp.Xep.Muc.Affiliation.ADMIN && target_aff != Xmpp.Xep.Muc.Affiliation.OWNER) {
-                    Button admin_button = new Button.with_label(_("Make admin"));
-                    outer_box.append(admin_button);
-                    admin_button.clicked.connect(() => {
-                        stream_interactor.get_module(MucManager.IDENTITY).change_affiliation_for_jid(conversation.account, conversation.counterpart, real_jid, "admin");
-                    });
-                } else if (target_aff == Xmpp.Xep.Muc.Affiliation.ADMIN) {
-                    Button unadmin_button = new Button.with_label(_("Remove admin"));
-                    outer_box.append(unadmin_button);
-                    unadmin_button.clicked.connect(() => {
-                        stream_interactor.get_module(MucManager.IDENTITY).change_affiliation_for_jid(conversation.account, conversation.counterpart, real_jid, "member");
-                    });
-                }
+            // Admin promote/demote. Owner OR (in a v2 PQ group) an existing admin
+            // may promote/demote. The MUC affiliation change is a cosmetic mirror;
+            // the crypto authority is the signed AddAdmin/RemoveAdmin journal entry.
+            bool target_pq_admin = is_pq_group && pq.member_is_group_admin(conversation.account, conversation.counterpart, real_jid);
+            Xmpp.Xep.Muc.Affiliation? target_aff = stream_interactor.get_module(MucManager.IDENTITY)
+                .get_affiliation(conversation.counterpart, real_jid, conversation.account);
+            bool target_is_admin = is_pq_group ? target_pq_admin
+                : (target_aff == Xmpp.Xep.Muc.Affiliation.ADMIN || target_aff == Xmpp.Xep.Muc.Affiliation.OWNER);
+            bool may_promote = (own_affiliation == Xmpp.Xep.Muc.Affiliation.OWNER) || pq_local_admin;
+            if (may_promote && !target_is_admin) {
+                Button admin_button = new Button.with_label(_("Make admin"));
+                outer_box.append(admin_button);
+                admin_button.clicked.connect(() => {
+                    stream_interactor.get_module(MucManager.IDENTITY).change_affiliation_for_jid(conversation.account, conversation.counterpart, real_jid, "admin");
+                    if (is_pq_group) pq.group_add_admin.begin(conversation.account, conversation.counterpart, real_jid.bare_jid);
+                });
+            } else if (may_promote && target_is_admin && target_aff != Xmpp.Xep.Muc.Affiliation.OWNER) {
+                Button unadmin_button = new Button.with_label(_("Remove admin"));
+                outer_box.append(unadmin_button);
+                unadmin_button.clicked.connect(() => {
+                    stream_interactor.get_module(MucManager.IDENTITY).change_affiliation_for_jid(conversation.account, conversation.counterpart, real_jid, "member");
+                    if (is_pq_group) pq.group_remove_admin.begin(conversation.account, conversation.counterpart, real_jid.bare_jid);
+                });
             }
         }
         if (stream_interactor.get_module(MucManager.IDENTITY).is_moderated_room(conversation.account, conversation.counterpart) && role ==  Xmpp.Xep.Muc.Role.MODERATOR){
@@ -199,6 +210,22 @@ public class View : Popover {
         }
         yield app.plugin_registry.x3dhpq_group_manager.remove_private_group_member(
             conversation.account, conversation.counterpart, real_jid.bare_jid);
+    }
+
+    // Ban variant: RemoveMember with the ban flag so the AIK is not silently
+    // re-added (falls back to a plain removal on a still-v1 room).
+    private async void ban_x3dhpq_member(Jid occupant) {
+        var muc_manager = stream_interactor.get_module(MucManager.IDENTITY);
+        Application? app = GLib.Application.get_default() as Application;
+        var pq = (app != null) ? app.plugin_registry.x3dhpq_group_manager : null;
+        if (pq == null) return;
+        if (!muc_manager.is_private_room(conversation.account, conversation.counterpart)
+                && !pq.is_secret_pq_group(conversation.account, conversation.counterpart)) {
+            return;
+        }
+        Jid? real_jid = muc_manager.get_real_jid(occupant, conversation.account);
+        if (real_jid == null) return;
+        yield pq.group_ban_member(conversation.account, conversation.counterpart, real_jid.bare_jid);
     }
 
     private void voice_button_clicked(string role) {

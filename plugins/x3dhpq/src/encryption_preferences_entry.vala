@@ -75,6 +75,11 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
                 (int) cert.device_id, Base64.encode(cert.marshal()), (long) cert.created_at, cert.flags);
             if (stream != null) {
                 module.publish_current_state.begin((!) stream);
+                // §10.6.3: append + publish the AddDevice audit entry so this
+                // sibling passes the audit-chain trust gate (stream_module.vala's
+                // audit_chain_confirmed_device_ids) on every device — including
+                // this one — that later observes the account's own devicelist.
+                module.publish_add_device_audit_entry.begin((!) stream, cert);
             }
         });
         dialog.present();

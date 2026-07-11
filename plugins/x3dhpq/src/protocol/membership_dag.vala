@@ -197,6 +197,62 @@ public class JournalEntryV2 : Object {
         return payload.length >= 25 && (payload[24] & 0x01) != 0;
     }
 
+    // v1->v2 bridge Snapshot payload (cross-client contract, big-endian):
+    //   owner_fp(20) | epoch(8) | member_count(4) |
+    //   member[ fp(20) | is_admin(1) ]* |
+    //   banned_count(4) | banned[ fp(20) | removal_epoch(4) ]*
+    // Pubkeys are NOT embedded — resolved via the AIK/devicelist layer.
+    public static uint8[] build_snapshot_payload(SnapshotPayload sp) {
+        int mc = sp.member_fps.size;
+        int bc = sp.banned_fps.size;
+        int size = 20 + 8 + 4 + mc * 21 + 4 + bc * 24;
+        uint8[] buf = new uint8[size];
+        int off = 0;
+        Memory.copy((uint8*) buf + off, sp.owner_fp, 20); off += 20;
+        put_u64(buf, ref off, sp.epoch);
+        put_u32(buf, ref off, (uint32) mc);
+        for (int i = 0; i < mc; i++) {
+            Memory.copy((uint8*) buf + off, sp.member_fps.get(i).get_data(), 20); off += 20;
+            buf[off++] = sp.member_is_admin.get(i) ? 0x01 : 0x00;
+        }
+        put_u32(buf, ref off, (uint32) bc);
+        for (int i = 0; i < bc; i++) {
+            Memory.copy((uint8*) buf + off, sp.banned_fps.get(i).get_data(), 20); off += 20;
+            put_u32(buf, ref off, sp.banned_epochs.get(i));
+        }
+        return buf;
+    }
+
+    public static SnapshotPayload? parse_snapshot_payload(uint8[] p) {
+        if (p.length < 20 + 8 + 4) return null;
+        int off = 0;
+        var sp = new SnapshotPayload();
+        sp.owner_fp = new uint8[20];
+        Memory.copy(sp.owner_fp, p, 20); off += 20;
+        sp.epoch = get_u64(p, ref off);
+        int mc = (int) get_u32(p, ref off);
+        if (mc < 0 || mc > 100000) return null;
+        if ((int64) off + (int64) mc * 21 + 4 > (int64) p.length) return null;
+        for (int i = 0; i < mc; i++) {
+            uint8[] fp = new uint8[20];
+            Memory.copy(fp, (uint8*) p + off, 20); off += 20;
+            bool adm = p[off++] != 0x00;
+            sp.member_fps.add(new Bytes(fp));
+            sp.member_is_admin.add(adm);
+        }
+        int bc = (int) get_u32(p, ref off);
+        if (bc < 0 || bc > 100000) return null;
+        if ((int64) off + (int64) bc * 24 > (int64) p.length) return null;
+        for (int i = 0; i < bc; i++) {
+            uint8[] fp = new uint8[20];
+            Memory.copy(fp, (uint8*) p + off, 20); off += 20;
+            uint32 rep = get_u32(p, ref off);
+            sp.banned_fps.add(new Bytes(fp));
+            sp.banned_epochs.add(rep);
+        }
+        return sp;
+    }
+
     private static void put_u16(uint8[] b, ref int off, uint16 v) {
         b[off++] = (uint8)(v >> 8); b[off++] = (uint8) v;
     }
@@ -219,6 +275,17 @@ public class JournalEntryV2 : Object {
         for (int i = 0; i < 8; i++) v = (v << 8) | b[off + i];
         off += 8; return v;
     }
+}
+
+// Decoded v1->v2 bridge Snapshot payload. member_fps[i] pairs with
+// member_is_admin[i]; banned_fps[i] pairs with banned_epochs[i].
+public class SnapshotPayload : Object {
+    public uint8[] owner_fp;                                             // 20 bytes
+    public uint64 epoch = 0;
+    public Gee.ArrayList<Bytes> member_fps = new Gee.ArrayList<Bytes>(); // 20 bytes each
+    public Gee.ArrayList<bool> member_is_admin = new Gee.ArrayList<bool>();
+    public Gee.ArrayList<Bytes> banned_fps = new Gee.ArrayList<Bytes>(); // 20 bytes each
+    public Gee.ArrayList<uint32> banned_epochs = new Gee.ArrayList<uint32>();
 }
 
 public class DagState : Object {
@@ -249,6 +316,13 @@ public class MembershipDag : Object {
         JournalEntryV2? e = JournalEntryV2.unmarshal(bytes);
         if (e == null) return false;
         return store.has_key(e.hash_hex());
+    }
+
+    // Every stored entry, marshaled — for re-broadcast in the group-sync bundle.
+    public Gee.ArrayList<Bytes> all_marshaled() {
+        var l = new Gee.ArrayList<Bytes>();
+        foreach (var en in store.entries) l.add(new Bytes(en.value.marshal()));
+        return l;
     }
 
     private Gee.ArrayList<JournalEntryV2> canonical_order() {
@@ -320,6 +394,36 @@ public class MembershipDag : Object {
             } catch (GLib.Error err) { continue; }
 
             if (i == 0) {
+                // A first-in-canonical-order Snapshot is a virtual genesis
+                // (v1->v2 bridge / MAM-prune-proof catch-up): TOFU-pin owner_fp
+                // and import its asserted member/admin/banned sets. The snapshot
+                // signer MUST be an asserted admin of the set it declares.
+                if (e.action == (uint8) MemberAuditActionV2.SNAPSHOT) {
+                    SnapshotPayload? sp = JournalEntryV2.parse_snapshot_payload(e.payload);
+                    if (sp == null) continue;
+                    string owner_hex = hex_of(sp.owner_fp);
+                    var imp_members = new Gee.HashSet<string>();
+                    var imp_admins = new Gee.HashSet<string>();
+                    for (int mi = 0; mi < sp.member_fps.size; mi++) {
+                        string mh = hex_of(sp.member_fps.get(mi).get_data());
+                        imp_members.add(mh);
+                        if (sp.member_is_admin.get(mi)) imp_admins.add(mh);
+                    }
+                    imp_members.add(owner_hex);
+                    imp_admins.add(owner_hex);
+                    // Reject a snapshot whose signer is not an admin it declares.
+                    if (!imp_admins.contains(signer_hex)) continue;
+                    st.owner_fp = owner_hex;
+                    foreach (string mh in imp_members) st.members.add(mh);
+                    foreach (string ah in imp_admins) st.admins.add(ah);
+                    for (int bi = 0; bi < sp.banned_fps.size; bi++) {
+                        string bh = hex_of(sp.banned_fps.get(bi).get_data());
+                        st.banned.add(bh);
+                        st.removed.set(bh, sp.banned_epochs.get(bi));
+                    }
+                    st.epoch = (uint32) sp.epoch;
+                    continue;
+                }
                 st.owner_fp = signer_hex;
                 st.admins.add(signer_hex);
                 st.members.add(signer_hex);
