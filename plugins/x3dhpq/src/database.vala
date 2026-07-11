@@ -5,7 +5,7 @@ using Xmpp;
 namespace Dino.Plugins.X3dhpq {
 
 public class Database : Qlite.Database {
-    private const int VERSION = 8;
+    private const int VERSION = 9;
 
     public class AccountIdentityTable : Table {
         public Column<int> id = new Column.Integer("id") { primary_key = true, auto_increment = true };
@@ -235,6 +235,31 @@ public class Database : Qlite.Database {
         }
     }
 
+    // §11.7 device-audit DAG (device_dag.vala): local persisted store of every
+    // known DeviceAuditEntryV2 for the account, keyed by its own content hash
+    // so re-ingesting the same entry (e.g. re-deriving the genesis Snapshot on
+    // a later publish attempt) is a harmless no-op. Mirrors MembershipJournalTable's
+    // keying style exactly: a plain (not_null) account_id INTEGER with NO SQL
+    // FOREIGN KEY — this codebase never declares one (see MembershipJournalTable,
+    // AuditEntryTable, etc.) — so a row can never fail to insert because of a
+    // dangling/late-created accounts-table reference. entry_blob_base64 stores
+    // DeviceAuditEntryV2.marshal() the same way every other binary payload in
+    // this schema is stored (base64 TEXT; Qlite has no native BLOB column type —
+    // see AuditEntryTable.entry_base64 / MembershipJournalTable.payload_base64).
+    // Added at schema v9.
+    public class DeviceAuditTable : Table {
+        public Column<int> account_id = new Column.Integer("account_id") { not_null = true };
+        public Column<string> entry_hash_hex = new Column.NonNullText("entry_hash_hex");
+        public Column<string> entry_blob_base64 = new Column.NonNullText("entry_blob_base64");
+        public Column<long> created_at = new Column.Long("created_at") { not_null = true };
+
+        internal DeviceAuditTable(Database db) {
+            base(db, "device_audit");
+            init({ account_id, entry_hash_hex, entry_blob_base64, created_at });
+            unique({ account_id, entry_hash_hex });
+        }
+    }
+
     public class AuditEntryTable : Table {
         public Column<int> account_id = new Column.Integer("account_id") { not_null = true };
         public Column<string> bare_jid = new Column.NonNullText("bare_jid");
@@ -311,6 +336,7 @@ public class Database : Qlite.Database {
     public PairwiseSessionTable pairwise_session { get; private set; }
     public GroupSessionTable group_session { get; private set; }
     public MembershipJournalTable membership_journal { get; private set; }
+    public DeviceAuditTable device_audit { get; private set; }
     public AuditEntryTable audit_entry { get; private set; }
     public RecoveryBlobTable recovery_blob { get; private set; }
     public PairingSessionTable pairing_session { get; private set; }
@@ -328,10 +354,11 @@ public class Database : Qlite.Database {
         pairwise_session = new PairwiseSessionTable(this);
         group_session = new GroupSessionTable(this);
         membership_journal = new MembershipJournalTable(this);
+        device_audit = new DeviceAuditTable(this);
         audit_entry = new AuditEntryTable(this);
         recovery_blob = new RecoveryBlobTable(this);
         pairing_session = new PairingSessionTable(this);
-        init({ account_identity, peer_account_identity, peer_device, device_list, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, group_session, membership_journal, audit_entry, recovery_blob, pairing_session });
+        init({ account_identity, peer_account_identity, peer_device, device_list, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, group_session, membership_journal, device_audit, audit_entry, recovery_blob, pairing_session });
     }
 
     public Row? get_local_identity(int account_id) {
@@ -1601,6 +1628,49 @@ public class Database : Qlite.Database {
             // reloaded+re-marshalled entry reproduces the exact signed_part.
             .value(membership_journal.created_at, (long) entry.timestamp)
             .perform();
+    }
+
+    // §11.7 device-audit DAG persistence (device_dag.vala). Upsert-by-natural-key
+    // (account_id, entry_hash_hex) mirrors store_membership_journal_entry: a
+    // re-store of an already-known entry (e.g. re-deriving the genesis Snapshot)
+    // is a harmless idempotent overwrite, never a duplicate row or a failure.
+    public void store_device_audit_entry(Account account, Protocol.DeviceAuditEntryV2 entry) {
+        device_audit.upsert()
+            .value(device_audit.account_id, account.id, true)
+            .value(device_audit.entry_hash_hex, entry.hash_hex(), true)
+            .value(device_audit.entry_blob_base64, Base64.encode(entry.marshal()))
+            .value(device_audit.created_at, (long) new DateTime.now_utc().to_unix())
+            .perform();
+    }
+
+    // Every persisted device-audit entry for this account, unmarshalled. Row
+    // order is NOT causal order — DeviceDag.recompute() performs its own
+    // Kahn topo-sort (canonical_order) over the ingested set, so callers must
+    // feed the full list to a fresh DeviceDag rather than relying on this order.
+    // A row that fails to base64-decode or unmarshal is skipped defensively
+    // rather than aborting the whole fold.
+    public Gee.List<Protocol.DeviceAuditEntryV2> list_device_audit_entries(Account account) {
+        var out_entries = new Gee.ArrayList<Protocol.DeviceAuditEntryV2>();
+        var rows = device_audit.select().with(device_audit.account_id, "=", account.id);
+        foreach (Row r in rows) {
+            try {
+                uint8[] blob = bytes_to_uint8_array(bytes_from_base64(r[device_audit.entry_blob_base64]));
+                Protocol.DeviceAuditEntryV2? e = Protocol.DeviceAuditEntryV2.unmarshal(blob);
+                if (e != null) {
+                    out_entries.add(e);
+                }
+            } catch (Error err) {
+                continue;
+            }
+        }
+        return out_entries;
+    }
+
+    // True once at least one device-audit row (genesis Snapshot or later) has
+    // been persisted for this account. Used to gate the one-time genesis
+    // bootstrap so it never re-fires on every publish.
+    public bool has_device_audit_entries(Account account) {
+        return device_audit.select().with(device_audit.account_id, "=", account.id).count() > 0;
     }
 
     private string bytes_to_hex_string(uint8[] b) {

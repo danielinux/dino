@@ -273,6 +273,23 @@ public class StreamModule : XmppStreamModule {
         devices.add_all(by_id.values);
         devices.sort((a, b) => (a.device_id < b.device_id) ? -1 : (a.device_id > b.device_id ? 1 : 0));
 
+        // §11.7: bootstrap the account's device-audit genesis Snapshot (idempotent,
+        // once per account — no-op after the first successful call) asserting
+        // TODAY'S device union as the DAG's initial authorized set. This is both
+        // the v1->v2 bridge for pre-existing accounts and the genesis for brand
+        // new ones. Then try to derive the published set from the persisted DAG
+        // fold instead of the legacy `by_id` union built above. SAFETY FALLBACK:
+        // any failure (no entries, fold verification rejects everything, an
+        // authorized cert that won't round-trip) leaves `devices` untouched —
+        // the legacy union computed above is still exactly what gets published.
+        ensure_device_audit_genesis(devices);
+        Gee.List<Protocol.DeviceListDevice>? dag_devices = try_derive_devices_from_dag(by_id);
+        if (dag_devices != null && dag_devices.size > 0) {
+            devices = new Gee.ArrayList<Protocol.DeviceListDevice>();
+            devices.add_all(dag_devices);
+            devices.sort((a, b) => (a.device_id < b.device_id) ? -1 : (a.device_id > b.device_id ? 1 : 0));
+        }
+
         // Safety net ("no accidental/injected devicelist shrink"): a publish
         // that DROPS a previously-known account device must never happen by
         // accident (transient/buggy/injected partial state). Compare the union
@@ -365,6 +382,148 @@ public class StreamModule : XmppStreamModule {
         // pairing_completed handler calls db.store_remote_device); other devices
         // pick up co-account siblings from the account's own inbound signed
         // devicelist via parse_device_list's is_self branch.
+    }
+
+    // §11.7 v1->v2 bridge / genesis. Idempotent — no-op once ANY device-audit
+    // row already exists for this account (has_device_audit_entries), so this
+    // only ever fires once per account, on whichever publish first has a
+    // non-empty device union to assert. Builds a Snapshot (action=10) entry
+    // over `devices` (the same union publish_device_list would otherwise
+    // publish verbatim), hybrid-signs it with the account AIK, and persists it.
+    // Devices with no persisted certificate are skipped (mirrors the union-build
+    // skip above) since an uncertified device cannot be safely asserted either.
+    // Never throws: any failure just leaves has_device_audit_entries() false, so
+    // the DAG-derive step below stays a no-op and publish_device_list keeps
+    // using the legacy union unchanged — bootstrap failure can never block a
+    // devicelist publish.
+    private void ensure_device_audit_genesis(Gee.List<Protocol.DeviceListDevice> devices) {
+        if (db.has_device_audit_entries(account)) {
+            return;
+        }
+        try {
+            Bytes aik_pub_ed = db.get_local_identity_bytes(account, db.account_identity.aik_pub_ed25519_base64);
+            Bytes aik_pub_ml = db.get_local_identity_bytes(account, db.account_identity.aik_pub_mldsa_base64);
+            Bytes aik_priv_ed = db.get_local_identity_bytes(account, db.account_identity.aik_priv_ed25519_base64);
+            Bytes aik_priv_ml = db.get_local_identity_bytes(account, db.account_identity.aik_priv_mldsa_base64);
+
+            uint8[] aik_marshalled = Protocol.DeviceAuditEntryV2.aik_pub_marshal(
+                bytes_to_uint8_array(aik_pub_ed), bytes_to_uint8_array(aik_pub_ml));
+            uint8[] signer_fp = bytes_to_uint8_array(global::X3dhpq.Crypto.blake2b160(new Bytes(aik_marshalled)));
+
+            var sp = new Protocol.DeviceSnapshotPayload();
+            sp.owner_aik_fp = signer_fp;
+            sp.epoch = 0;
+            foreach (Protocol.DeviceListDevice d in devices) {
+                if (d.cert_bytes.length == 0) {
+                    continue;
+                }
+                var sd = new Protocol.DeviceSnapshotDevice();
+                sd.device_id = d.device_id;
+                sd.cert_bytes = d.cert_bytes;
+                sp.devices.add(sd);
+            }
+            if (sp.devices.size == 0) {
+                // Nothing certifiable to assert yet (e.g. cert issuance still
+                // pending) — try again on the next publish rather than persisting
+                // an empty genesis.
+                return;
+            }
+
+            int? local_device_id = db.get_local_device_id(account);
+            var genesis = new Protocol.DeviceAuditEntryV2();
+            genesis.lamport = 0;
+            genesis.signer_fp = signer_fp;
+            genesis.author_device_id = local_device_id != null ? (uint32) (!) local_device_id : 0;
+            genesis.parents = new Gee.ArrayList<Bytes>();
+            genesis.action = (uint8) Protocol.DeviceAuditActionV2.SNAPSHOT;
+            genesis.payload = Protocol.DeviceAuditEntryV2.build_snapshot_payload(sp);
+            genesis.timestamp = new DateTime.now_utc().to_unix();
+
+            uint8[] signed_part = genesis.signed_part();
+            genesis.signature = bytes_to_uint8_array(global::X3dhpq.Crypto.ed25519_sign(aik_priv_ed, new Bytes(signed_part)));
+            genesis.mldsa_signature = bytes_to_uint8_array(global::X3dhpq.Crypto.mldsa65_sign(aik_priv_ml, new Bytes(signed_part)));
+
+            db.store_device_audit_entry(account, genesis);
+        } catch (GLib.Error e) {
+            warning("x3dhpq: unable to bootstrap device-audit genesis snapshot for %s: %s",
+                account.bare_jid.to_string(), e.message);
+        }
+    }
+
+    // §11.7: attempt to rebuild the published device union from the persisted
+    // device-audit DAG fold instead of the legacy peer_device union. Returns
+    // null on ANY reason to distrust the fold (no entries yet, the resolver
+    // can't establish the local AIK, or the fold authorizes an empty set) so
+    // the caller's SAFETY FALLBACK to the untouched legacy union is exact.
+    // `legacy_by_id` supplies the wire metadata (added_at/flags) for any device
+    // id the fold and the legacy union agree on, so switching the source set
+    // does not change the published SignedPart bytes (§8.3) in the common case
+    // where the fold has not yet diverged from the union it was seeded from.
+    private Gee.List<Protocol.DeviceListDevice>? try_derive_devices_from_dag(
+            Gee.HashMap<uint32, Protocol.DeviceListDevice> legacy_by_id) {
+        Gee.List<Protocol.DeviceAuditEntryV2> entries = db.list_device_audit_entries(account);
+        if (entries.size == 0) {
+            return null;
+        }
+
+        Bytes aik_pub_ed;
+        Bytes aik_pub_ml;
+        string local_fp_hex;
+        try {
+            aik_pub_ed = db.get_local_identity_bytes(account, db.account_identity.aik_pub_ed25519_base64);
+            aik_pub_ml = db.get_local_identity_bytes(account, db.account_identity.aik_pub_mldsa_base64);
+            uint8[] aik_marshalled = Protocol.DeviceAuditEntryV2.aik_pub_marshal(
+                bytes_to_uint8_array(aik_pub_ed), bytes_to_uint8_array(aik_pub_ml));
+            local_fp_hex = Protocol.hex_of(bytes_to_uint8_array(global::X3dhpq.Crypto.blake2b160(new Bytes(aik_marshalled))));
+        } catch (GLib.Error e) {
+            return null;
+        }
+
+        var dag = new Protocol.DeviceDag();
+        foreach (Protocol.DeviceAuditEntryV2 e in entries) {
+            dag.ingest(e.marshal());
+        }
+
+        // Mirrors tests/device_dag.vala's resolver: a single-signer account, so
+        // the resolver just confirms the requested fp is OUR pinned AIK fp and
+        // hands back its public halves; anything else is an entry the DAG must
+        // reject (a foreign signer could never legitimately appear here).
+        Protocol.DeviceAikResolver resolver = (fp_hex, out ed, out ml) => {
+            if (fp_hex != local_fp_hex) {
+                ed = new Bytes(new uint8[0]);
+                ml = new Bytes(new uint8[0]);
+                return false;
+            }
+            ed = aik_pub_ed;
+            ml = aik_pub_ml;
+            return true;
+        };
+
+        Protocol.DeviceState st = dag.recompute(resolver);
+        if (st.authorized.size == 0) {
+            return null;
+        }
+
+        var result = new Gee.ArrayList<Protocol.DeviceListDevice>();
+        foreach (var kv in st.authorized.entries) {
+            Protocol.DeviceCertificate dc = kv.value;
+            var d = new Protocol.DeviceListDevice();
+            d.device_id = dc.device_id;
+            d.cert_bytes = dc.marshal();
+            if (legacy_by_id.has_key(dc.device_id)) {
+                Protocol.DeviceListDevice legacy = legacy_by_id[dc.device_id];
+                d.added_at = legacy.added_at;
+                d.flags = legacy.flags;
+            } else {
+                // A device the fold authorizes that the legacy union never saw
+                // (not reachable yet in this owner-only-genesis phase, but kept
+                // safe for when Add/RemoveDevice entries start being appended).
+                d.added_at = new DateTime.now_utc().to_unix();
+                d.flags = dc.flags;
+            }
+            result.add(d);
+        }
+        return result;
     }
 
     // Republish the account's signed devicelist while explicitly permitting the
