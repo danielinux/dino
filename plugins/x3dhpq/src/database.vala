@@ -1432,9 +1432,15 @@ public class Database : Qlite.Database {
                 e.action = (uint8) (int) r[membership_journal.action];
                 string p_b64 = r[membership_journal.payload_base64];
                 e.payload = (p_b64 != null) ? Base64.decode(p_b64) : new uint8[0];
-                e.signature = new uint8[0];
-                e.mldsa_signature = new uint8[0];
-                e.timestamp = 0;
+                // Restore the hybrid signatures and the entry timestamp — required
+                // so a re-marshalled entry (e.g. bundled into a group-sync
+                // announcement) still verifies. Previously these were dropped,
+                // which produced signature-less, timestamp-0 entries.
+                string? sig_ed_b64 = r[membership_journal.sig_ed_base64];
+                string? sig_ml_b64 = r[membership_journal.sig_mldsa_base64];
+                e.signature = (sig_ed_b64 != null) ? Base64.decode(sig_ed_b64) : new uint8[0];
+                e.mldsa_signature = (sig_ml_b64 != null) ? Base64.decode(sig_ml_b64) : new uint8[0];
+                e.timestamp = (int64) r[membership_journal.created_at];
                 out_entries.add(e);
             } catch (Error err) {
                 continue;
@@ -1454,7 +1460,9 @@ public class Database : Qlite.Database {
             .value(membership_journal.payload_base64, Base64.encode(entry.payload))
             .value(membership_journal.sig_ed_base64, Base64.encode(entry.signature))
             .value(membership_journal.sig_mldsa_base64, Base64.encode(entry.mldsa_signature))
-            .value(membership_journal.created_at, (long) new DateTime.now_utc().to_unix())
+            // Persist the entry's OWN signed timestamp (not store-time) so a
+            // reloaded+re-marshalled entry reproduces the exact signed_part.
+            .value(membership_journal.created_at, (long) entry.timestamp)
             .perform();
     }
 
