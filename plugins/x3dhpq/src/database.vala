@@ -1423,8 +1423,12 @@ public class Database : Qlite.Database {
                 e.prev_hash = new uint8[32];
                 if (ph_hex != null && ph_hex.length == 64) {
                     for (int i = 0; i < 32; i++) {
-                        int hi = ph_hex.get_char(i * 2).digit_value();
-                        int lo = ph_hex.get_char(i * 2 + 1).digit_value();
+                        // xdigit_value() is hex-aware (0-9, a-f, A-F); digit_value()
+                        // only handles 0-9 and returned -1 for a-f, which silently
+                        // zeroed every hex-letter nibble and corrupted the prevHash
+                        // chain link for any non-genesis entry.
+                        int hi = ph_hex.get_char(i * 2).xdigit_value();
+                        int lo = ph_hex.get_char(i * 2 + 1).xdigit_value();
                         if (hi < 0 || lo < 0) { hi = 0; lo = 0; }
                         e.prev_hash[i] = (uint8) ((hi << 4) | lo);
                     }
