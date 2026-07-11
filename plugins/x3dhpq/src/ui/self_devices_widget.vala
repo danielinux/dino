@@ -25,6 +25,8 @@ public class SelfDevicesWidget : Gtk.Box {
     private Gtk.Label local_device_label;
     private Gtk.Label devices_header_label;
     private Gtk.ListBox devices_listbox;
+    private Gtk.Button add_button;
+    private Gtk.Button confirm_button;
 
     public SelfDevicesWidget(Database db, Account account) {
         Object(orientation: Gtk.Orientation.VERTICAL, spacing: 6);
@@ -92,11 +94,11 @@ public class SelfDevicesWidget : Gtk.Box {
             margin_top = 6,
             margin_bottom = 6
         };
-        var add_button = new Gtk.Button.with_label("Add / link a device…");
+        add_button = new Gtk.Button.with_label("Add / link a device…");
         add_button.clicked.connect(() => add_device_requested());
         button_box.append(add_button);
 
-        var confirm_button = new Gtk.Button.with_label("Confirm a device…");
+        confirm_button = new Gtk.Button.with_label("Confirm a device…");
         confirm_button.clicked.connect(() => confirm_device_requested());
         button_box.append(confirm_button);
         append(button_box);
@@ -134,9 +136,27 @@ public class SelfDevicesWidget : Gtk.Box {
         Row? local_row = db.get_local_identity(account.id);
         bool is_primary = local_row != null && ((!) local_row)[db.account_identity.is_primary];
         string device_id_str = device_id != null ? ((uint32) ((!) device_id)).to_string() : "Unavailable";
-        local_device_label.label = is_primary
-            ? @"This device: $device_id_str (Primary)"
-            : @"This device: $device_id_str (Secondary)";
+        // §10.6.6: "authorized" is what actually matters for management/send
+        // decisions (any authorized device — primary or secondary — is an
+        // equal manager); Primary/Secondary is shown only as an informational
+        // label for an already-authorized device. A disabled device (never
+        // confirmed, or revoked) is called out distinctly regardless.
+        bool authorized = db.is_authorized(account);
+        string status_str = authorized
+            ? (is_primary ? "Primary" : "Secondary")
+            : "Disabled — waiting for sync";
+        local_device_label.label = @"This device: $device_id_str ($status_str)";
+
+        // §10.6.6: a disabled device holds no AIK_priv and cannot sign the
+        // AddDevice/RemoveDevice entries these two actions require — grey them
+        // out with an explanatory tooltip instead of letting the human hit a
+        // silent failure after completing a pairing handshake.
+        add_button.sensitive = authorized;
+        add_button.tooltip_text = authorized ? "" :
+            "This device is disabled (waiting for sync) and cannot authorize new devices yet.";
+        confirm_button.sensitive = authorized;
+        confirm_button.tooltip_text = authorized ? "" :
+            "This device is disabled (waiting for sync) and cannot confirm other devices yet.";
 
         // Remove all existing rows from the listbox
         Gtk.Widget? child = devices_listbox.get_first_child();
@@ -235,21 +255,26 @@ public class SelfDevicesWidget : Gtk.Box {
             });
         }
 
-        // Any device can be revoked from here, including a pending/unconfirmed
-        // one (in fact that's the primary way to kick out a rogue addition) —
-        // except the device the user is currently using.
+        // §10.6.6: any AUTHORIZED device can revoke another device from here,
+        // including a pending/unconfirmed one (in fact that's the primary way
+        // to kick out a rogue addition) — except the device the user is
+        // currently using. A disabled (not-yet-authorized) local device holds
+        // no AIK_priv and cannot sign a RemoveDevice entry at all.
+        bool can_revoke = !this_device && db.is_authorized(account);
         var revoke_button = new Gtk.Button.with_label("Revoke") {
             valign = Gtk.Align.CENTER,
-            sensitive = !this_device
+            sensitive = can_revoke
         };
         revoke_button.add_css_class("destructive-action");
-        if (!this_device) {
+        if (can_revoke) {
             int captured_id = device_id;
             revoke_button.clicked.connect(() => {
                 confirm_and_remove(captured_id);
             });
-        } else {
+        } else if (this_device) {
             revoke_button.tooltip_text = "Cannot revoke the device you are currently using";
+        } else {
+            revoke_button.tooltip_text = "This device is disabled (waiting for sync) and cannot revoke other devices yet.";
         }
         row.add_suffix(revoke_button);
 

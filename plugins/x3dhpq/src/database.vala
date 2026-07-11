@@ -1551,6 +1551,30 @@ public class Database : Qlite.Database {
         return ed != null && ed != "" && ml != null && ml != "";
     }
 
+    // §10.6.6: true iff THIS device is currently authorized to act as the
+    // account — confirmed (not pending/disabled) AND holding AIK_priv. This is
+    // the general "any authorized device" gate the XEP requires wherever code
+    // used to check is_local_primary for a management decision (confirm a
+    // device, revoke a device, publish the devicelist/tracker, send as the
+    // account): every confirmed device holding AIK_priv is an equal manager,
+    // not just the one that happened to mint the account.
+    //
+    // Deliberately NOT the same as is_local_primary(): is_local_primary's
+    // underlying is_primary column is set by promote_to_primary and by
+    // apply_paired_identity(share_primary=true), but NOT by
+    // mark_tracker_authorized's AIK_priv-recovery path (§11.8 — "MAY carry the
+    // shared AIK_priv... self-refreshing, device-key-sealed recovery"), which
+    // only ever touches the aik_priv_* columns and intentionally never flips
+    // is_primary. A device that recovered AIK_priv via the tracker therefore
+    // holds signing material and IS authorized per §10.6.6 even though
+    // is_local_primary would (incorrectly) still say false. Use is_authorized()
+    // — not is_local_primary() — for every "can this device act as the
+    // account right now" decision; is_local_primary() is kept only for its
+    // narrower "genuinely first device" / UI Primary-vs-Secondary badge use.
+    public bool is_authorized(Account account) {
+        return !is_pending_enrollment(account) && has_local_aik_priv(account);
+    }
+
     // §11.8: this device successfully decrypted its own <emk> copy of the
     // sealed device-state tracker — re-affirms/records authorization. Only
     // touches AIK private-key material if `aik_priv` is supplied AND we do not
@@ -1802,6 +1826,22 @@ public class Database : Qlite.Database {
     // bootstrap so it never re-fires on every publish.
     public bool has_device_audit_entries(Account account) {
         return device_audit.select().with(device_audit.account_id, "=", account.id).count() > 0;
+    }
+
+    // §10.6.6/§12 account reset: drop every locally-cached device-audit DAG
+    // (§11.7) entry for this account so ensure_device_audit_genesis /
+    // try_derive_devices_from_dag re-bootstrap cleanly under the NEW AIK
+    // instead of permanently failing to resolve against entries signed by the
+    // now-revoked OLD AIK (the fold's resolver only accepts the CURRENTLY
+    // pinned AIK's fingerprint, so leftover OLD-AIK entries could never fold
+    // again anyway — this just clears the dead weight). Mirrors
+    // prune_remote_devices_not_in's "wipe everything from the old identity"
+    // role, but for the v2 DAG cache. Deliberately does NOT touch the v1
+    // account_audit chain (audit_entry table): that chain intentionally
+    // continues unbroken so a RotateAIK entry can still be appended and
+    // hash-linked to it (§12.1 step 3).
+    public void clear_device_audit_entries(Account account) {
+        device_audit.delete().with(device_audit.account_id, "=", account.id).perform();
     }
 
     private string bytes_to_hex_string(uint8[] b) {

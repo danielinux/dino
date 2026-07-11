@@ -756,6 +756,22 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         if (message.encryption != Encryption.X3DHPQ) {
             return;
         }
+        // §10.6.6: a disabled/pending device MUST NOT send as the account —
+        // peers would reject its unverifiable DC (it has no valid AddDevice-
+        // covered certificate yet). This is the last-resort send gate; the
+        // composer-level gate (EncryptionListEntry.encryption_activated_async)
+        // normally catches this earlier with a NO_SEND input-field status, so
+        // reaching here at all means a message was already queued before this
+        // device became disabled (e.g. a live revocation mid-compose). An
+        // AUTHORIZED device is completely unaffected — is_authorized() is true
+        // for every confirmed device holding AIK_priv, exactly the population
+        // that already sent normally before this change.
+        if (!db.is_authorized(conversation.account)) {
+            warning("x3dhpq on_pre_message_send: this device is disabled/pending — refusing to send as %s",
+                conversation.account.bare_jid.to_string());
+            message.marked = Message.Marked.WONTSEND;
+            return;
+        }
         if (conversation.type_ == Conversation.Type.GROUPCHAT_PM) {
             message.marked = Message.Marked.WONTSEND;
             return;
@@ -2060,6 +2076,15 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     // publish-time guard refuses accidental shrinks, so the removal is routed
     // through republish_device_list_removing, which whitelists exactly this id.
     public async bool remove_own_device(Dino.Entities.Account account, uint32 device_id) {
+        // §10.6.6: any AUTHORIZED device may revoke — not only the original
+        // primary — but a disabled/pending device holds no AIK_priv and MUST
+        // NOT be able to append a (forged-looking, unsignable) RemoveDevice
+        // entry. Check explicitly up front for a clear failure rather than
+        // relying on the signing calls below to throw on empty key material.
+        if (!db.is_authorized(account)) {
+            warning("x3dhpq remove_own_device: this device is not authorized (disabled/pending) — refusing to revoke device %u", device_id);
+            return false;
+        }
         XmppStream? stream = app.stream_interactor.get_stream(account);
         StreamModule? module = app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
         if (stream == null || module == null) {

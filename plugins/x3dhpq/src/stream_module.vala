@@ -135,17 +135,17 @@ public class StreamModule : XmppStreamModule {
     public async void publish_current_state(XmppStream stream) {
         db.ensure_local_identity(account);
         db.ensure_local_prekeys(account);
-        // §10.6.1 fresh-device gating: a device that is not yet confirmed primary
-        // (is_primary=false — either still-pending, §10.6.1, or a legitimately
-        // confirmed non-primary/non-shared secondary from pairing) MUST NOT
-        // publish an authoritative devicelist. Resolve pending state first; a
-        // confirmed non-primary secondary's resolve is a no-op (already resolved
-        // via apply_paired_identity) and simply stays unpublished here, same as
-        // today's (correct) behavior for that case.
-        if (!db.is_local_primary(account)) {
+        // §10.6.6 device-authorization gating: a device that is not yet
+        // authorized (not confirmed, or confirmed but without AIK_priv — see
+        // Database.is_authorized) MUST NOT publish an authoritative devicelist.
+        // Resolve pending state first; an already-authorized device's resolve
+        // is a no-op and simply stays unpublished here, same as today's
+        // (correct) behavior for that case. Any authorized device — not only
+        // the one that minted the account — manages from here on (§10.6.6).
+        if (!db.is_authorized(account)) {
             yield resolve_pending_primary(stream);
         }
-        if (db.is_local_primary(account)) {
+        if (db.is_authorized(account)) {
             yield publish_device_list(stream);
         }
         // publish_bundle is NOT gated: a confirmed non-primary device still needs
@@ -159,18 +159,18 @@ public class StreamModule : XmppStreamModule {
         // rather than only when the human happens to already have the
         // "Confirm a device" dialog open. Fire-and-forget: any outcome is
         // surfaced via enrollment_request_received / pair_hello_received.
-        if (db.is_local_primary(account)) {
+        if (db.is_authorized(account)) {
             refresh_pair_hello.begin(stream);
         }
     }
 
-    // §10.6.1: resolves a not-yet-primary local identity by fetching the
+    // §10.6.1: resolves a not-yet-authorized local identity by fetching the
     // account's own devicelist from the server. An EMPTY (or errored) response
     // means no AIK has ever been published for this account anywhere — genuinely
     // the first device — so it is promoted to primary. A NON-empty response means
-    // an existing primary already owns this account's AIK; this device remains
-    // pending (is_primary stays false) and waits to be confirmed via CPace
-    // pairing (§10.6.2), which calls apply_paired_identity and sets is_primary
+    // an existing authorized device already owns this account's AIK; this device
+    // remains pending/disabled and waits to be confirmed via CPace pairing
+    // (§10.6.2), which calls apply_paired_identity and sets is_primary/confirmed
     // explicitly (true if share_primary, false otherwise — either way "resolved").
     private async void resolve_pending_primary(XmppStream stream) {
         // §11.8 sealed device-state tracker: try it FIRST. Unlike the devicelist
@@ -196,7 +196,7 @@ public class StreamModule : XmppStreamModule {
         ArrayList<int> own_devices = yield request_device_list(stream, own_bare);
         // Re-check: a concurrent pairing confirmation may have completed while
         // the fetch was in flight.
-        if (db.is_local_primary(account)) {
+        if (db.is_authorized(account)) {
             return;
         }
         if (own_devices.size == 0) {
@@ -423,16 +423,15 @@ public class StreamModule : XmppStreamModule {
     }
 
     // Live +notify delivery of our own devtracker:0 item. Only meaningful for a
-    // device that is not (yet) the genuine primary — a primary/share_primary
-    // device always holds AIK_priv directly and is never subject to the tracker
-    // revocation signal. Fire-and-forget: any outcome just updates local state
-    // via interpret_device_tracker, exactly as the explicit login-time fetch
-    // would.
+    // device that is not (yet) authorized — an authorized device always holds
+    // AIK_priv directly and is never subject to the tracker revocation signal.
+    // Fire-and-forget: any outcome just updates local state via
+    // interpret_device_tracker, exactly as the explicit login-time fetch would.
     private void handle_devtracker_event(XmppStream stream, Jid from, StanzaNode? item_node) {
         if (!from.bare_jid.equals(account.bare_jid) || item_node == null) {
             return;
         }
-        if (db.is_local_primary(account)) {
+        if (db.is_authorized(account)) {
             return;
         }
         interpret_device_tracker.begin(stream, item_node);
@@ -1845,6 +1844,52 @@ public class StreamModule : XmppStreamModule {
         bool ok = yield publish_audit_entry(stream, seq.to_string(), Base64.encode(entry.marshal()));
         if (!ok) {
             warning("publish_add_device_audit_entry: publish failed for device %u", device_id);
+        }
+        return ok;
+    }
+
+    // §12.1/§11.4 account reset: append + publish a RotateAIK audit entry
+    // (action=3, payload = uint16(new_aik_len)|AccountIdentityPub.marshal() —
+    // unchanged wire format, reusing Protocol.DeviceAuditEntryV2's §11.4 codec
+    // verbatim) to the OLD account's audit:0 chain, signed by the OLD AIK.
+    // Called by encryption_preferences_entry.vala's account-reset flow BEFORE
+    // the new identity has published anything, so any peer still watching the
+    // old chain can chain-detect the reconstruction (§12.3) — though this is
+    // NOT sufficient evidence of authenticity on its own; the receiving peer
+    // still MUST re-verify out-of-band (§12.3 RotationTrustStrict). Only ever
+    // called when the OLD AIK_priv is still held locally; the caller skips
+    // this entirely otherwise (§12: "where the old AIK_priv is still held").
+    // Best-effort: a failure here is logged and returned, never thrown —
+    // the caller must not let this block the reset itself.
+    public async bool publish_rotate_aik_audit_entry(XmppStream stream, Bytes old_aik_priv_ed, Bytes old_aik_priv_mldsa, uint8[] new_aik_marshalled) {
+        var entries = db.list_account_audit_entries(account);
+        uint64 next_seq = 0;
+        uint8[] prev_hash = new uint8[32];
+        if (entries.size > 0) {
+            Protocol.AuditEntry last = entries[entries.size - 1];
+            next_seq = last.seq + 1;
+            prev_hash = last.compute_hash();
+        }
+
+        Protocol.AuditEntry entry = new Protocol.AuditEntry();
+        entry.seq = next_seq;
+        entry.prev_hash = prev_hash;
+        entry.action = (uint8) Protocol.AccountAuditAction.ROTATE_AIK;
+        entry.payload = Protocol.DeviceAuditEntryV2.build_rotate_aik_payload(new_aik_marshalled);
+        entry.timestamp = (int64) new DateTime.now_utc().to_unix();
+        try {
+            uint8[] sp = entry.signed_part();
+            entry.signature = bytes_to_uint8_array(global::X3dhpq.Crypto.ed25519_sign(old_aik_priv_ed, new Bytes(sp)));
+            entry.mldsa_signature = bytes_to_uint8_array(global::X3dhpq.Crypto.mldsa65_sign(old_aik_priv_mldsa, new Bytes(sp)));
+        } catch (GLib.Error e) {
+            warning("publish_rotate_aik_audit_entry: signing failed: %s", e.message);
+            return false;
+        }
+
+        db.store_account_audit_entry(account, entry);
+        bool ok = yield publish_audit_entry(stream, next_seq.to_string(), Base64.encode(entry.marshal()));
+        if (!ok) {
+            warning("publish_rotate_aik_audit_entry: publish failed");
         }
         return ok;
     }

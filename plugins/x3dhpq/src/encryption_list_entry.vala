@@ -39,6 +39,18 @@ public class EncryptionListEntry : Plugins.EncryptionListEntry, Object {
             return;
         }
 
+        // §10.6.6: a disabled device ("waiting for sync" — never confirmed, or
+        // revoked) holds no usable AIK_priv/certificate and MUST NOT send as the
+        // account; peers would reject its unverifiable DC. Block at the composer
+        // level with a clear reason. An AUTHORIZED device (is_authorized() true)
+        // is completely unaffected by this check and proceeds exactly as before.
+        if (!plugin.db.is_authorized(conversation.account)) {
+            input_status_callback(new Plugins.InputFieldStatus(
+                "This device is waiting for sync — it is disabled until an existing authorized device confirms it (Account settings → x3dhpq), or you perform an account reset.",
+                Plugins.InputFieldStatus.MessageType.ERROR, Plugins.InputFieldStatus.InputState.NO_SEND));
+            return;
+        }
+
         if (conversation.type_ == Conversation.Type.CHAT) {
             // Enforce peer AIK trust in 1:1 too, consistently with groups. A
             // ROTATED identity (was trusted, key changed) is NOT authenticated —

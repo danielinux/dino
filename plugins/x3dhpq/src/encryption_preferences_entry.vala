@@ -106,8 +106,8 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
             margin_bottom = 12
         };
         var title = new Gtk.Label(revoked
-            ? "This device was removed from the account"
-            : "This device is waiting to be confirmed") {
+            ? "This device is disabled — removed from the account"
+            : "This device is disabled — waiting for sync") {
             halign = Gtk.Align.START,
             wrap = true
         };
@@ -116,12 +116,14 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
 
         var subtitle = new Gtk.Label(revoked
             ? ("Another device revoked this one's access (§11.8: its sealed device-state tracker copy " +
-                "no longer decrypts). If this was not you, treat this device as compromised. If it was, " +
-                "Associate again from one of your remaining devices to rejoin, or generate a new identity " +
-                "if you have no other working device left.")
-            : ("This account already has an identity on another device. Confirm this device from " +
-                "one of your existing devices to join it — your prior messages, groups and contacts' " +
-                "trust are preserved. Only generate a new identity if you have no working device left.")
+                "no longer decrypts). It cannot send or receive messages as this account while disabled. " +
+                "If this was not you, treat this device as compromised. If it was, Associate again from " +
+                "one of your remaining devices to rejoin, or start an account reset if you have no other " +
+                "working device left.")
+            : ("This account already has an identity on another device. This device cannot send messages " +
+                "until it is confirmed. Confirm it from one of your existing devices to join — your prior " +
+                "messages, groups and contacts' trust are preserved. Only start an account reset if you " +
+                "have no working device left.")
         ) {
             halign = Gtk.Align.START,
             wrap = true
@@ -152,9 +154,9 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
         show_code_button.clicked.connect(() => launch_show_own_code_dialog(account, box));
         button_box.append(show_code_button);
 
-        var new_identity_button = new Gtk.Button.with_label("Generate a new identity instead");
+        var new_identity_button = new Gtk.Button.with_label("Account reset…");
         new_identity_button.add_css_class("destructive-action");
-        new_identity_button.clicked.connect(() => confirm_generate_new_identity(account, box));
+        new_identity_button.clicked.connect(() => confirm_account_reset(account, box));
         button_box.append(new_identity_button);
 
         inner.append(button_box);
@@ -162,46 +164,110 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
         return box;
     }
 
-    // §10.6.4b: destructive override. Mints a brand-new AIK, explicitly
-    // revoking access to everything under the previous identity (if any) —
-    // MUST be presented as such per the XEP.
-    private void confirm_generate_new_identity(Account account, Gtk.Widget anchor) {
+    // §10.6.6/§12: Account reset — the only device-lifecycle operation that
+    // disturbs peers. Mints a brand-new AIK (a new ratchet root), explicitly
+    // de-associating every previously associated device — MUST be presented as
+    // destructive per the XEP.
+    private void confirm_account_reset(Account account, Gtk.Widget anchor) {
         var dialog = new Adw.AlertDialog(
-            "Generate a new identity?",
-            "This creates a brand-new post-quantum identity for this account instead of joining " +
-            "the one your other devices already use.\n\n" +
-            "This is DESTRUCTIVE:\n" +
-            " • All messages under the previous identity are lost.\n" +
-            " • The previous identity is revoked — your other devices will no longer trust it.\n" +
-            " • You lose access to all prior groups (your old identity is no longer a member).\n" +
-            " • Every contact will see your identity change and MUST re-verify you out-of-band " +
-            "before trusting you again.\n\n" +
+            "Reset this account's identity?",
+            "This performs an ACCOUNT RESET: it creates a brand-new post-quantum identity for " +
+            "this account instead of joining the one your other devices already use.\n\n" +
+            "This is DESTRUCTIVE and cannot be undone:\n" +
+            " • All prior messages under the previous identity are lost.\n" +
+            " • The previous identity is revoked and every other device of yours is de-associated " +
+            "from this one — they will no longer be trusted as this account.\n" +
+            " • This account is removed from every prior group (your old identity is no longer a " +
+            "journal member) and MUST be re-invited to each one.\n" +
+            " • Every contact will see your identity change and MUST manually re-verify you " +
+            "out-of-band before trusting you again — messaging with them does not resume until " +
+            "they do.\n\n" +
             "Only do this if you have no other working device for this account."
         );
         dialog.add_response("cancel", "Cancel");
-        dialog.add_response("generate", "Generate new identity");
-        dialog.set_response_appearance("generate", Adw.ResponseAppearance.DESTRUCTIVE);
+        dialog.add_response("reset", "Reset account");
+        dialog.set_response_appearance("reset", Adw.ResponseAppearance.DESTRUCTIVE);
         dialog.default_response = "cancel";
         dialog.close_response = "cancel";
         dialog.response.connect((id) => {
-            if (id != "generate") return;
-            // Wipe any own-account sibling rows learned under the OLD identity
-            // (pending or confirmed) — they are meaningless once the AIK
-            // changes; a stale row here would otherwise resurrect a phantom
-            // "sibling" in the devices-list UI under the new identity.
-            plugin.db.prune_remote_devices_not_in(account, account.bare_jid.to_string(), new Gee.HashSet<int>());
-            plugin.db.mint_fresh_identity(account);
-
-            StreamModule? module = plugin.app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
-            XmppStream? stream = plugin.app.stream_interactor.get_stream(account);
-            if (module != null && stream != null) {
-                // Publishes the fresh, self-signed devicelist under the new AIK
-                // so contacts observe the reconstruction event (§10.6.5) and a
-                // fresh bundle so PQXDH can proceed with the new identity.
-                module.publish_current_state.begin((!) stream);
-            }
+            if (id != "reset") return;
+            perform_account_reset(account);
         });
         dialog.present(anchor);
+    }
+
+    // §10.6.6/§12: performs the account reset. Captures the OLD AIK_priv (if
+    // still held) BEFORE mint_fresh_identity() wipes it, then — after minting —
+    // best-effort signals the OLD chain with a RotateAIK entry signed by the
+    // OLD AIK (§12.1 step 3) and publishes a fresh devicelist containing ONLY
+    // the new device. Wrapped defensively at every step so a failure here can
+    // never crash bootstrap or leave the account without a usable local
+    // identity: mint_fresh_identity() always succeeds locally regardless of
+    // whether the (best-effort, network-dependent) RotateAIK signal does.
+    private void perform_account_reset(Account account) {
+        Bytes? old_aik_priv_ed = null;
+        Bytes? old_aik_priv_mldsa = null;
+        if (plugin.db.has_local_identity(account)) {
+            try {
+                string old_priv_ed_b64 = plugin.db.get_local_identity_string(account, plugin.db.account_identity.aik_priv_ed25519_base64);
+                string old_priv_ml_b64 = plugin.db.get_local_identity_string(account, plugin.db.account_identity.aik_priv_mldsa_base64);
+                if (old_priv_ed_b64 != "" && old_priv_ml_b64 != "") {
+                    old_aik_priv_ed = bytes_from_base64(old_priv_ed_b64);
+                    old_aik_priv_mldsa = bytes_from_base64(old_priv_ml_b64);
+                }
+            } catch (GLib.Error e) {
+                // Missing/corrupt old key material: skip the old-sig RotateAIK
+                // step below (§12: "where the old AIK_priv is still held") —
+                // the reset itself still proceeds.
+                old_aik_priv_ed = null;
+                old_aik_priv_mldsa = null;
+            }
+        }
+
+        // Wipe any own-account sibling rows learned under the OLD identity
+        // (pending or confirmed) — they are meaningless once the AIK changes; a
+        // stale row here would otherwise resurrect a phantom "sibling" in the
+        // devices-list UI, or leak into the fresh devicelist union, under the
+        // new identity. Also drop the locally-cached device-audit DAG (§11.7)
+        // so it re-bootstraps under the new AIK instead of permanently failing
+        // to resolve against entries signed by the now-revoked old one.
+        plugin.db.prune_remote_devices_not_in(account, account.bare_jid.to_string(), new Gee.HashSet<int>());
+        plugin.db.clear_device_audit_entries(account);
+        plugin.db.mint_fresh_identity(account);
+
+        StreamModule? module = plugin.app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
+        XmppStream? stream = plugin.app.stream_interactor.get_stream(account);
+        if (module == null || stream == null) {
+            // Offline: the new identity is minted locally; the devicelist
+            // publish (and the best-effort RotateAIK signal) happen on next
+            // connect via the normal publish_current_state bootstrap path,
+            // which re-derives everything needed from persisted state.
+            return;
+        }
+
+        // §12.1 step 3 / §11.4 RotateAIK: signal the OLD chain, signed by the
+        // OLD AIK, so any peer still watching it can chain-detect the
+        // reconstruction (§12.3) — best-effort, and entirely skipped when the
+        // old AIK_priv was not held locally.
+        if (old_aik_priv_ed != null && old_aik_priv_mldsa != null) {
+            try {
+                Bytes new_aik_pub_ed = plugin.db.get_local_identity_bytes(account, plugin.db.account_identity.aik_pub_ed25519_base64);
+                Bytes new_aik_pub_mldsa = plugin.db.get_local_identity_bytes(account, plugin.db.account_identity.aik_pub_mldsa_base64);
+                uint8[] new_aik_marshalled = Protocol.DeviceAuditEntryV2.aik_pub_marshal(
+                    bytes_to_uint8_array(new_aik_pub_ed), bytes_to_uint8_array(new_aik_pub_mldsa));
+                module.publish_rotate_aik_audit_entry.begin(
+                    (!) stream, (!) old_aik_priv_ed, (!) old_aik_priv_mldsa, new_aik_marshalled);
+            } catch (GLib.Error e) {
+                warning("x3dhpq account reset: RotateAIK signal failed (continuing anyway): %s", e.message);
+            }
+        }
+
+        // Publishes the fresh, self-signed devicelist under the new AIK —
+        // containing ONLY this device, every prior device having just been
+        // pruned above — so contacts observe the reconstruction event
+        // (§10.6.5), plus a fresh bundle so PQXDH can proceed with the new
+        // identity.
+        module.publish_current_state.begin((!) stream);
     }
 
     private void launch_confirm_device_dialog(Account account, Gtk.Widget anchor) {
