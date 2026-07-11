@@ -597,17 +597,27 @@ public class StreamModule : XmppStreamModule {
             bool is_own_local = local_device_id != null && did == (!) local_device_id;
             if (is_own_local || chain_confirmed.contains(did)) {
                 trusted_devices.add(did);
-                db.store_remote_device(account, bare, did, cert_by_id[did], added_by_id[did] ?? 0, e.flags);
+                db.store_remote_device(account, bare, did, cert_by_id[did], added_by_id[did] ?? 0, e.flags, true);
             } else {
+                // §10.6.3: persist the row anyway, but INACTIVE — this keeps it
+                // out of get_remote_device_ids / get_device_list_devices (both
+                // filter active=true, so nothing here changes trust or what we
+                // republish), while making it queryable via
+                // db.get_pending_own_device_ids so the devices-list UI can
+                // surface it as a pending/unconfirmed security event instead of
+                // silently dropping it.
                 warning("x3dhpq: sibling device %d appears in own devicelist but has NO " +
                     "valid AddDevice audit entry — NOT auto-trusting (§10.6.3)", did);
+                db.store_remote_device(account, bare, did, cert_by_id[did], added_by_id[did] ?? 0, e.flags, false);
             }
         }
         db.store_device_list_payload(account, bare, id, node.to_string());
-        // Only prune to the CHAIN-CONFIRMED set, not the full announced set — an
-        // unconfirmed sibling must not linger in peer_device from an earlier,
-        // less strict acceptance either.
-        db.prune_remote_devices_not_in(account, bare, trusted_devices);
+        // Prune against the FULL announced set (devices), not just the
+        // chain-confirmed one — otherwise the inactive rows just stored above
+        // for unconfirmed siblings would be deleted immediately by this same
+        // pass. A device disappearing entirely from the signed list (confirmed
+        // or not) is still torn down, per §8.6.
+        db.prune_remote_devices_not_in(account, bare, devices);
         device_list_loaded(jid, trusted_devices);
         return trusted_devices;
     }
@@ -1175,6 +1185,34 @@ public class StreamModule : XmppStreamModule {
             .set_access_model(Pubsub.ACCESS_MODEL_WHITELIST);
         return yield stream.get_module(Pubsub.Module.IDENTITY).publish(
             stream, null, Protocol.NS_PAIR, "current", hello, options);
+    }
+
+    // §10.6.2 "Confirm a device" entry point: the existing/primary device's
+    // "confirm a waiting device" dialog is opened by the human AFTER (or
+    // before) the pending device has already published its <pair-hello>. The
+    // live +notify path (handle_pair_hello_event) only fires for a dialog that
+    // was already listening at delivery time, so a hello published first would
+    // otherwise be missed. This proactively fetches the current pair:0 item —
+    // the same one +notify would have delivered — and, if present, routes it
+    // through the identical handle_pair_hello_node path (so the outcome, and
+    // the pair_hello_received signal any listening dialog reacts to, is
+    // byte-identical regardless of ordering).
+    public async void refresh_pair_hello(XmppStream stream) {
+        StanzaNode pubsub_node = new StanzaNode.build("pubsub", Pubsub.NS_URI).add_self_xmlns()
+            .put_node(new StanzaNode.build("items", Pubsub.NS_URI)
+                .put_attribute("node", Protocol.NS_PAIR));
+        Iq.Stanza iq = new Iq.Stanza.get(pubsub_node);
+        try {
+            Iq.Stanza result = yield stream.get_module(Iq.Module.IDENTITY).send_iq_async(stream, iq);
+            if (result.is_error()) return;
+            StanzaNode? item = result.stanza.get_deep_subnode(
+                Pubsub.NS_URI + ":pubsub", Pubsub.NS_URI + ":items", Pubsub.NS_URI + ":item");
+            if (item != null && item.sub_nodes.size > 0) {
+                handle_pair_hello_node(stream, account.bare_jid, item.sub_nodes[0]);
+            }
+        } catch (Error e) {
+            warning("refresh_pair_hello: request failed: %s", e.message);
+        }
     }
 
     // ── Inbound message handler ────────────────────────────────────────────────

@@ -5,7 +5,7 @@ using Xmpp;
 namespace Dino.Plugins.X3dhpq {
 
 public class Database : Qlite.Database {
-    private const int VERSION = 7;
+    private const int VERSION = 8;
 
     public class AccountIdentityTable : Table {
         public Column<int> id = new Column.Integer("id") { primary_key = true, auto_increment = true };
@@ -23,10 +23,18 @@ public class Database : Qlite.Database {
         public Column<string> dik_pub_mldsa_base64 = new Column.NonNullText("dik_pub_mldsa_base64");
         public Column<string> dik_priv_mldsa_base64 = new Column.NonNullText("dik_priv_mldsa_base64");
         public Column<long> created_at = new Column.Long("created_at") { not_null = true };
+        // §10.6.1/§10.6.4 enrollment-state flag, distinct from is_primary: true
+        // once THIS device's local identity has been resolved — either it was
+        // confirmed as genuinely primary/first-device (promote_to_primary) or it
+        // was admitted as a secondary via CPace pairing (apply_paired_identity).
+        // False for a freshly generated (ensure_local_identity) row that has not
+        // yet been resolved either way — the pending-enrollment window the
+        // account-settings banner surfaces. Added at schema v8.
+        public Column<bool> confirmed = new Column.BoolInt("confirmed") { min_version = 8, default = "0" };
 
         internal AccountIdentityTable(Database db) {
             base(db, "account_identity");
-            init({ id, account_id, device_id, is_primary, aik_pub_ed25519_base64, aik_priv_ed25519_base64, aik_pub_mldsa_base64, aik_priv_mldsa_base64, dik_pub_ed25519_base64, dik_priv_ed25519_base64, dik_pub_x25519_base64, dik_priv_x25519_base64, dik_pub_mldsa_base64, dik_priv_mldsa_base64, created_at });
+            init({ id, account_id, device_id, is_primary, aik_pub_ed25519_base64, aik_priv_ed25519_base64, aik_pub_mldsa_base64, aik_priv_mldsa_base64, dik_pub_ed25519_base64, dik_priv_ed25519_base64, dik_pub_x25519_base64, dik_priv_x25519_base64, dik_pub_mldsa_base64, dik_priv_mldsa_base64, created_at, confirmed });
             index("x3dhpq_account_identity_account_idx", { account_id }, true);
         }
     }
@@ -598,6 +606,26 @@ public class Database : Qlite.Database {
         return devices;
     }
 
+    // §10.6.3: device ids seen in a signed, version-valid OWN devicelist that
+    // are NOT (yet) covered by a chain-verified AddDevice audit entry. Stored
+    // by parse_device_list's is_self branch with peer_device.active=false
+    // (store_remote_device's `active` parameter) precisely so they stay
+    // queryable here without ever being treated as trusted by
+    // get_remote_device_ids / get_device_list_devices (both filter
+    // active=true). Surfaced by the devices-list UI as a pending/unconfirmed
+    // security event per §10.6.3 rather than silently dropped.
+    public Gee.List<int> get_pending_own_device_ids(Account account) {
+        Gee.ArrayList<int> devices = new Gee.ArrayList<int>();
+        string own_jid = account.bare_jid.to_string();
+        foreach (Row row in peer_device.select()
+            .with(peer_device.account_id, "=", account.id)
+            .with(peer_device.bare_jid, "=", own_jid)
+            .with(peer_device.active, "=", false)) {
+            devices.add(row[peer_device.device_id]);
+        }
+        return devices;
+    }
+
     public void store_session(Account account, string bare_jid, int device_id, Protocol.SessionState state) {
         pairwise_session.upsert()
             .value(pairwise_session.account_id, account.id, true)
@@ -1112,7 +1140,7 @@ public class Database : Qlite.Database {
             .perform();
     }
 
-    public void store_remote_device(Account account, string bare_jid, int device_id, string? certificate_base64 = null, long added_at = 0, uint8 flags = 1) {
+    public void store_remote_device(Account account, string bare_jid, int device_id, string? certificate_base64 = null, long added_at = 0, uint8 flags = 1, bool active = true) {
         // Preserve the earliest known added_at (first-seen) for this device id:
         // once a peer has published a device with a given added_at we keep it so
         // the reconstructed SignedPart stays stable even if a later republish
@@ -1134,7 +1162,7 @@ public class Database : Qlite.Database {
             .value(peer_device.bare_jid, bare_jid, true)
             .value(peer_device.device_id, device_id, true)
             .value(peer_device.certificate_base64, certificate_base64)
-            .value(peer_device.active, true)
+            .value(peer_device.active, active)
             .value(peer_device.updated_at, (long) new DateTime.now_utc().to_unix())
             .value(peer_device.created_at, (long) new DateTime.now_utc().to_unix())
             .value(peer_device.added_at, effective_added_at)
@@ -1261,6 +1289,33 @@ public class Database : Qlite.Database {
         }
     }
 
+    // Per-device identity fingerprint for a device listed under `bare_jid`
+    // (used for the account's own sibling devices in the devices-list UI, §10.6),
+    // derived from that device's DIK public keys the same way get_aik_fingerprint
+    // derives the account-level fingerprint from the AIK. All devices under one
+    // account share a single AIK (§7) — that is the account fingerprint shown
+    // prominently once — but each device holds its own DIK, so this value
+    // differs per device and lets a user out-of-band-compare a specific device.
+    // Returns null if we have not yet learned this device's DIK (e.g. its bundle
+    // has not been fetched).
+    public string? get_device_fingerprint(Account account, string bare_jid, int device_id) {
+        Row? row = peer_device.select()
+            .with(peer_device.account_id, "=", account.id)
+            .with(peer_device.bare_jid, "=", bare_jid)
+            .with(peer_device.device_id, "=", device_id)
+            .single().row().inner;
+        if (row == null) return null;
+        string? dik_ed = ((!) row)[peer_device.dik_pub_ed25519_base64];
+        string? dik_ml = ((!) row)[peer_device.dik_pub_mldsa_base64];
+        if (dik_ed == null || dik_ml == null) return null;
+        try {
+            return account_fingerprint(bytes_from_base64((!) dik_ed), bytes_from_base64((!) dik_ml));
+        } catch (GLib.Error e) {
+            warning("Unable to compute x3dhpq device fingerprint for %s/%d: %s", bare_jid, device_id, e.message);
+            return null;
+        }
+    }
+
     // §10.6.1 fresh-device gating: a freshly-generated identity NEVER self-claims
     // primary. It always mints device-level material (DIK) plus a throwaway AIK
     // (account_identity's AIK columns are NOT NULL, so unlike PQ's two-table split
@@ -1363,7 +1418,20 @@ public class Database : Qlite.Database {
         account_identity.update()
             .with(account_identity.account_id, "=", account.id)
             .set(account_identity.is_primary, true)
+            .set(account_identity.confirmed, true)
             .perform();
+    }
+
+    // §10.6.4 (UX): true while this device's local identity row exists but has
+    // not yet been resolved either way (see AccountIdentityTable.confirmed) —
+    // i.e. it detected an existing account AIK on first run and is waiting to
+    // be confirmed by an existing device via CPace pairing (§10.6.2). False
+    // once resolved (genuinely-first-device primary, or a paired-in secondary)
+    // and false if no local identity row exists yet at all (nothing to show).
+    public bool is_pending_enrollment(Account account) {
+        Row? row = get_local_identity(account.id);
+        if (row == null) return false;
+        return !((!) row)[account_identity.confirmed];
     }
 
     // Adopt the pairing primary's account identity (AIK) into a new device's
@@ -1383,7 +1451,11 @@ public class Database : Qlite.Database {
             .with(account_identity.account_id, "=", account.id)
             .set(account_identity.device_id, (int) result.cert.device_id)
             .set(account_identity.aik_pub_ed25519_base64, Base64.encode(result.aik_pub.pub_ed25519))
-            .set(account_identity.aik_pub_mldsa_base64, Base64.encode(result.aik_pub.pub_mldsa));
+            .set(account_identity.aik_pub_mldsa_base64, Base64.encode(result.aik_pub.pub_mldsa))
+            // §10.6.4: pairing completion — success or share_primary=false — always
+            // resolves the pending-enrollment window; this device is now a
+            // confirmed (primary or secondary) member of the account.
+            .set(account_identity.confirmed, true);
         if (result.aik_priv != null) {
             Protocol.AccountIdentityKey aik_priv = (!) result.aik_priv;
             update

@@ -28,9 +28,20 @@ public class PairNewDeviceDialog : Gtk.Window {
     private Protocol.PairingExisting? existing;
     private Jid? peer_jid;
 
-    public PairNewDeviceDialog(Gtk.Window parent, Database db, Account account, StreamModule stream_module, XmppStream? stream = null) {
+    // §10.6.2 "Confirm a device" direction: this device (existing/primary)
+    // does NOT generate its own code — the user types in / scans the code
+    // that the PENDING device is showing (PairToExistingDialog with
+    // show_own_code=true). Everything else (the PairingExisting FSM, the
+    // pair-hello rendezvous handling) is identical to the "Add device"
+    // direction; only who originates the code differs (§10.6.2).
+    private bool confirm_mode;
+    private bool code_confirmed = false;
+    private Gtk.Entry? code_entry;
+    private Gtk.Button? confirm_button;
+
+    public PairNewDeviceDialog(Gtk.Window parent, Database db, Account account, StreamModule stream_module, XmppStream? stream = null, bool confirm_mode = false) {
         Object(
-            title: "Add new device",
+            title: confirm_mode ? "Confirm a device" : "Add new device",
             modal: true,
             transient_for: parent,
             default_width: 400,
@@ -41,6 +52,7 @@ public class PairNewDeviceDialog : Gtk.Window {
         this.account = account;
         this.stream_module = stream_module;
         this.active_stream = stream;
+        this.confirm_mode = confirm_mode;
 
         Row? identity_row = db.get_local_identity(account.id);
         if (identity_row != null) {
@@ -52,11 +64,17 @@ public class PairNewDeviceDialog : Gtk.Window {
             aik = key;
         }
 
-        try {
-            code = Protocol.PairingCode.generate();
-        } catch (GLib.Error e) {
-            code = "0000000000";
-            warning("PairNewDeviceDialog: failed to generate pairing code: %s", e.message);
+        if (confirm_mode) {
+            // The code is user-supplied once they've read it off the pending
+            // device; nothing to generate yet.
+            code = "";
+        } else {
+            try {
+                code = Protocol.PairingCode.generate();
+            } catch (GLib.Error e) {
+                code = "0000000000";
+                warning("PairNewDeviceDialog: failed to generate pairing code: %s", e.message);
+            }
         }
 
         try {
@@ -88,7 +106,7 @@ public class PairNewDeviceDialog : Gtk.Window {
 
     private void build_ui() {
         var header = new Gtk.HeaderBar();
-        header.set_title_widget(new Gtk.Label("Add new device"));
+        header.set_title_widget(new Gtk.Label(confirm_mode ? "Confirm a device" : "Add new device"));
         var cancel_button = new Gtk.Button.with_label("Cancel");
         cancel_button.clicked.connect(() => cancel());
         header.pack_start(cancel_button);
@@ -101,10 +119,52 @@ public class PairNewDeviceDialog : Gtk.Window {
             margin_end = 18
         };
 
-        var hint_label = new Gtk.Label("Show this code on the new device") {
+        if (confirm_mode) {
+            var hint_label = new Gtk.Label(
+                "Enter (or scan) the code shown on the device that's waiting to be confirmed."
+            ) {
+                halign = Gtk.Align.CENTER,
+                wrap = true
+            };
+            box.append(hint_label);
+
+            var entry = new Gtk.Entry() {
+                placeholder_text = "DDD-DDD-DDD-C",
+                input_purpose = Gtk.InputPurpose.DIGITS,
+                max_length = 14,
+                halign = Gtk.Align.FILL,
+                hexpand = true,
+                margin_top = 6
+            };
+            entry.changed.connect(on_code_entry_changed);
+            entry.activate.connect(on_confirm_clicked);
+            code_entry = entry;
+            box.append(entry);
+
+            var button = new Gtk.Button.with_label("Confirm") {
+                halign = Gtk.Align.FILL,
+                margin_top = 6
+            };
+            button.add_css_class("suggested-action");
+            button.clicked.connect(on_confirm_clicked);
+            confirm_button = button;
+            box.append(button);
+
+            status_label = new Gtk.Label("Awaiting code.") {
+                halign = Gtk.Align.CENTER,
+                margin_top = 6
+            };
+            status_label.add_css_class("dim-label");
+            box.append(status_label);
+
+            set_child(box);
+            return;
+        }
+
+        var hint_label2 = new Gtk.Label("Show this code on the new device") {
             halign = Gtk.Align.CENTER
         };
-        box.append(hint_label);
+        box.append(hint_label2);
 
         string formatted = Protocol.PairingCode.format(code);
         var code_label = new Gtk.Label(formatted) {
@@ -135,6 +195,60 @@ public class PairNewDeviceDialog : Gtk.Window {
         box.append(status_label);
 
         set_child(box);
+    }
+
+    // Suppress re-entrant `changed` signals while we rewrite the entry text.
+    private bool formatting = false;
+
+    private void on_code_entry_changed() {
+        if (formatting || code_entry == null) return;
+        Gtk.Entry entry = (!) code_entry;
+        formatting = true;
+
+        var sb = new StringBuilder();
+        for (int i = 0; i < entry.text.length; i++) {
+            unichar c = entry.text[i];
+            if (c >= '0' && c <= '9') sb.append_unichar(c);
+        }
+        string digits = sb.str.length > 10 ? sb.str[0:10] : sb.str;
+        var formatted = new StringBuilder();
+        for (int i = 0; i < digits.length; i++) {
+            if (i == 3 || i == 6 || i == 9) formatted.append_c('-');
+            formatted.append_unichar(digits[i]);
+        }
+        if (entry.text != formatted.str) {
+            entry.text = formatted.str;
+            entry.set_position(-1);
+        }
+        entry.remove_css_class("error");
+        formatting = false;
+    }
+
+    // §10.6.2 "Confirm a device": the user has read the code off the pending
+    // device and typed/scanned it here. Lock it in, then proactively fetch
+    // any pair-hello the pending device may have already published (covers
+    // the "newcomer showed its code first" ordering — see
+    // StreamModule.refresh_pair_hello) in addition to the live +notify path
+    // already wired in wire_signals().
+    private void on_confirm_clicked() {
+        if (code_entry == null) return;
+        Gtk.Entry entry = (!) code_entry;
+        string parsed;
+        try {
+            parsed = Protocol.PairingCode.parse(entry.text);
+        } catch (Protocol.PairingCodeError e) {
+            set_status("Invalid code: %s".printf(e.message));
+            entry.add_css_class("error");
+            return;
+        }
+        code = parsed;
+        code_confirmed = true;
+        entry.sensitive = false;
+        if (confirm_button != null) ((!) confirm_button).sensitive = false;
+        set_status("Waiting for that device to respond…");
+        if (active_stream != null) {
+            stream_module.refresh_pair_hello.begin((!) active_stream);
+        }
     }
 
     private string build_qr_uri() {
@@ -197,6 +311,18 @@ public class PairNewDeviceDialog : Gtk.Window {
     }
 
     private void on_pair_hello_received(Jid new_full_jid, uint8[] hello_sid) {
+        if (confirm_mode && !code_confirmed) {
+            // Not yet — the user hasn't entered/confirmed a code, so we don't
+            // know which pending device (if several were mid-rendezvous) or
+            // what code to run CPace with. on_confirm_clicked() calls
+            // refresh_pair_hello() once a code is confirmed, which re-delivers
+            // this same event.
+            return;
+        }
+        if (existing != null) {
+            // Already mid-handshake with a peer for this dialog instance.
+            return;
+        }
         if (aik == null) {
             set_status("Failed: local identity key not available");
             pairing_failed("local identity key not available");

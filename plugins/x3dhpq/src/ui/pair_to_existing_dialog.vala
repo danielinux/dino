@@ -8,17 +8,26 @@ using Xmpp;
 namespace Dino.Plugins.X3dhpq.UI {
 
 /**
- * PairToExistingDialog walks a brand-new device through joining an existing
- * account via the x3dhpq pairing protocol (PairingNew FSM).
+ * PairToExistingDialog walks a brand-new (or still-pending) device through
+ * joining an existing account via the x3dhpq pairing protocol (PairingNew
+ * FSM). Both §10.6.2 confirmation directions share this one FSM/rendezvous
+ * path — only the pairing CODE's origin differs:
+ *
+ *  - `show_own_code = false` (default): "primary presents the code" — the
+ *    user types in / scans the 10-digit code that is displayed on the
+ *    EXISTING device (PairNewDeviceDialog).
+ *  - `show_own_code = true`: "new device presents the code" (§10.6.2's
+ *    SHOULD-support direction) — THIS device generates and displays its own
+ *    code/sid; the user walks to an existing/primary device and enters it
+ *    there (see ConfirmDeviceDialog), which then drives the CPace exchange
+ *    exactly as if the code had been typed in from an existing device's
+ *    screen. The rendezvous (publish <pair-hello> to our own pair:0 node) and
+ *    the PairingNew FSM are identical in both cases — the existing device
+ *    always sends PAKE1 first (§10.1a).
  *
  * The dialog is modal and transient over the given parent window.  When
  * pairing succeeds it emits `pairing_completed`; on failure it emits
  * `pairing_failed`.  The caller may also call `cancel()` at any time.
- *
- * Assumed StreamModule API (to be wired in the D-STREAM task):
- *   - void register_pair_session(uint8[] sid, Jid peer_bare_jid, int role)
- *   - void send_pair_stanza(Jid to_jid, uint8[] sid, Protocol.PairingMsg msg)
- *   - signal pair_message_received(uint8[] sid, Jid from_jid, Protocol.PairingMsg msg)
  */
 public class PairToExistingDialog : Adw.Window {
 
@@ -42,17 +51,22 @@ public class PairToExistingDialog : Adw.Window {
 
     // ── UI widgets ─────────────────────────────────────────────────────────────
 
-    private Gtk.Entry  code_entry;
-    private Gtk.Button pair_button;
+    private Gtk.Entry? code_entry;
+    private Gtk.Button? pair_button;
     private Gtk.Label  status_label;
+
+    // §10.6.2 "new device presents the code" direction: when true, this
+    // device generates and displays its own code/sid instead of asking the
+    // user to type one in.
+    private bool show_own_code;
 
     // ── Constructor ────────────────────────────────────────────────────────────
 
-    public PairToExistingDialog(Gtk.Window parent, Database db, Account account, StreamModule stream_module, XmppStream? stream = null) {
+    public PairToExistingDialog(Gtk.Window parent, Database db, Account account, StreamModule stream_module, XmppStream? stream = null, bool show_own_code = false) {
         Object(
             modal: true,
             transient_for: parent,
-            title: "Pair this device",
+            title: show_own_code ? "Show this device's code" : "Pair this device",
             default_width: 400,
             default_height: -1
         );
@@ -61,8 +75,13 @@ public class PairToExistingDialog : Adw.Window {
         this.account       = account;
         this.stream_module = stream_module;
         this.active_stream = stream;
+        this.show_own_code = show_own_code;
 
         build_ui();
+
+        if (show_own_code) {
+            begin_show_own_code();
+        }
     }
 
     // ── Public API ─────────────────────────────────────────────────────────────
@@ -81,76 +100,96 @@ public class PairToExistingDialog : Adw.Window {
         cancel_btn.clicked.connect(() => cancel());
         header.pack_start(cancel_btn);
 
-        // Instruction label.
-        var instruction = new Gtk.Label(
-            "Either type the 10-digit code shown on the existing device, or scan its QR."
-        ) {
-            halign    = Gtk.Align.START,
-            wrap      = true,
-            margin_start  = 12,
-            margin_end    = 12,
-            margin_top    = 12,
-            margin_bottom = 6
-        };
+        // Vertical content box.
+        var content = new Gtk.Box(Gtk.Orientation.VERTICAL, 0);
 
-        // QR scan button — camera widget not yet wired; shows an informational
-        // dialog when clicked.
-        // TODO: wire a real camera/QR-scan widget once the dependency is in place.
-        var qr_button = new Gtk.Button.with_label("Scan QR") {
-            halign       = Gtk.Align.START,
-            margin_start = 12,
-            margin_end   = 12,
-            margin_bottom = 6
-        };
-        qr_button.clicked.connect(() => {
-            var dlg = new Adw.AlertDialog(
-                "QR scanning not yet available",
-                "Please type the 10-digit code from the existing device manually.");
-            dlg.add_response("ok", "OK");
-            dlg.present(this);
-        });
+        if (show_own_code) {
+            // §10.6.2 "new device presents the code": no entry, no QR-scan —
+            // we generate and DISPLAY our own code/sid (mirrors
+            // PairNewDeviceDialog's own code display), and the pairing kicks
+            // off automatically once built (begin_show_own_code()).
+            var instruction = new Gtk.Label(
+                "Show this code to whoever is confirming this device on your existing device, or read it out."
+            ) {
+                halign    = Gtk.Align.START,
+                wrap      = true,
+                margin_start  = 12,
+                margin_end    = 12,
+                margin_top    = 12,
+                margin_bottom = 6
+            };
+            content.append(instruction);
+        } else {
+            // Instruction label.
+            var instruction = new Gtk.Label(
+                "Either type the 10-digit code shown on the existing device, or scan its QR."
+            ) {
+                halign    = Gtk.Align.START,
+                wrap      = true,
+                margin_start  = 12,
+                margin_end    = 12,
+                margin_top    = 12,
+                margin_bottom = 6
+            };
+            content.append(instruction);
 
-        // Pairing-code entry — placeholder shows expected format.
-        code_entry = new Gtk.Entry() {
-            placeholder_text = "DDD-DDD-DDD-C",
-            input_purpose    = Gtk.InputPurpose.DIGITS,
-            max_length       = 14,   // 10 digits + 3 hyphens
-            halign           = Gtk.Align.FILL,
-            hexpand          = true,
-            margin_start     = 12,
-            margin_end       = 12,
-            margin_bottom    = 6
-        };
-        // Auto-format: insert hyphens as the user types past positions 3, 6, 9.
-        code_entry.changed.connect(on_entry_changed);
-        // Allow Enter key to trigger pairing.
-        code_entry.activate.connect(on_pair_clicked);
+            // QR scan button — camera widget not yet wired; shows an
+            // informational dialog when clicked.
+            // TODO: wire a real camera/QR-scan widget once the dependency is in place.
+            var qr_button = new Gtk.Button.with_label("Scan QR") {
+                halign       = Gtk.Align.START,
+                margin_start = 12,
+                margin_end   = 12,
+                margin_bottom = 6
+            };
+            qr_button.clicked.connect(() => {
+                var dlg = new Adw.AlertDialog(
+                    "QR scanning not yet available",
+                    "Please type the 10-digit code from the existing device manually.");
+                dlg.add_response("ok", "OK");
+                dlg.present(this);
+            });
+            content.append(qr_button);
 
-        // "Pair" button.
-        pair_button = new Gtk.Button.with_label("Pair") {
-            halign       = Gtk.Align.FILL,
-            margin_start = 12,
-            margin_end   = 12,
-            margin_bottom = 6
-        };
-        pair_button.add_css_class("suggested-action");
-        pair_button.clicked.connect(on_pair_clicked);
+            // Pairing-code entry — placeholder shows expected format.
+            var entry = new Gtk.Entry() {
+                placeholder_text = "DDD-DDD-DDD-C",
+                input_purpose    = Gtk.InputPurpose.DIGITS,
+                max_length       = 14,   // 10 digits + 3 hyphens
+                halign           = Gtk.Align.FILL,
+                hexpand          = true,
+                margin_start     = 12,
+                margin_end       = 12,
+                margin_bottom    = 6
+            };
+            // Auto-format: insert hyphens as the user types past positions 3, 6, 9.
+            entry.changed.connect(on_entry_changed);
+            // Allow Enter key to trigger pairing.
+            entry.activate.connect(on_pair_clicked);
+            code_entry = entry;
+            content.append(entry);
+
+            // "Pair" button.
+            var button = new Gtk.Button.with_label("Pair") {
+                halign       = Gtk.Align.FILL,
+                margin_start = 12,
+                margin_end   = 12,
+                margin_bottom = 6
+            };
+            button.add_css_class("suggested-action");
+            button.clicked.connect(on_pair_clicked);
+            pair_button = button;
+            content.append(button);
+        }
 
         // Status label — keeps the user informed at each step.
-        status_label = new Gtk.Label("Awaiting code.") {
+        status_label = new Gtk.Label(show_own_code ? "Generating code…" : "Awaiting code.") {
             halign       = Gtk.Align.START,
             wrap         = true,
             margin_start = 12,
             margin_end   = 12,
             margin_bottom = 12
         };
-
-        // Vertical content box.
-        var content = new Gtk.Box(Gtk.Orientation.VERTICAL, 0);
-        content.append(instruction);
-        content.append(qr_button);
-        content.append(code_entry);
-        content.append(pair_button);
         content.append(status_label);
 
         // Wrap content in a ToolbarView so the header bar sits at the top.
@@ -171,13 +210,14 @@ public class PairToExistingDialog : Adw.Window {
      * Only digits are kept; hyphens are inserted automatically.
      */
     private void on_entry_changed() {
-        if (formatting) {
+        if (formatting || code_entry == null) {
             return;
         }
+        Gtk.Entry entry = (!) code_entry;
         formatting = true;
 
         // Strip everything except digits.
-        string raw = code_entry.text;
+        string raw = entry.text;
         var sb = new StringBuilder();
         for (int i = 0; i < raw.length; i++) {
             unichar c = raw[i];
@@ -197,14 +237,14 @@ public class PairToExistingDialog : Adw.Window {
             formatted.append_unichar(digits[i]);
         }
 
-        if (code_entry.text != formatted.str) {
-            code_entry.text = formatted.str;
+        if (entry.text != formatted.str) {
+            entry.text = formatted.str;
             // Move cursor to end.
-            code_entry.set_position(-1);
+            entry.set_position(-1);
         }
 
         // Clear any previous error styling.
-        code_entry.remove_css_class("error");
+        entry.remove_css_class("error");
 
         formatting = false;
     }
@@ -213,30 +253,73 @@ public class PairToExistingDialog : Adw.Window {
 
     private void on_pair_clicked() {
         // Prevent double-clicks.
-        pair_button.sensitive = false;
-        code_entry.sensitive  = false;
+        if (pair_button != null) ((!) pair_button).sensitive = false;
+        if (code_entry != null) ((!) code_entry).sensitive  = false;
 
         // Validate the code.
-        string raw_input = code_entry.text;
+        string raw_input = code_entry != null ? ((!) code_entry).text : "";
         string parsed_code;
         try {
             parsed_code = Protocol.PairingCode.parse(raw_input);
         } catch (Protocol.PairingCodeError e) {
             set_status("Invalid code: %s".printf(e.message));
-            code_entry.add_css_class("error");
-            pair_button.sensitive = true;
-            code_entry.sensitive  = true;
+            if (code_entry != null) ((!) code_entry).add_css_class("error");
+            if (pair_button != null) ((!) pair_button).sensitive = true;
+            if (code_entry != null) ((!) code_entry).sensitive  = true;
             return;
         }
 
+        start_pairing(parsed_code);
+    }
+
+    // §10.6.2 "new device presents the code": generate our own code + sid,
+    // display it (build_ui already rendered the placeholder), and kick off
+    // pairing immediately — there is no user input to wait for on this side.
+    private void begin_show_own_code() {
+        string code;
+        try {
+            code = Protocol.PairingCode.generate();
+        } catch (GLib.Error e) {
+            string msg = "Failed to generate pairing code: %s".printf(e.message);
+            set_status(msg);
+            pairing_failed(msg);
+            return;
+        }
+
+        string formatted = Protocol.PairingCode.format(code);
+        var code_label = new Gtk.Label(formatted) {
+            halign = Gtk.Align.CENTER,
+            selectable = true,
+            margin_top = 6,
+            margin_bottom = 6
+        };
+        code_label.add_css_class("monospace");
+        Pango.AttrList attrs = new Pango.AttrList();
+        attrs.insert(Pango.attr_scale_new(2.0));
+        code_label.set_attributes(attrs);
+        // Insert the code display right before the status label.
+        Gtk.Widget? content_parent = status_label.get_parent();
+        if (content_parent != null) {
+            code_label.insert_before((!) content_parent, status_label);
+        }
+
+        set_status("Waiting for your other device to confirm…");
+        start_pairing(code);
+    }
+
+    // Shared FSM/rendezvous kickoff for both directions of §10.6.2: `code` is
+    // either user-typed (existing device presented it) or self-generated
+    // (this device presents it, show_own_code=true) — the FSM and rendezvous
+    // are identical either way.
+    private void start_pairing(string parsed_code) {
         // Load our DeviceIdentityKey from the database.
         Protocol.DeviceIdentityKey? dik = load_local_dik();
         if (dik == null) {
             string msg = "No local device identity found. Please set up this account first.";
             set_status(msg);
             pairing_failed(msg);
-            pair_button.sensitive = true;
-            code_entry.sensitive  = true;
+            if (pair_button != null) ((!) pair_button).sensitive = true;
+            if (code_entry != null) ((!) code_entry).sensitive  = true;
             return;
         }
 
@@ -248,8 +331,8 @@ public class PairToExistingDialog : Adw.Window {
             string msg = "Failed to generate session ID: %s".printf(e.message);
             set_status(msg);
             pairing_failed(msg);
-            pair_button.sensitive = true;
-            code_entry.sensitive  = true;
+            if (pair_button != null) ((!) pair_button).sensitive = true;
+            if (code_entry != null) ((!) code_entry).sensitive  = true;
             return;
         }
         active_sid = sid;
@@ -261,8 +344,8 @@ public class PairToExistingDialog : Adw.Window {
             string msg = "Failed to initialise pairing FSM: %s".printf(e.message);
             set_status(msg);
             pairing_failed(msg);
-            pair_button.sensitive = true;
-            code_entry.sensitive  = true;
+            if (pair_button != null) ((!) pair_button).sensitive = true;
+            if (code_entry != null) ((!) code_entry).sensitive  = true;
             return;
         }
 
@@ -270,11 +353,8 @@ public class PairToExistingDialog : Adw.Window {
         Xmpp.Jid peer_bare_jid = account.bare_jid;
 
         // Register the pairing session with the stream module (role=1 → "new
-        // device"). The stream module is expected to start routing inbound
-        // pairing stanzas for this SID to the pair_message_received signal.
-        // NOTE: register_pair_session() is part of the D-STREAM task and does
-        // not yet exist on StreamModule; this call will fail to compile until
-        // that task adds the method.
+        // device") so inbound pairing stanzas for this SID are routed to the
+        // pair_message_received signal.
         stream_module.register_pair_session(sid, peer_bare_jid, 1 /* role: new */);
 
         // Subscribe to inbound pairing messages for this SID.
@@ -284,13 +364,16 @@ public class PairToExistingDialog : Adw.Window {
             }
         );
 
-        set_status("Waiting for existing device to respond…");
+        if (!show_own_code) {
+            set_status("Waiting for existing device to respond…");
+        }
 
         // Rendezvous (XEP §10.1a method B): publish a self-addressed
         // <pair-hello> to our own pair:0 PEP node so an existing device on this
-        // account learns our full JID + sid via +notify and initiates the FSM
-        // toward us (sending PAKE1 first). Carries no secret material — the
-        // pairing code travels only out-of-band.
+        // account learns our full JID + sid via +notify (or an explicit
+        // "Confirm a device" fetch — see StreamModule.refresh_pair_hello) and
+        // initiates the FSM toward us (sending PAKE1 first). Carries no secret
+        // material — the pairing code travels only out-of-band.
         if (active_stream != null) {
             XmppStream stream = (!) active_stream;
             int? local_device_id = db.get_local_device_id(account);
