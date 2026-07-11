@@ -424,8 +424,9 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             for (int i = 0; i < int.min(sp.length, 60); i++) h.append_printf("%02x", sp[i]);
             uint8[] gfp; uint32 gep;
             Protocol.MemberAuditEntry.parse_member_payload(g.payload, out gfp, out gep);
-            warning("x3dhpq-DIAG bundle genesis: seq=%llu ownerFp=%s spLen=%d edSig=%d mlSig=%d spHead=%s",
-                g.seq, Protocol.hex_of(gfp), sp.length, g.signature.length, g.mldsa_signature.length, h.str);
+            warning("x3dhpq-DIAG bundle genesis: seq=%llu ownerFp=%s spLen=%d edSig=%d mlSig=%d marshalHash=%s spHead=%s",
+                g.seq, Protocol.hex_of(gfp), sp.length, g.signature.length, g.mldsa_signature.length,
+                Protocol.hex_of(g.compute_hash()), h.str);
         }
         var marshalled = new Gee.ArrayList<Bytes>();
         int total = 2 + 4 + ann_bytes.length + 4;
