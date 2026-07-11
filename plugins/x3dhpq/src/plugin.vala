@@ -25,6 +25,9 @@ public class Plugin : RootInterface, Object {
         app.plugin_registry.register_encryption_list_entry(list_entry);
         app.plugin_registry.register_encryption_preferences_entry(new X3dhpqPreferencesEntry(this));
         app.plugin_registry.register_contact_details_entry(contact_details_provider);
+        // WS7: encrypted media (aesgcm:// XEP-0454) for x3dhpq conversations.
+        app.stream_interactor.get_module(FileManager.IDENTITY).add_file_decryptor(new X3dhpqFileDecryptor());
+        app.stream_interactor.get_module(FileManager.IDENTITY).add_file_encryptor(new X3dhpqFileEncryptor());
         app.stream_interactor.module_manager.initialize_account_modules.connect(on_initialize_account_modules);
         app.stream_interactor.stream_negotiated.connect(on_stream_negotiated);
         app.stream_interactor.get_module(ChatInteraction.IDENTITY).focused_in.connect((conversation) => {

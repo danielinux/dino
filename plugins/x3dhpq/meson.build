@@ -1,4 +1,5 @@
 dependencies = [
+    dep_crypto_vala,
     dep_dino,
     dep_gee,
     dep_glib,
@@ -21,6 +22,7 @@ sources = files(
     'src/database.vala',
     'src/encryption_list_entry.vala',
     'src/encryption_preferences_entry.vala',
+    'src/file_transfer.vala',
     'src/manager.vala',
     'src/plugin.vala',
     'src/protocol/groupmsg.vala',
