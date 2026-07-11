@@ -119,6 +119,27 @@ public class View : Popover {
                 // future group keys.
                 remove_x3dhpq_member.begin(jid);
             });
+
+            // Admin promotion/demotion (owner-only). Mirrors the fuller member
+            // dialog; changes the MUC affiliation. (Crypto-layer admin authority
+            // over the membership journal is handled by the x3dhpq plugin.)
+            if (own_affiliation == Xmpp.Xep.Muc.Affiliation.OWNER) {
+                Xmpp.Xep.Muc.Affiliation? target_aff = stream_interactor.get_module(MucManager.IDENTITY)
+                    .get_affiliation(conversation.counterpart, real_jid, conversation.account);
+                if (target_aff != Xmpp.Xep.Muc.Affiliation.ADMIN && target_aff != Xmpp.Xep.Muc.Affiliation.OWNER) {
+                    Button admin_button = new Button.with_label(_("Make admin"));
+                    outer_box.append(admin_button);
+                    admin_button.clicked.connect(() => {
+                        stream_interactor.get_module(MucManager.IDENTITY).change_affiliation_for_jid(conversation.account, conversation.counterpart, real_jid, "admin");
+                    });
+                } else if (target_aff == Xmpp.Xep.Muc.Affiliation.ADMIN) {
+                    Button unadmin_button = new Button.with_label(_("Remove admin"));
+                    outer_box.append(unadmin_button);
+                    unadmin_button.clicked.connect(() => {
+                        stream_interactor.get_module(MucManager.IDENTITY).change_affiliation_for_jid(conversation.account, conversation.counterpart, real_jid, "member");
+                    });
+                }
+            }
         }
         if (stream_interactor.get_module(MucManager.IDENTITY).is_moderated_room(conversation.account, conversation.counterpart) && role ==  Xmpp.Xep.Muc.Role.MODERATOR){
             if (stream_interactor.get_module(MucManager.IDENTITY).get_role(selected_jid, conversation.account) ==  Xmpp.Xep.Muc.Role.VISITOR) {
