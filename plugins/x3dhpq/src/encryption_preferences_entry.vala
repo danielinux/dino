@@ -287,7 +287,14 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
         // pruned above — so contacts observe the reconstruction event
         // (§10.6.5), plus a fresh bundle so PQXDH can proceed with the new
         // identity.
-        module.publish_current_state.begin((!) stream);
+        module.publish_current_state.begin((!) stream, (obj, res) => {
+            ((!) module).publish_current_state.end(res);
+            // Immediately re-record the self-genesis AddDevice(self)@0 under the NEW
+            // AIK (overwriting any stale/old-AIK item "0" left on the audit node),
+            // rather than waiting for the next reconnect — so multi-device trust is
+            // usable right after the reset (§11).
+            ((!) module).ensure_account_audit_genesis.begin((!) stream);
+        });
     }
 
     private void launch_confirm_device_dialog(Account account, Gtk.Widget anchor) {
