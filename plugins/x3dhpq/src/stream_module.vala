@@ -2042,6 +2042,39 @@ public class StreamModule : XmppStreamModule {
         return ok;
     }
 
+    // §11 self-genesis: the account's PRIMARY records ITSELF as ADD_DEVICE(self)@0.
+    // Without this the primary/genesis device is never the subject of any AddDevice
+    // entry (AddDevice is only ever published BY the primary FOR new devices), so a
+    // newly-paired sibling never audit-trusts the primary as a co-account device →
+    // omits it from the encrypt fan-out and clobbers it out of the republished
+    // devicelist. Recording the primary in the chain makes every device trust it,
+    // fixing multi-device sync symmetrically.
+    public async void ensure_account_audit_genesis(XmppStream stream) {
+        Row? identity = db.get_local_identity(account.id);
+        if (identity == null) return;
+        bool is_primary = ((!) identity)[db.account_identity.is_primary];
+        string? aik_ed = ((!) identity)[db.account_identity.aik_priv_ed25519_base64];
+        // Only a PRIMARY that actually holds AIK_priv can (and should) self-add.
+        if (!is_primary || aik_ed == null || aik_ed == "") return;
+        // Reflect the server's authoritative chain FIRST: a share_primary secondary
+        // also carries is_primary, so we must not mistake an as-yet-unfetched empty
+        // local chain for a genuine genesis and self-add a conflicting seq-0 entry.
+        yield fetch_audit_history(stream);
+        if (db.list_account_audit_entries(account).size > 0) {
+            return;   // chain already established (our genesis, or devices added)
+        }
+        string dc_b64;
+        try {
+            dc_b64 = db.ensure_local_device_certificate(account);
+        } catch (GLib.Error e) {
+            warning("ensure_account_audit_genesis: cannot obtain own DC: %s", e.message);
+            return;
+        }
+        Protocol.DeviceCertificate? own_dc = Protocol.DeviceCertificate.unmarshal(new Bytes(Base64.decode(dc_b64)));
+        if (own_dc == null) return;
+        yield publish_add_device_audit_entry(stream, own_dc);
+    }
+
     // Publish an opaque, client-signed audit entry to the per-account audit:0
     // PEP node. The server stores and notifies subscribed contacts; verification
     // is the recipient's responsibility per X3DHPQ XEP §11.5.

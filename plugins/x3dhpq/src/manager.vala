@@ -705,7 +705,15 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     private void on_stream_negotiated(Account account, XmppStream stream) {
         StreamModule? module = app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
         if (module != null) {
-            module.request_device_list.begin(stream, account.bare_jid);
+            // Ensure our own audit genesis (primary self-ADD) exists BEFORE processing
+            // the own devicelist, so the audit-chain trust gate can confirm every
+            // audited sibling — including the primary — rather than dropping it to
+            // active=false. ensure_account_audit_genesis fetches the authoritative
+            // chain first, so this is safe on secondaries too.
+            module.ensure_account_audit_genesis.begin(stream, (obj, res) => {
+                ((!) module).ensure_account_audit_genesis.end(res);
+                ((!) module).request_device_list.begin(stream, account.bare_jid);
+            });
         }
     }
 
