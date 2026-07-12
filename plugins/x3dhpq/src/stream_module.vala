@@ -1348,6 +1348,77 @@ public class StreamModule : XmppStreamModule {
         return false;
     }
 
+    // §D4: revoke a device by appending a DIK-signed REMOVE entry (removal-wins in
+    // fold()). Mirrors append_device_add_to_manifest. The self-revoke guard lives
+    // at the manager call site (remove_own_device). Returns true on publish+apply.
+    public async bool append_device_remove_to_manifest(XmppStream stream, uint32 target_device_id) {
+        string own_bare = account.bare_jid.to_string();
+
+        // Load the current manifest: freshest from the server, else local cache.
+        Protocol.TrustManifest? m = yield fetch_trust_manifest(stream, account.bare_jid);
+        if (m == null) {
+            string? cached = db.get_trust_manifest_payload(account, own_bare);
+            if (cached != null) {
+                try {
+                    m = Protocol.TrustManifest.unmarshal(bytes_to_uint8_array(bytes_from_base64((!) cached)));
+                } catch (GLib.Error e) { m = null; }
+            }
+        }
+        if (m == null) {
+            warning("append_device_remove_to_manifest: no manifest available for %s", own_bare);
+            return false;
+        }
+
+        int? self_id_n = db.get_local_device_id(account);
+        if (self_id_n == null) return false;
+        uint32 self_id = (uint32) (!) self_id_n;
+
+        var fold = ((!) m).fold();
+        if (!fold.has_key(self_id.to_string())) {
+            warning("append_device_remove_to_manifest: this device (%u) is not in the manifest fold — cannot author", self_id);
+            return false;
+        }
+        if (!fold.has_key(target_device_id.to_string())) {
+            // Already absent from the fold — nothing to revoke (idempotent).
+            warning("append_device_remove_to_manifest: target %u not in fold — nothing to remove", target_device_id);
+            return true;
+        }
+        Protocol.DeviceCertificate self_dc = fold.get(self_id.to_string());
+        Protocol.DeviceCertificate target_dc = fold.get(target_device_id.to_string());
+        uint8[] self_dc_hash = manifest_sha256(self_dc.marshal());
+
+        Row? row = db.get_local_identity(account.id);
+        if (row == null) return false;
+        Bytes dik_priv_ed, dik_priv_ml;
+        try {
+            dik_priv_ed = bytes_from_base64(((!) row)[db.account_identity.dik_priv_ed25519_base64]);
+            dik_priv_ml = bytes_from_base64(((!) row)[db.account_identity.dik_priv_mldsa_base64]);
+        } catch (GLib.Error e) {
+            warning("append_device_remove_to_manifest: cannot load local DIK priv: %s", e.message);
+            return false;
+        }
+
+        try {
+            uint8[] prev_hash = manifest_sha256(((!) m).marshal());   // before mutation
+            var entry = build_signed_trust_entry(Protocol.TrustEntry.ACTION_REMOVE, target_device_id,
+                target_dc, ((!) m).next_lamport(), ((!) m).current_heads(),
+                self_id, self_dc_hash, dik_priv_ed, dik_priv_ml);
+            ((!) m).entries.add(entry);
+            ((!) m).version = ((!) m).version + 1;
+            ((!) m).prev_hash = prev_hash;
+            ((!) m).sign_head(dik_priv_ed, dik_priv_ml);
+        } catch (GLib.Error e) {
+            warning("append_device_remove_to_manifest: sign failed: %s", e.message);
+            return false;
+        }
+
+        if (yield publish_trust_manifest_blob(stream, (!) m)) {
+            verify_and_apply_manifest(account.bare_jid, ((!) m).marshal());
+            return true;
+        }
+        return false;
+    }
+
     // §D3: a freshly paired newcomer fetches + verifies + folds the account's own
     // manifest so it sees itself + siblings (once the confirmer's ADD lands).
     public async void fetch_and_apply_own_manifest(XmppStream stream) {

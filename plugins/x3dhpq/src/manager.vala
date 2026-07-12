@@ -2115,47 +2115,17 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             return false;
         }
 
-        // Derive the account audit chain tail (seq + prev_hash) from locally
-        // persisted entries; an empty chain starts at the genesis anchor.
-        var entries = db.list_account_audit_entries(account);
-        uint64 next_seq = 0;
-        uint8[] prev_hash = new uint8[32];
-        if (entries.size > 0) {
-            Protocol.AuditEntry last = entries[entries.size - 1];
-            next_seq = last.seq + 1;
-            prev_hash = last.compute_hash();
-        }
-
-        Protocol.AuditEntry entry = new Protocol.AuditEntry();
-        entry.seq = next_seq;
-        entry.prev_hash = prev_hash;
-        entry.action = (uint8) Protocol.AccountAuditAction.REMOVE_DEVICE;
-        // payload = uint32_BE(device_id)  (layout D)
-        uint8[] payload = new uint8[4];
-        payload[0] = (uint8)(device_id >> 24);
-        payload[1] = (uint8)(device_id >> 16);
-        payload[2] = (uint8)(device_id >> 8);
-        payload[3] = (uint8) device_id;
-        entry.payload = payload;
-        entry.timestamp = new DateTime.now_utc().to_unix();
-        try {
-            uint8[] sp = entry.signed_part();
-            Bytes aik_priv_ed = bytes_from_base64((!) db.get_local_identity_string(account, db.account_identity.aik_priv_ed25519_base64));
-            Bytes aik_priv_mldsa = bytes_from_base64((!) db.get_local_identity_string(account, db.account_identity.aik_priv_mldsa_base64));
-            entry.signature = bytes_to_uint8_array(
-                global::X3dhpq.Crypto.ed25519_sign(aik_priv_ed, new Bytes(sp)));
-            entry.mldsa_signature = bytes_to_uint8_array(
-                global::X3dhpq.Crypto.mldsa65_sign(aik_priv_mldsa, new Bytes(sp)));
-        } catch (GLib.Error e) {
-            warning("x3dhpq remove_own_device: signing failed for device %u: %s", device_id, e.message);
+        // Trust Manifest Phase 2 (§D4): revocation is now a DIK-signed REMOVE entry
+        // appended to the account's trust manifest — the LIVE trust source — rather
+        // than a RemoveDevice audit entry (which no longer feeds the fold, so a
+        // device removed only via audit would stay in the fold and keep receiving
+        // messages). fold()'s removal-wins semantics drop the target; the derived
+        // devicelist cache is republished below. The old audit REMOVE path is
+        // retired from the trust decision (Phase 3 removes the code wholesale).
+        if (!yield module.append_device_remove_to_manifest(stream, device_id)) {
+            warning("x3dhpq remove_own_device: manifest REMOVE publish failed for device %u", device_id);
             return false;
         }
-
-        if (!yield module.publish_audit_entry(stream, next_seq.to_string(), Base64.encode(entry.marshal()))) {
-            warning("x3dhpq remove_own_device: audit publish failed for device %u", device_id);
-            return false;
-        }
-        db.store_account_audit_entry(account, entry);
 
         // §8.6 tombstone: remember this id as revoked so no inbound devicelist
         // (including a stale, old-AIK-signed one the server still serves) or peer

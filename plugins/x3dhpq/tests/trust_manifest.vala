@@ -33,6 +33,7 @@ class TrustManifestTest : Gee.TestCase {
         add_test("head_sign_verify", test_head_sign_verify);
         add_test("migration_roundtrip", test_migration_roundtrip);
         add_test("confirmer_append", test_confirmer_append);
+        add_test("revoke_removes_device", test_revoke_removes_device);
     }
 
     // ── DC_SUBJECT / KAT object builders ─────────────────────────────────────
@@ -433,6 +434,43 @@ class TrustManifestTest : Gee.TestCase {
             // The new head signature verifies under the authoring member D2.
             fail_if_not(m.verify_head(new Bytes(d2.dik.pub_ed25519), new Bytes(d2.dik.pub_mldsa)),
                 "head signed by folded confirmer D2");
+        } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    // §D4: a trusted non-genesis device (A = D2) revokes device B (D3) by
+    // appending a DIK-signed REMOVE. Fold must drop B. A concurrent sibling ADD
+    // re-adding B (NOT a descendant of the removal) loses (removal-wins).
+    private void test_revoke_removes_device() {
+        try {
+            AccountIdentityKey aik = AccountIdentityKey.generate();
+            Dev d1 = make_dev(1001, new Bytes(aik.priv_ed25519), new Bytes(aik.priv_mldsa)); // genesis/primary
+            var g = genesis(aik, d1);
+            Dev d2 = make_dev(1002, new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa)); // A (trusted)
+            var add2 = sign_entry(TrustEntry.ACTION_ADD, d2.id, d2.dc, 1, parents_of(g.compute_hash()),
+                d1.id, sha256_arr(d1.dc.marshal()), 1001,
+                new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa));
+            Dev d3 = make_dev(1003, new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa)); // B
+            var add3 = sign_entry(TrustEntry.ACTION_ADD, d3.id, d3.dc, 2, parents_of(add2.compute_hash()),
+                d1.id, sha256_arr(d1.dc.marshal()), 1002,
+                new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa));
+            uint8[] add3h = add3.compute_hash();
+
+            // A (D2) revokes B (D3): REMOVE authored + signed by D2's DIK.
+            var rem = sign_entry(TrustEntry.ACTION_REMOVE, d3.id, d3.dc, 3, parents_of(add3h),
+                d2.id, sha256_arr(d2.dc.marshal()), 2000,
+                new Bytes(d2.dik.priv_ed25519), new Bytes(d2.dik.priv_mldsa));
+            // Concurrent re-add of B by D1 on add3 (NOT a descendant of the removal).
+            Dev d3b = make_dev(1003, new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa));
+            var readd = sign_entry(TrustEntry.ACTION_ADD, d3b.id, d3b.dc, 3, parents_of(add3h),
+                d1.id, sha256_arr(d1.dc.marshal()), 2001,
+                new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa));
+
+            var m = manifest_of(aik.public_key(), new TrustEntry[]{ g, add2, add3, rem, readd });
+            var trusted = m.fold();
+            fail_if(trusted.has_key("1003"),
+                "B revoked by trusted non-genesis device A; concurrent non-descendant re-add loses (removal-wins)");
+            fail_if_not(trusted.has_key("1001"), "D1 (primary) still authorized");
+            fail_if_not(trusted.has_key("1002"), "D2 (revoker) still authorized");
         } catch (Error e) { fail_if_reached(e.message); }
     }
 
