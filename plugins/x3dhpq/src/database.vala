@@ -5,7 +5,7 @@ using Xmpp;
 namespace Dino.Plugins.X3dhpq {
 
 public class Database : Qlite.Database {
-    private const int VERSION = 11;
+    private const int VERSION = 12;
 
     public class AccountIdentityTable : Table {
         public Column<int> id = new Column.Integer("id") { primary_key = true, auto_increment = true };
@@ -304,6 +304,22 @@ public class Database : Qlite.Database {
         }
     }
 
+    // Purely-local, never-published friendly names for devices (this device and
+    // siblings), keyed by (account, device_id). Absent → the UI shows a default
+    // "Device N" ordinal. Added at schema v12; local-only, so never signed or
+    // synced (§10.6 device labels are a client-side convenience).
+    public class DeviceNicknameTable : Table {
+        public Column<int> account_id = new Column.Integer("account_id") { not_null = true };
+        public Column<int> device_id = new Column.Integer("device_id") { not_null = true };
+        public Column<string> nickname = new Column.NonNullText("nickname");
+
+        internal DeviceNicknameTable(Database db) {
+            base(db, "device_nickname");
+            init({ account_id, device_id, nickname });
+            unique({ account_id, device_id });
+        }
+    }
+
     public class AuditEntryTable : Table {
         public Column<int> account_id = new Column.Integer("account_id") { not_null = true };
         public Column<string> bare_jid = new Column.NonNullText("bare_jid");
@@ -385,6 +401,7 @@ public class Database : Qlite.Database {
     public RecoveryBlobTable recovery_blob { get; private set; }
     public PairingSessionTable pairing_session { get; private set; }
     public PendingEnrollmentRequestTable pending_enrollment_request { get; private set; }
+    public DeviceNicknameTable device_nickname { get; private set; }
 
     public Database(string file_name) {
         base(file_name, VERSION);
@@ -404,7 +421,8 @@ public class Database : Qlite.Database {
         recovery_blob = new RecoveryBlobTable(this);
         pairing_session = new PairingSessionTable(this);
         pending_enrollment_request = new PendingEnrollmentRequestTable(this);
-        init({ account_identity, peer_account_identity, peer_device, device_list, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, group_session, membership_journal, device_audit, audit_entry, recovery_blob, pairing_session, pending_enrollment_request });
+        device_nickname = new DeviceNicknameTable(this);
+        init({ account_identity, peer_account_identity, peer_device, device_list, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, group_session, membership_journal, device_audit, audit_entry, recovery_blob, pairing_session, pending_enrollment_request, device_nickname });
     }
 
     public Row? get_local_identity(int account_id) {
@@ -1870,6 +1888,35 @@ public class Database : Qlite.Database {
     // (signed by the now-revoked old AIK) blocking it.
     public void clear_account_audit_entries(Account account) {
         audit_entry.delete().with(audit_entry.account_id, "=", account.id).perform();
+    }
+
+    // Local device nickname (§10.6 client-side label). Returns null when the user
+    // has not set one — callers fall back to a "Device N" default.
+    public string? lookup_device_nickname(Account account, int device_id) {
+        Row? row = device_nickname.select()
+            .with(device_nickname.account_id, "=", account.id)
+            .with(device_nickname.device_id, "=", device_id)
+            .single().row().inner;
+        if (row == null) return null;
+        return ((!) row)[device_nickname.nickname];
+    }
+
+    // Set (or, for a blank name, clear back to the default) a device's local
+    // nickname. Never published — purely a client-side convenience.
+    public void store_device_nickname(Account account, int device_id, string? name) {
+        string trimmed = (name ?? "").strip();
+        if (trimmed == "") {
+            device_nickname.delete()
+                .with(device_nickname.account_id, "=", account.id)
+                .with(device_nickname.device_id, "=", device_id)
+                .perform();
+            return;
+        }
+        device_nickname.upsert()
+            .value(device_nickname.account_id, account.id, true)
+            .value(device_nickname.device_id, device_id, true)
+            .value(device_nickname.nickname, trimmed)
+            .perform();
     }
 
     // Drop the persisted OWN devicelist snapshot (payload/version/content-key). Used by

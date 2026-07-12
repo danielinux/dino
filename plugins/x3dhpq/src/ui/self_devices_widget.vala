@@ -26,6 +26,11 @@ public class SelfDevicesWidget : Gtk.Box {
     private Gtk.ListBox devices_listbox;
     private Gtk.Button confirm_button;
 
+    // device_id → 1-based "Device N" ordinal, recomputed each refresh over the
+    // full known device set (this device + confirmed + pending), so the default
+    // labels stay stable and shared between the local row and the sibling rows.
+    private Gee.HashMap<int, int> device_ordinals = new Gee.HashMap<int, int>();
+
     public SelfDevicesWidget(Database db, Account account) {
         Object(orientation: Gtk.Orientation.VERTICAL, spacing: 6);
         this.db = db;
@@ -59,11 +64,27 @@ public class SelfDevicesWidget : Gtk.Box {
         fingerprint_label.add_css_class("monospace");
         append(fingerprint_label);
 
+        var local_box = new Gtk.Box(Gtk.Orientation.HORIZONTAL, 6) {
+            margin_start = 6,
+            margin_end = 6
+        };
         local_device_label = new Gtk.Label("") {
             halign = Gtk.Align.START,
-            margin_start = 6
+            hexpand = true,
+            xalign = 0,
+            wrap = true
         };
-        append(local_device_label);
+        local_box.append(local_device_label);
+        var local_rename_button = new Gtk.Button.with_label("Rename") {
+            valign = Gtk.Align.CENTER
+        };
+        local_rename_button.add_css_class("flat");
+        local_rename_button.clicked.connect(() => {
+            int? lid = db.get_local_device_id(account);
+            if (lid != null) rename_device((int) ((!) lid));
+        });
+        local_box.append(local_rename_button);
+        append(local_box);
 
         append(new Gtk.Separator(Gtk.Orientation.HORIZONTAL) { margin_top = 6, margin_bottom = 6 });
 
@@ -128,6 +149,7 @@ public class SelfDevicesWidget : Gtk.Box {
         fingerprint_label.label = db.get_aik_fingerprint(account) ?? "Unavailable";
 
         int? device_id = db.get_local_device_id(account);
+        recompute_ordinals(device_id);
         Row? local_row = db.get_local_identity(account.id);
         bool is_primary = local_row != null && ((!) local_row)[db.account_identity.is_primary];
         string device_id_str = device_id != null ? ((uint32) ((!) device_id)).to_string() : "Unavailable";
@@ -140,7 +162,8 @@ public class SelfDevicesWidget : Gtk.Box {
         string status_str = authorized
             ? (is_primary ? "Primary" : "Secondary")
             : "Disabled — waiting for sync";
-        local_device_label.label = @"This device: $device_id_str ($status_str)";
+        string local_name = device_id != null ? device_display_name((int) ((!) device_id)) : "This device";
+        local_device_label.label = @"$local_name — this device ($device_id_str · $status_str)";
 
         // §10.6.6: a disabled device holds no AIK_priv and cannot sign the
         // AddDevice entry confirming a newcomer requires — grey the button out
@@ -215,17 +238,29 @@ public class SelfDevicesWidget : Gtk.Box {
         bool this_device = local_id != null && ((!) local_id) == device_id;
 
         string role = row_is_primary ? "Primary" : "Secondary";
-        var title_parts = new Gee.ArrayList<string>();
-        title_parts.add(@"Device $(((uint32) device_id).to_string())");
-        title_parts.add(role);
-        if (this_device) title_parts.add("this device");
-        if (!confirmed) title_parts.add("PENDING — not yet confirmed");
-        string title = string.joinv(" · ", title_parts.to_array());
+        var subtitle_parts = new Gee.ArrayList<string>();
+        subtitle_parts.add(@"ID $(((uint32) device_id).to_string())");
+        subtitle_parts.add(role);
+        if (this_device) subtitle_parts.add("this device");
+        if (!confirmed) subtitle_parts.add("PENDING — not yet confirmed");
 
-        var row = new Adw.ExpanderRow() { title = title };
+        var row = new Adw.ExpanderRow() {
+            title = device_display_name(device_id),
+            subtitle = string.joinv(" · ", subtitle_parts.to_array())
+        };
         if (!confirmed) {
             row.add_css_class("warning");
         }
+
+        // Local, never-published rename (§10.6 label). Available for every row
+        // including this device — the nickname is stored per (account, device_id).
+        var rename_button = new Gtk.Button.with_label("Rename") {
+            valign = Gtk.Align.CENTER
+        };
+        rename_button.add_css_class("flat");
+        int rename_id = device_id;
+        rename_button.clicked.connect(() => rename_device(rename_id));
+        row.add_suffix(rename_button);
 
         string? device_fp = db.get_device_fingerprint(account, own_jid, device_id);
         var fp_row = new Adw.ActionRow() {
@@ -271,6 +306,57 @@ public class SelfDevicesWidget : Gtk.Box {
         row.add_suffix(revoke_button);
 
         return row;
+    }
+
+    // Assign stable 1-based "Device N" ordinals over the full known device set
+    // (this device + confirmed siblings + pending), sorted ascending by id so the
+    // default label is deterministic and shared across the local and sibling rows.
+    private void recompute_ordinals(int? local_device_id) {
+        device_ordinals.clear();
+        var ids = new Gee.TreeSet<int>();
+        if (local_device_id != null) ids.add((int) ((!) local_device_id));
+        string own_jid = account.bare_jid.to_string();
+        foreach (int did in db.get_remote_device_ids(account, own_jid)) ids.add(did);
+        foreach (int did in db.get_pending_own_device_ids(account)) ids.add(did);
+        int n = 1;
+        foreach (int did in ids) {
+            device_ordinals.set(did, n);
+            n++;
+        }
+    }
+
+    // The user's local nickname for a device, or the "Device N" default.
+    private string device_display_name(int device_id) {
+        string? nick = db.lookup_device_nickname(account, device_id);
+        if (nick != null && nick.strip() != "") return (!) nick;
+        int ord = device_ordinals.has_key(device_id) ? device_ordinals.get(device_id) : device_id;
+        return @"Device $ord";
+    }
+
+    private void rename_device(int device_id) {
+        string current = db.lookup_device_nickname(account, device_id) ?? "";
+        var dialog = new Adw.AlertDialog(
+            "Rename device",
+            "Set a local nickname for this device. It is stored only on this device and never shared."
+        );
+        var entry = new Gtk.Entry() {
+            text = current,
+            placeholder_text = device_display_name(device_id),
+            activates_default = true
+        };
+        dialog.set_extra_child(entry);
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("save", "Save");
+        dialog.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED);
+        dialog.default_response = "save";
+        dialog.close_response = "cancel";
+        dialog.response.connect((id) => {
+            if (id == "save") {
+                db.store_device_nickname(account, device_id, entry.text);
+                refresh();
+            }
+        });
+        dialog.present(this);
     }
 
     private void confirm_and_remove(int device_id) {
