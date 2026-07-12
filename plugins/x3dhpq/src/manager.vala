@@ -2109,7 +2109,6 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             // Offline: still tombstone + drop locally so the UI clears and the id
             // can't be re-seeded; the RemoveDevice audit entry + republish happen
             // on next connect via the normal bootstrap.
-            warning("X3DHPQ-PAIRDBG: remove_own_device: no stream/module (offline) — tombstoning + dropping device %u locally, deferring publish", device_id);
             db.store_revoked_device(account, (int) device_id);
             db.remove_peer_device(account, account.bare_jid.to_string(), (int) device_id);
             db.delete_own_device(account, device_id);
@@ -2174,7 +2173,6 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         // exactly this id (§8.6). The removed device is now absent from the
         // union, so the content changes and the version bumps (§8.2).
         yield module.republish_device_list_removing(stream, device_id);
-        warning("X3DHPQ-PAIRDBG: remove_own_device: device %u revoked+tombstoned, RemoveDevice published, devicelist republished", device_id);
         return true;
     }
 }

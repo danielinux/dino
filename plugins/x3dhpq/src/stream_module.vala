@@ -1769,12 +1769,9 @@ public class StreamModule : XmppStreamModule {
     // downstream behavior to a self-PEP one.
     private void handle_pair_hello_node(XmppStream stream, Jid from, StanzaNode item_node) {
         if (!from.bare_jid.equals(account.bare_jid)) {
-            warning("X3DHPQ-PAIRDBG: handle_pair_hello_node: DROP — from %s not our bare jid %s",
-                from.to_string(), account.bare_jid.to_string());
             return;
         }
         if (item_node.name != "pair-hello") {
-            warning("X3DHPQ-PAIRDBG: handle_pair_hello_node: DROP — child is <%s> not <pair-hello>", item_node.name);
             return;
         }
         string? full_jid_str  = item_node.get_attribute("full-jid");
@@ -1796,7 +1793,6 @@ public class StreamModule : XmppStreamModule {
         Bind.Flag? bind_flag = stream.get_flag(Bind.Flag.IDENTITY);
         Jid? my_jid = bind_flag != null ? bind_flag.my_jid : null;
         if (my_jid != null && my_jid.equals(new_full_jid)) {
-            warning("X3DHPQ-PAIRDBG: handle_pair_hello_node: DROP — own echo (full-jid=%s)", new_full_jid.to_string());
             return;
         }
         uint device_id = (uint) int64.parse(device_id_str);
@@ -1807,8 +1803,6 @@ public class StreamModule : XmppStreamModule {
         last_pair_hello_device_id = device_id;
         last_pair_hello_sid = sid;
         last_pair_hello_at = GLib.get_monotonic_time();
-        warning("X3DHPQ-PAIRDBG: handle_pair_hello_node: OK — firing pair_hello_received from %s device-id=%u",
-            new_full_jid.to_string(), device_id);
         pair_hello_received(new_full_jid, device_id, sid);
     }
 
@@ -1819,16 +1813,12 @@ public class StreamModule : XmppStreamModule {
     // hello from a dead resource of a previous attempt.
     public void replay_last_pair_hello() {
         if (last_pair_hello_jid == null || last_pair_hello_sid == null) {
-            warning("X3DHPQ-PAIRDBG: replay_last_pair_hello: nothing cached");
             return;
         }
         int64 age_s = (GLib.get_monotonic_time() - last_pair_hello_at) / 1000000;
         if (age_s > 180) {
-            warning("X3DHPQ-PAIRDBG: replay_last_pair_hello: cached hello too old (%llds) — skipping", age_s);
             return;
         }
-        warning("X3DHPQ-PAIRDBG: replay_last_pair_hello: re-firing cached hello from %s device-id=%u (age %llds)",
-            ((!) last_pair_hello_jid).to_string(), last_pair_hello_device_id, age_s);
         pair_hello_received((!) last_pair_hello_jid, last_pair_hello_device_id, (!) last_pair_hello_sid);
     }
 
@@ -2258,9 +2248,6 @@ public class StreamModule : XmppStreamModule {
         stanza.type_ = Xmpp.MessageStanza.TYPE_CHAT;
         stanza.stanza.put_node(pair_node);
         Bind.Flag? _bf = stream.get_flag(Bind.Flag.IDENTITY);
-        warning("X3DHPQ-PAIRDBG: send_pair_stanza: from(me)=%s to=%s sid=%s step=%u msgType=%u",
-            _bf != null && _bf.my_jid != null ? ((!) _bf.my_jid).to_string() : "?",
-            peer.to_string(), sid_b64, step, msg.msg_type);
         // Pairing stanzas are strictly point-to-point between two devices. Tell
         // the server NOT to carbon-copy them to the account's other resources
         // (XEP-0280 <private/> + XEP-0334 <no-copy/>). Carbon copies are also
@@ -2406,17 +2393,12 @@ public class StreamModule : XmppStreamModule {
             StanzaNode? items_node = result.stanza.get_deep_subnode(
                 Pubsub.NS_URI + ":pubsub", Pubsub.NS_URI + ":items");
             if (items_node == null) {
-                warning("X3DHPQ-PAIRDBG: refresh_pair_hello: no <items> node in result (node empty or access denied)");
                 return;
             }
             var item_list = items_node.get_subnodes("item", Pubsub.NS_URI);
-            warning("X3DHPQ-PAIRDBG: refresh_pair_hello: fetched %d item(s) on pair:0", item_list.size);
             foreach (StanzaNode item in item_list) {
                 if (item.sub_nodes.size == 0) continue;
                 StanzaNode child = item.sub_nodes[0];
-                warning("X3DHPQ-PAIRDBG: refresh_pair_hello: item id=%s child=<%s full-jid=%s device-id=%s>",
-                    item.get_attribute("id") ?? "?", child.name,
-                    child.get_attribute("full-jid") ?? "?", child.get_attribute("device-id") ?? "?");
                 if (child.name == "enroll-request") {
                     handle_enroll_request_node(stream, account.bare_jid, child);
                 } else {
@@ -2437,9 +2419,6 @@ public class StreamModule : XmppStreamModule {
         if (has_pair || has_hello) {
             Bind.Flag? bf = stream.get_flag(Bind.Flag.IDENTITY);
             string me = bf != null && bf.my_jid != null ? ((!) bf.my_jid).to_string() : "?";
-            warning("X3DHPQ-PAIRDBG: on_received_message: pair=%s hello=%s from=%s to(me)=%s type=%s carbon=%s",
-                has_pair.to_string(), has_hello.to_string(), message.from.to_string(), me,
-                message.type_ ?? "(none)", is_carbon.to_string());
         }
         // Pairing is strictly point-to-point between two devices; the genuine
         // handshake is delivered DIRECTLY to our full JID (never a carbon). A
@@ -2450,8 +2429,6 @@ public class StreamModule : XmppStreamModule {
         // OMEMO-only resource's echoed envelope). Ignore carboned copies.
         if (is_carbon) {
             if (has_pair || has_hello) {
-                warning("X3DHPQ-PAIRDBG: on_received_message: DROPPED as carbon (pair=%s hello=%s)",
-                    has_pair.to_string(), has_hello.to_string());
             }
             return;
         }
@@ -2465,8 +2442,6 @@ public class StreamModule : XmppStreamModule {
             return;
         }
         if (pair_node != null) {
-            warning("X3DHPQ-PAIRDBG: on_received_message: DROPPED <pair> — type=%s is not TYPE_CHAT=%s",
-                message.type_ ?? "(none)", Xmpp.MessageStanza.TYPE_CHAT);
         }
         // XEP §10.1a method A: <pair-hello> delivered as a directed message when
         // this device displayed the QR and a peer device scanned it, rather than

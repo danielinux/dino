@@ -265,8 +265,6 @@ public class PairNewDeviceDialog : Gtk.Window {
         entry.sensitive = false;
         if (confirm_button != null) ((!) confirm_button).sensitive = false;
         set_status("Waiting for that device to respond…");
-        warning("X3DHPQ-PAIRDBG: dialog.on_confirm_clicked: code confirmed, replay cached hello + refresh_pair_hello (active_stream=%s)",
-            (active_stream != null).to_string());
         // Act on a hello already received (via +notify) before the dialog was
         // ready — replayed synchronously so we don't depend on the network
         // re-fetch, which can stall and leave PAKE1 unsent (pairing hang).
@@ -337,8 +335,6 @@ public class PairNewDeviceDialog : Gtk.Window {
     }
 
     private void on_pair_hello_received(Jid new_full_jid, uint8[] hello_sid) {
-        warning("X3DHPQ-PAIRDBG: dialog.on_pair_hello_received: from=%s confirm_mode=%s code_confirmed=%s existing=%s",
-            new_full_jid.to_string(), confirm_mode.to_string(), code_confirmed.to_string(), (existing != null).to_string());
         if (confirm_mode && !code_confirmed) {
             // Not yet — the user hasn't entered/confirmed a code, so we don't
             // know which pending device (if several were mid-rendezvous) or
@@ -366,7 +362,6 @@ public class PairNewDeviceDialog : Gtk.Window {
             existing = new Protocol.PairingExisting((!) aik, code, sid, opts);
             Protocol.PairingMsg? pake1 = ((!) existing).step(null);
             if (pake1 != null) {
-                warning("X3DHPQ-PAIRDBG: dialog: sending PAKE1 to %s", new_full_jid.to_string());
                 stream_module.send_pair_stanza(new_full_jid, sid, (!) pake1);
                 // Arm retransmission until the peer's first reply (see field doc).
                 last_sent_msg = pake1;
@@ -454,7 +449,7 @@ public class PairNewDeviceDialog : Gtk.Window {
     // slow single hop; the previous 15s total budget fired mid-handshake on lag.
     private void arm_pairing_timeout() {
         cancel_pairing_timeout();
-        pairing_timeout_id = Timeout.add_seconds(30, () => {
+        pairing_timeout_id = Timeout.add_seconds(90, () => {
             pairing_timeout_id = 0;
             set_status("Pairing timed out. If you mistyped the code, start over and try again.");
             disconnect_signals();
@@ -473,7 +468,6 @@ public class PairNewDeviceDialog : Gtk.Window {
                 pair_resend_id = 0;
                 return false;
             }
-            warning("X3DHPQ-PAIRDBG: dialog: RETRANSMIT PAKE1 to %s (no reply yet)", ((!) peer_jid).to_string());
             stream_module.send_pair_stanza((!) peer_jid, sid, (!) last_sent_msg);
             return true; // keep retransmitting until cancelled
         });
