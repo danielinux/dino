@@ -5,7 +5,7 @@ using Xmpp;
 namespace Dino.Plugins.X3dhpq {
 
 public class Database : Qlite.Database {
-    private const int VERSION = 13;
+    private const int VERSION = 14;
 
     public class AccountIdentityTable : Table {
         public Column<int> id = new Column.Integer("id") { primary_key = true, auto_increment = true };
@@ -124,6 +124,27 @@ public class Database : Qlite.Database {
         internal DeviceListTable(Database db) {
             base(db, "device_list");
             init({ account_id, bare_jid, item_id, signed_payload_base64, updated_at, list_version, signed_accepted, content_key });
+            unique({ account_id, bare_jid });
+        }
+    }
+
+    // Trust Manifest Phase 2: the last accepted manifest blob per owner (own bare
+    // JID or a contact). manifest_version is the monotonic per-owner rollback
+    // guard (§C.3); blob_hash_hex is SHA-256(m.marshal()) at that version, used to
+    // detect same-version equivocation/forks. payload_base64 is base64(m.marshal())
+    // of the last good manifest (kept so we never wipe trust on a bad update).
+    public class TrustManifestTable : Table {
+        public Column<int> account_id = new Column.Integer("account_id") { not_null = true };
+        public Column<string> bare_jid = new Column.NonNullText("bare_jid");
+        public Column<string?> item_id = new Column.Text("item_id");
+        public Column<string?> payload_base64 = new Column.Text("payload_base64");
+        public Column<long> manifest_version = new Column.Long("manifest_version") { default = "-1" };
+        public Column<string?> blob_hash_hex = new Column.Text("blob_hash_hex");
+        public Column<long> updated_at = new Column.Long("updated_at") { not_null = true };
+
+        internal TrustManifestTable(Database db) {
+            base(db, "trust_manifest");
+            init({ account_id, bare_jid, item_id, payload_base64, manifest_version, blob_hash_hex, updated_at });
             unique({ account_id, bare_jid });
         }
     }
@@ -406,6 +427,7 @@ public class Database : Qlite.Database {
     public PeerAccountIdentityTable peer_account_identity { get; private set; }
     public PeerDeviceTable peer_device { get; private set; }
     public DeviceListTable device_list { get; private set; }
+    public TrustManifestTable trust_manifest { get; private set; }
     public BundleTable bundle { get; private set; }
     public SignedPreKeyTable signed_pre_key { get; private set; }
     public KemPreKeyTable kem_pre_key { get; private set; }
@@ -427,6 +449,7 @@ public class Database : Qlite.Database {
         peer_account_identity = new PeerAccountIdentityTable(this);
         peer_device = new PeerDeviceTable(this);
         device_list = new DeviceListTable(this);
+        trust_manifest = new TrustManifestTable(this);
         bundle = new BundleTable(this);
         signed_pre_key = new SignedPreKeyTable(this);
         kem_pre_key = new KemPreKeyTable(this);
@@ -441,7 +464,7 @@ public class Database : Qlite.Database {
         pending_enrollment_request = new PendingEnrollmentRequestTable(this);
         device_nickname = new DeviceNicknameTable(this);
         revoked_device = new RevokedDeviceTable(this);
-        init({ account_identity, peer_account_identity, peer_device, device_list, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, group_session, membership_journal, device_audit, audit_entry, recovery_blob, pairing_session, pending_enrollment_request, device_nickname, revoked_device });
+        init({ account_identity, peer_account_identity, peer_device, device_list, trust_manifest, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, group_session, membership_journal, device_audit, audit_entry, recovery_blob, pairing_session, pending_enrollment_request, device_nickname, revoked_device });
     }
 
     public Row? get_local_identity(int account_id) {
@@ -1106,6 +1129,84 @@ public class Database : Qlite.Database {
         return row[device_list.list_version];
     }
 
+    // ── Trust Manifest (Phase 2) persistence ─────────────────────────────────
+
+    private RowOption get_trust_manifest_row(Account account, string bare_jid) {
+        return trust_manifest.select()
+            .with(trust_manifest.account_id, "=", account.id)
+            .with(trust_manifest.bare_jid, "=", bare_jid)
+            .single().row();
+    }
+
+    // Highest accepted manifest version for owner bare_jid, or -1 if none seen.
+    public long get_trust_manifest_version(Account account, string bare_jid) {
+        RowOption row = get_trust_manifest_row(account, bare_jid);
+        if (!row.is_present()) return -1;
+        return row[trust_manifest.manifest_version];
+    }
+
+    // SHA-256(m.marshal()) hex of the last accepted manifest at the stored
+    // version (equivocation/fork guard), or null if none.
+    public string? get_trust_manifest_blob_hash(Account account, string bare_jid) {
+        RowOption row = get_trust_manifest_row(account, bare_jid);
+        if (!row.is_present()) return null;
+        return row[trust_manifest.blob_hash_hex];
+    }
+
+    // base64(m.marshal()) of the last accepted manifest for owner bare_jid, or
+    // null if none — used to extend/adopt the current manifest.
+    public string? get_trust_manifest_payload(Account account, string bare_jid) {
+        RowOption row = get_trust_manifest_row(account, bare_jid);
+        if (!row.is_present()) return null;
+        return row[trust_manifest.payload_base64];
+    }
+
+    public void store_trust_manifest(Account account, string bare_jid, string? item_id,
+            string payload_base64, long version, string blob_hash_hex) {
+        trust_manifest.upsert()
+            .value(trust_manifest.account_id, account.id, true)
+            .value(trust_manifest.bare_jid, bare_jid, true)
+            .value(trust_manifest.item_id, item_id)
+            .value(trust_manifest.payload_base64, payload_base64)
+            .value(trust_manifest.manifest_version, version)
+            .value(trust_manifest.blob_hash_hex, blob_hash_hex)
+            .value(trust_manifest.updated_at, (long) new DateTime.now_utc().to_unix())
+            .perform();
+    }
+
+    // First-use (TOFU) pin of a peer's account AIK from a trust manifest: only
+    // writes when NO AIK is currently pinned for this peer. Never overwrites an
+    // existing pin (an AIK swap is handled as a rejection by the caller, not a
+    // silent re-pin). Returns true if the peer now has this AIK pinned.
+    public bool pin_peer_aik_first_use(Account account, string bare_jid, uint8[] aik_ed, uint8[] aik_ml) {
+        Bytes cur_ed, cur_ml;
+        if (get_peer_aik_pubs(account, bare_jid, out cur_ed, out cur_ml)) {
+            return true; // already pinned — do not touch
+        }
+        string ed_b64 = Base64.encode(aik_ed);
+        string ml_b64 = Base64.encode(aik_ml);
+        string? fingerprint = null;
+        try {
+            fingerprint = account_fingerprint(new Bytes(aik_ed), new Bytes(aik_ml));
+        } catch (Error e) {
+            warning("pin_peer_aik_first_use: fingerprint failed for %s: %s", bare_jid, e.message);
+        }
+        Row? existing = get_peer_account_identity_row(account, bare_jid);
+        long created_at = existing != null ? ((!) existing)[peer_account_identity.created_at] : (long) new DateTime.now_utc().to_unix();
+        peer_account_identity.upsert()
+            .value(peer_account_identity.account_id, account.id, true)
+            .value(peer_account_identity.bare_jid, bare_jid, true)
+            .value(peer_account_identity.aik_pub_ed25519_base64, ed_b64)
+            .value(peer_account_identity.aik_pub_mldsa_base64, ml_b64)
+            .value(peer_account_identity.aik_fingerprint, fingerprint)
+            .value(peer_account_identity.trust_state, existing != null ? ((!) existing)[peer_account_identity.trust_state] : "unverified")
+            .value(peer_account_identity.downgraded, existing != null ? ((!) existing)[peer_account_identity.downgraded] : false)
+            .value(peer_account_identity.created_at, created_at)
+            .value(peer_account_identity.updated_at, (long) new DateTime.now_utc().to_unix())
+            .perform();
+        return true;
+    }
+
     public bool get_device_list_signed_accepted(Account account, string bare_jid) {
         RowOption row = get_device_list_row(account, bare_jid);
         if (!row.is_present()) {
@@ -1566,18 +1667,17 @@ public class Database : Qlite.Database {
             // resolves the pending-enrollment window; this device is now a
             // confirmed (primary or secondary) member of the account.
             .set(account_identity.confirmed, true);
-        if (result.aik_priv != null) {
-            Protocol.AccountIdentityKey aik_priv = (!) result.aik_priv;
-            update
-                .set(account_identity.is_primary, true)
-                .set(account_identity.aik_priv_ed25519_base64, Base64.encode(aik_priv.priv_ed25519))
-                .set(account_identity.aik_priv_mldsa_base64, Base64.encode(aik_priv.priv_mldsa));
-        } else {
-            update
-                .set(account_identity.is_primary, false)
-                .set(account_identity.aik_priv_ed25519_base64, "")
-                .set(account_identity.aik_priv_mldsa_base64, "");
-        }
+        // Trust Manifest Phase 2 (§E1): AIK_priv no longer travels in the issuance
+        // payload, so a paired newcomer NEVER adopts it — it is a delegated member
+        // whose authority flows from the manifest ADD entry (DIK-signed by the
+        // confirmer), not from holding the account root key. Always clear the
+        // aik_priv_* columns (NonNullText → "") and mark this device non-primary.
+        // result.aik_priv is expected to be null in Phase 2; even if a legacy peer
+        // still sent one, we deliberately drop it.
+        update
+            .set(account_identity.is_primary, false)
+            .set(account_identity.aik_priv_ed25519_base64, "")
+            .set(account_identity.aik_priv_mldsa_base64, "");
         update.perform();
     }
 

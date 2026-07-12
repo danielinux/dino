@@ -180,6 +180,13 @@ public class PairingOptions : GLib.Object {
     public bool    share_primary     { get; set; }
     public uint8[] state_blob        { get; set; default = new uint8[0]; }
     public uint8   new_device_flags  { get; set; }
+    // Trust Manifest Phase 2 (§E2): the CONFIRMER's own DIK private halves. The
+    // newcomer's DeviceCertificate is issued (signed) under these, NOT under the
+    // account AIK — pairing is a DIK delegation, and the manifest ADD entry (also
+    // DIK-signed by the confirmer) is what actually confers trust. When null the
+    // FSM falls back to signing the DC under the AIK (legacy/self-genesis path).
+    public uint8[]? dik_priv_ed25519 { get; set; default = null; }
+    public uint8[]? dik_priv_mldsa   { get; set; default = null; }
 }
 
 public class PairingResult : GLib.Object {
@@ -569,17 +576,31 @@ public class PairingExisting : GLib.Object {
             if (opts.share_primary) {
                 flags |= FLAG_PRIMARY;
             }
+            // Trust Manifest Phase 2 (§E2): sign the newcomer DC under the
+            // CONFIRMER's DIK when available (pairing is a DIK delegation). Fall
+            // back to the account AIK only when no DIK priv was supplied.
+            Bytes issue_priv_ed;
+            Bytes issue_priv_mldsa;
+            if (opts.dik_priv_ed25519 != null && opts.dik_priv_mldsa != null
+                    && ((!) opts.dik_priv_ed25519).length > 0 && ((!) opts.dik_priv_mldsa).length > 0) {
+                issue_priv_ed = new Bytes((!) opts.dik_priv_ed25519);
+                issue_priv_mldsa = new Bytes((!) opts.dik_priv_mldsa);
+            } else {
+                issue_priv_ed = new Bytes(aik.priv_ed25519);
+                issue_priv_mldsa = new Bytes(aik.priv_mldsa);
+            }
             DeviceCertificate dc = DeviceCertificate.issue(
                 opts.new_device_id,
                 new Bytes(((!) dik).pub_ed25519),
                 new Bytes(((!) dik).pub_x25519),
                 new Bytes(((!) dik).pub_mldsa),
-                new Bytes(aik.priv_ed25519),
-                new Bytes(aik.priv_mldsa),
+                issue_priv_ed,
+                issue_priv_mldsa,
                 flags
             );
             issued_cert = dc;
-            uint8[] issuance = marshal_issuance_payload(dc, aik, opts.share_primary, opts.state_blob);
+            // §E1: AIK_priv never travels — force share_priv=false in the payload.
+            uint8[] issuance = marshal_issuance_payload(dc, aik, false, opts.state_blob);
             uint8[] enc_payload = do_encrypt(issuance, 'E');
             current_step = PairingStep.SENT_PAYLOAD;
             return new PairingMsg(PairingMsg.TYPE_PAYLOAD, enc_payload);

@@ -132,6 +132,9 @@ public class Plugin : RootInterface, Object {
             db.apply_paired_identity(account, result);
             db.store_local_device_certificate(account, (int) result.cert.device_id, Base64.encode(result.cert.marshal()));
             module.publish_current_state.begin(stream);
+            // Trust Manifest Phase 2 (§D3): adopt the account manifest so this
+            // newcomer sees itself + siblings once the confirmer's ADD lands.
+            module.fetch_and_apply_own_manifest.begin(stream);
         });
         dialog.present();
     }

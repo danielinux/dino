@@ -30,6 +30,9 @@ class TrustManifestTest : Gee.TestCase {
         add_test("removal_wins", test_removal_wins);
         add_test("convergence_independent_of_order", test_convergence);
         add_test("marshal_roundtrip", test_roundtrip);
+        add_test("head_sign_verify", test_head_sign_verify);
+        add_test("migration_roundtrip", test_migration_roundtrip);
+        add_test("confirmer_append", test_confirmer_append);
     }
 
     // ── DC_SUBJECT / KAT object builders ─────────────────────────────────────
@@ -336,6 +339,108 @@ class TrustManifestTest : Gee.TestCase {
                 fail_if_not(((!) m2).fold().size == 2, "unmarshalled manifest still folds to {D1, D2}");
             }
         } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    // ── Phase 2: head sign/verify + migration + confirmer-append ─────────────
+
+    private void test_head_sign_verify() {
+        try {
+            AccountIdentityKey aik = AccountIdentityKey.generate();
+            Dev d1 = make_dev(1001, new Bytes(aik.priv_ed25519), new Bytes(aik.priv_mldsa));
+            var g = genesis(aik, d1);
+            var m = manifest_of(aik.public_key(), new TrustEntry[]{ g });
+
+            // Sign the head under D1's DIK; verify_head must be true for D1's DIK...
+            m.sign_head(new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa));
+            fail_if_not(m.verify_head(new Bytes(d1.dik.pub_ed25519), new Bytes(d1.dik.pub_mldsa)),
+                "verify_head must accept the DIK that signed it");
+
+            // ...and false under an unrelated DIK.
+            DeviceIdentityKey other = DeviceIdentityKey.generate();
+            fail_if(m.verify_head(new Bytes(other.pub_ed25519), new Bytes(other.pub_mldsa)),
+                "verify_head must reject a wrong DIK");
+        } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    // Mirrors build_and_publish_genesis_manifest: the primary (D1, AIK holder)
+    // builds a genesis manifest from a 2-device authorized set — its own self DC
+    // (AIK-signed genesis) plus a sibling D2 whose DC is RE-ISSUED under the
+    // primary's DIK and appended as a DIK-signed ADD. Fold must yield {D1, D2}.
+    private void test_migration_roundtrip() {
+        try {
+            AccountIdentityKey aik = AccountIdentityKey.generate();
+            // D1 is the primary: its DC is AIK-signed (genesis).
+            Dev d1 = make_dev(1001, new Bytes(aik.priv_ed25519), new Bytes(aik.priv_mldsa));
+            // D2 pre-exists in the account with its own DIK (its old cert would be
+            // AIK-signed; migration RE-ISSUES it under D1's DIK).
+            DeviceIdentityKey d2_dik = DeviceIdentityKey.generate();
+            DeviceCertificate d2_reissued = DeviceCertificate.issue(1002,
+                new Bytes(d2_dik.pub_ed25519), new Bytes(d2_dik.pub_x25519), new Bytes(d2_dik.pub_mldsa),
+                new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa), 0);
+
+            var g = genesis(aik, d1);
+            var m = new TrustManifest();
+            m.aik = aik.public_key();
+            m.prev_hash = new uint8[32];
+            m.entries = new Gee.ArrayList<TrustEntry>();
+            m.entries.add(g);
+            var add2 = sign_entry(TrustEntry.ACTION_ADD, 1002, d2_reissued, m.next_lamport(),
+                clone_heads(m), d1.id, sha256_arr(d1.dc.marshal()), 2000,
+                new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa));
+            m.entries.add(add2);
+            m.version = 2;
+            m.sign_head(new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa));
+
+            var trusted = m.fold();
+            fail_if_not_eq_int(trusted.size, 2, "genesis migration folds to exactly {D1, D2}");
+            fail_if_not(trusted.has_key("1001"), "D1 (genesis) present");
+            fail_if_not(trusted.has_key("1002"), "D2 (re-issued sibling) present");
+            // Head sig is under D1, a folded device.
+            fail_if_not(m.verify_head(new Bytes(d1.dik.pub_ed25519), new Bytes(d1.dik.pub_mldsa)),
+                "head signed by a folded device (D1)");
+        } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    // A trusted non-genesis device (D2) appends a DIK-signed ADD for a newcomer
+    // (D3), whose DC is issued under D2's DIK. Fold must then contain D3.
+    private void test_confirmer_append() {
+        try {
+            AccountIdentityKey aik = AccountIdentityKey.generate();
+            Dev d1 = make_dev(1001, new Bytes(aik.priv_ed25519), new Bytes(aik.priv_mldsa));
+            var g = genesis(aik, d1);
+            Dev d2 = make_dev(1002, new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa));
+            var add2 = sign_entry(TrustEntry.ACTION_ADD, d2.id, d2.dc, 1, parents_of(g.compute_hash()),
+                d1.id, sha256_arr(d1.dc.marshal()), 1001,
+                new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa));
+
+            var m = manifest_of(aik.public_key(), new TrustEntry[]{ g, add2 });
+            var fold0 = m.fold();
+            fail_if_not(fold0.has_key("1002"), "D2 trusted before it authors");
+
+            // D2 (confirmer) admits newcomer D3: D3's DC issued under D2's DIK,
+            // ADD entry authored + signed by D2.
+            Dev d3 = make_dev(1003, new Bytes(d2.dik.priv_ed25519), new Bytes(d2.dik.priv_mldsa));
+            var add3 = sign_entry(TrustEntry.ACTION_ADD, d3.id, d3.dc, m.next_lamport(),
+                clone_heads(m), d2.id, sha256_arr(d2.dc.marshal()), 3000,
+                new Bytes(d2.dik.priv_ed25519), new Bytes(d2.dik.priv_mldsa));
+            m.entries.add(add3);
+            m.version = m.version + 1;
+            m.sign_head(new Bytes(d2.dik.priv_ed25519), new Bytes(d2.dik.priv_mldsa));
+
+            var trusted = m.fold();
+            fail_if_not_eq_int(trusted.size, 3, "fold now contains {D1, D2, D3}");
+            fail_if_not(trusted.has_key("1003"), "newcomer D3 appears after confirmer append");
+            // The new head signature verifies under the authoring member D2.
+            fail_if_not(m.verify_head(new Bytes(d2.dik.pub_ed25519), new Bytes(d2.dik.pub_mldsa)),
+                "head signed by folded confirmer D2");
+        } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    private Gee.ArrayList<Bytes> clone_heads(TrustManifest m) {
+        var heads = m.current_heads();
+        var l = new Gee.ArrayList<Bytes>();
+        l.add_all(heads);
+        return l;
     }
 
     private static bool keys_equal(Gee.HashMap<string, DeviceCertificate> a, Gee.HashMap<string, DeviceCertificate> b) {

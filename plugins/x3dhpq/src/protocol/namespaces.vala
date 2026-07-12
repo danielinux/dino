@@ -35,6 +35,7 @@ public string[] get_disco_features() {
         NS_RECOVERY,
         NS_GROUP,
         NS_DEVTRACKER,
+        NS_TRUSTMANIFEST,
     };
 }
 

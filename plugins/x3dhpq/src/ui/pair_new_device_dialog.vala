@@ -108,16 +108,22 @@ public class PairNewDeviceDialog : Gtk.Window {
             opts.new_device_id = 1;
             warning("PairNewDeviceDialog: failed to generate device id: %s", e.message);
         }
-        // §10.6.6 / #46: a confirmed device embraces the account membership — it
-        // MUST drop its own provisional AIK and adopt the account AIK_priv so it
-        // becomes a full authorized manager (shows the account fingerprint, can
-        // verify/anchor the account audit chain, and can itself confirm/revoke).
-        // Transferring share_primary is what carries AIK_priv in the issuance;
-        // without it the new device keeps its own AIK and stays fail-closed
-        // (observed: paired device shows its own AIK, "not covered by AddDevice",
-        // audit chain cannot anchor).
-        opts.share_primary = true;
+        // Trust Manifest Phase 2 (§E1): AIK_priv no longer travels. The newcomer
+        // becomes a full member via a DIK-signed manifest ADD (appended by this
+        // confirming device), NOT by adopting the account root key. So we never
+        // share the primary key any more.
+        opts.share_primary = false;
         opts.new_device_flags = 0;
+        // §E2: the confirmer signs the newcomer's DC under its OWN DIK. Load this
+        // device's DIK private halves so the FSM issues the DC as a delegation.
+        if (identity_row != null) {
+            try {
+                opts.dik_priv_ed25519 = bytes_to_uint8_array(bytes_from_base64(((!) identity_row)[db.account_identity.dik_priv_ed25519_base64]));
+                opts.dik_priv_mldsa   = bytes_to_uint8_array(bytes_from_base64(((!) identity_row)[db.account_identity.dik_priv_mldsa_base64]));
+            } catch (GLib.Error e) {
+                warning("PairNewDeviceDialog: failed to load local DIK priv for DC issuance: %s", e.message);
+            }
+        }
 
         build_ui();
         wire_signals();

@@ -286,6 +286,29 @@ public class TrustManifest : Object {
         return hex_of(compute_hash());
     }
 
+    // §B: sign the manifest HEAD (signed_part) with the PUBLISHING device's DIK.
+    // Both hybrid halves are set; the signer must be a device present in the fold
+    // (verified separately by verify_head at the receiver). The signed input is
+    // the Phase-1 KAT-locked signed_part, so this is interop-stable.
+    public void sign_head(Bytes dik_priv_ed, Bytes dik_priv_mldsa) throws GLib.Error {
+        uint8[] sp = signed_part();
+        signature = bytes_to_uint8_array(global::X3dhpq.Crypto.ed25519_sign(dik_priv_ed, new Bytes(sp)));
+        mldsa_signature = bytes_to_uint8_array(global::X3dhpq.Crypto.mldsa65_sign(dik_priv_mldsa, new Bytes(sp)));
+    }
+
+    // §B: verify the head signature under a candidate device's DIK public halves.
+    // BOTH Ed25519 and ML-DSA-65 must verify over signed_part(). Never throws.
+    public bool verify_head(Bytes dik_pub_ed, Bytes dik_pub_mldsa) {
+        if (signature.length == 0 || mldsa_signature.length == 0) return false;
+        try {
+            uint8[] sp = signed_part();
+            if (!global::X3dhpq.Crypto.ed25519_verify(dik_pub_ed, new Bytes(sp), new Bytes(signature))) return false;
+            return global::X3dhpq.Crypto.mldsa65_verify(dik_pub_mldsa, new Bytes(sp), new Bytes(mldsa_signature));
+        } catch (GLib.Error e) {
+            return false;
+        }
+    }
+
     public static bool is_v1(uint8[] b) {
         uint8[] PREFIX = v1_prefix();
         if (b.length < PREFIX.length) return false;

@@ -166,7 +166,11 @@ class PairingTest : Gee.TestCase {
     }
 
     /**
-     * Case 3: share_primary=true → nResult.aik_priv != null, priv_ed matches original.
+     * Case 3 (Trust Manifest Phase 2, §E1): AIK_priv NEVER travels in the issuance
+     * payload, even when the caller sets share_primary=true. The confirmer forces
+     * share_priv=false, so the newcomer's result.aik_priv MUST be null — the
+     * newcomer becomes a member via a DIK-signed manifest ADD, not by adopting the
+     * account root key. The account AIK *pub* still travels and is adopted.
      */
     private void test_share_primary() {
         try {
@@ -183,33 +187,21 @@ class PairingTest : Gee.TestCase {
             PairingResult? res = newdev.get_result();
             fail_if(res == null, "share_primary: result is null");
 
-            AccountIdentityKey? received_priv = ((!) res).aik_priv;
-            fail_if(received_priv == null, "share_primary: aik_priv should not be null");
+            // §E1: AIK_priv must never be shared, regardless of share_primary.
+            fail_if(((!) res).aik_priv != null,
+                "Phase 2: aik_priv must be null even when share_primary=true (§E1)");
 
-            // priv_ed should match the original aik
-            fail_if_not_eq_uint8_arr(
-                aik.priv_ed25519,
-                ((!) received_priv).priv_ed25519,
-                "share_primary: priv_ed25519 mismatch"
-            );
-
-            // pub_ed and pub_mldsa should also match
+            // The account AIK pub is still adopted so the manifest genesis verifies.
+            fail_if(((!) res).aik_pub == null, "share_primary: aik_pub should still travel");
             fail_if_not_eq_uint8_arr(
                 aik.pub_ed25519,
-                ((!) received_priv).pub_ed25519,
-                "share_primary: pub_ed25519 mismatch"
+                ((!) res).aik_pub.pub_ed25519,
+                "share_primary: aik_pub.pub_ed25519 must match the account AIK"
             );
             fail_if_not_eq_uint8_arr(
                 aik.pub_mldsa,
-                ((!) received_priv).pub_mldsa,
-                "share_primary: pub_mldsa mismatch"
-            );
-
-            // priv_mldsa must also be transferred (the 4-field issuance fix)
-            fail_if_not_eq_uint8_arr(
-                aik.priv_mldsa,
-                ((!) received_priv).priv_mldsa,
-                "share_primary: priv_mldsa mismatch"
+                ((!) res).aik_pub.pub_mldsa,
+                "share_primary: aik_pub.pub_mldsa must match the account AIK"
             );
 
         } catch (Error e) {

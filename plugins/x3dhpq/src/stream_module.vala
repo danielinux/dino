@@ -31,6 +31,13 @@ public class StreamModule : XmppStreamModule {
         .set_persist_items(true)
         .set_max_items("1")
         .set_access_model(Pubsub.ACCESS_MODEL_WHITELIST);
+    // Trust Manifest (Phase 2): identical publish semantics to the devicelist
+    // node (persist, open access) but pinned to a single retained item
+    // (max_items=1), matching §A.
+    private static Pubsub.PublishOptions MANIFEST_PUBLISH_OPTIONS = new Pubsub.PublishOptions()
+        .set_persist_items(true)
+        .set_max_items("1")
+        .set_access_model(Pubsub.ACCESS_MODEL_OPEN);
     private HashMap<Jid, Future<ArrayList<int>>> active_devicelist_requests = new HashMap<Jid, Future<ArrayList<int>>>(Jid.hash_func, Jid.equals_func);
 
     // pair stanza step counters keyed by base64(sid)
@@ -127,6 +134,12 @@ public class StreamModule : XmppStreamModule {
         pubsub.add_filtered_notification(stream, Protocol.NS_DEVTRACKER, (stream, jid, id, node) => {
             handle_devtracker_event(stream, jid, node);
         }, null, null);
+        // Trust Manifest (Phase 2 §A): live +notify of a manifest item (own or a
+        // contact). Registering the filtered notification also advertises
+        // `urn:xmppqr:x3dhpq:trustmanifest:0+notify` in disco#info.
+        pubsub.add_filtered_notification(stream, Protocol.NS_TRUSTMANIFEST, (stream, jid, id, node) => {
+            handle_manifest_event(stream, jid, id, node);
+        }, null, null);
 
         attached_stream = stream;
         stream.get_module(Xmpp.MessageModule.IDENTITY).received_message.connect(on_received_message);
@@ -149,6 +162,7 @@ public class StreamModule : XmppStreamModule {
         pubsub.remove_filtered_notification(stream, Protocol.NS_GROUP);
         pubsub.remove_filtered_notification(stream, Protocol.NS_PAIR);
         pubsub.remove_filtered_notification(stream, Protocol.NS_DEVTRACKER);
+        pubsub.remove_filtered_notification(stream, Protocol.NS_TRUSTMANIFEST);
 
         stream.get_module(Xmpp.MessageModule.IDENTITY).received_message.disconnect(on_received_message);
         attached_stream = null;
@@ -169,6 +183,11 @@ public class StreamModule : XmppStreamModule {
         }
         if (db.is_authorized(account)) {
             yield publish_device_list(stream);
+            // Trust Manifest Phase 2 (§D1): once the devicelist cache is out, an
+            // authorized device holding AIK_priv migrates the account to a genesis
+            // manifest (idempotent — no-op if a `current` manifest already exists
+            // or this device is not the AIK holder).
+            yield ensure_trust_manifest(stream);
         }
         // publish_bundle is NOT gated: a confirmed non-primary device still needs
         // its own bundle published so peers can PQXDH directly to it. A still-
@@ -957,6 +976,387 @@ public class StreamModule : XmppStreamModule {
         // devicelist via parse_device_list's is_self branch.
     }
 
+    // ==================================================================
+    // Trust Manifest (Phase 2): the LIVE trust source.
+    // ==================================================================
+
+    // Local raw-bytes SHA-256 helper (returns zeros on failure — callers treat a
+    // zero hash as a non-match, which fails closed).
+    private uint8[] manifest_sha256(uint8[] data) {
+        try {
+            return bytes_to_uint8_array(global::X3dhpq.Crypto.sha256(new Bytes(data)));
+        } catch (GLib.Error e) {
+            return new uint8[32];
+        }
+    }
+
+    private static bool manifest_bytes_equal(uint8[] a, uint8[] b) {
+        if (a.length != b.length) return false;
+        for (int i = 0; i < a.length; i++) if (a[i] != b[i]) return false;
+        return true;
+    }
+
+    // Build + hybrid-sign a TrustEntry under the given signer private halves.
+    private Protocol.TrustEntry build_signed_trust_entry(uint8 action, uint32 device_id,
+            Protocol.DeviceCertificate dc, uint64 lamport, Gee.ArrayList<Bytes> parents,
+            uint32 author_id, uint8[] author_dc_hash, Bytes signer_ed_priv, Bytes signer_ml_priv)
+            throws GLib.Error {
+        var e = new Protocol.TrustEntry();
+        e.action = action;
+        e.device_id = device_id;
+        e.dc = dc;
+        e.lamport = lamport;
+        e.parents = parents;
+        e.author_device_id = author_id;
+        e.author_dc_hash = author_dc_hash;
+        e.timestamp = (int64) new DateTime.now_utc().to_unix();
+        uint8[] sp = e.signed_part();
+        e.signature = bytes_to_uint8_array(global::X3dhpq.Crypto.ed25519_sign(signer_ed_priv, new Bytes(sp)));
+        e.mldsa_signature = bytes_to_uint8_array(global::X3dhpq.Crypto.mldsa65_sign(signer_ml_priv, new Bytes(sp)));
+        return e;
+    }
+
+    // §A: read a <trustmanifest> element's base64 text child and unmarshal it.
+    private Protocol.TrustManifest? unmarshal_manifest_node(StanzaNode? node) {
+        if (node == null) return null;
+        StanzaNode tm = node;
+        if (node.name != "trustmanifest") {
+            StanzaNode? inner = node.get_subnode("trustmanifest", Protocol.NS_TRUSTMANIFEST);
+            if (inner != null) tm = (!) inner;
+        }
+        string? b64 = tm.get_string_content();
+        if (b64 == null || b64 == "") return null;
+        try {
+            uint8[] raw = bytes_to_uint8_array(bytes_from_base64((!) b64));
+            return Protocol.TrustManifest.unmarshal(raw);
+        } catch (GLib.Error e) {
+            return null;
+        }
+    }
+
+    // §A: publish a manifest blob to trustmanifest:0 item "current" (open access,
+    // single retained item). Does NOT persist locally — the caller runs
+    // verify_and_apply_manifest afterwards which persists + writes trust tables.
+    private async bool publish_trust_manifest_blob(XmppStream stream, Protocol.TrustManifest m) {
+        string b64 = Base64.encode(m.marshal());
+        StanzaNode node = new StanzaNode.build("trustmanifest", Protocol.NS_TRUSTMANIFEST)
+            .add_self_xmlns()
+            .put_node(new StanzaNode.text(b64));
+        bool ok = yield stream.get_module(Pubsub.Module.IDENTITY).publish(stream, null,
+            Protocol.NS_TRUSTMANIFEST, "current", node, MANIFEST_PUBLISH_OPTIONS);
+        if (ok) {
+            yield try_make_node_public(stream, Protocol.NS_TRUSTMANIFEST);
+        } else {
+            warning("publish_trust_manifest_blob: publish failed for %s", account.bare_jid.to_string());
+        }
+        return ok;
+    }
+
+    // §A fetch helper: fetch owner `jid`'s current manifest (own or a contact).
+    public async Protocol.TrustManifest? fetch_trust_manifest(XmppStream stream, Jid jid) {
+        StanzaNode pubsub = new StanzaNode.build("pubsub", Pubsub.NS_URI).add_self_xmlns()
+            .put_node(new StanzaNode.build("items", Pubsub.NS_URI)
+                .put_attribute("node", Protocol.NS_TRUSTMANIFEST)
+                .put_node(new StanzaNode.build("item", Pubsub.NS_URI).put_attribute("id", "current")));
+        Iq.Stanza iq = new Iq.Stanza.get(pubsub) { to = jid };
+        try {
+            Iq.Stanza result = yield stream.get_module(Iq.Module.IDENTITY).send_iq_async(stream, iq);
+            StanzaNode? item = result.stanza.get_deep_subnode(Pubsub.NS_URI + ":pubsub", Pubsub.NS_URI + ":items", Pubsub.NS_URI + ":item");
+            if (item == null || item.sub_nodes.size == 0) return null;
+            return unmarshal_manifest_node(item.sub_nodes[0]);
+        } catch (Error e) {
+            return null;
+        }
+    }
+
+    // §A inbound +notify handler.
+    private void handle_manifest_event(XmppStream stream, Jid jid, string? id, StanzaNode? node) {
+        Protocol.TrustManifest? m = unmarshal_manifest_node(node);
+        if (m == null) {
+            // Absent / unmarshal failure: leave the devicelist fallback path in
+            // charge (never hard-fail the owner). §C fallback.
+            return;
+        }
+        verify_and_apply_manifest(jid, ((!) m).marshal());
+    }
+
+    // §C gate: verify (AIK pin + version/rollback/fork + fold + head-sig under a
+    // folded device) then write the folded device set into the trust tables. On
+    // any REJECT, keep the last good state (do not wipe trust). Returns true if
+    // the manifest was accepted and applied.
+    private bool verify_and_apply_manifest(Jid jid, uint8[] bytes) {
+        string bare = jid.bare_jid.to_string();
+        bool is_self = jid.bare_jid.equals(account.bare_jid);
+
+        // 1.
+        Protocol.TrustManifest? m_ = Protocol.TrustManifest.unmarshal(bytes);
+        if (m_ == null) return false;
+        Protocol.TrustManifest m = (!) m_;
+
+        // 2. AIK pinning (TOFU).
+        uint8[] m_aik_ed = m.aik.pub_ed25519;
+        uint8[] m_aik_ml = m.aik.pub_mldsa;
+        if (is_self) {
+            Row? row = db.get_local_identity(account.id);
+            if (row == null) return false;
+            string? ed_b64 = ((!) row)[db.account_identity.aik_pub_ed25519_base64];
+            string? ml_b64 = ((!) row)[db.account_identity.aik_pub_mldsa_base64];
+            if (ed_b64 == null || ml_b64 == null || ed_b64 == "" || ml_b64 == "") return false;
+            try {
+                if (!manifest_bytes_equal(m_aik_ed, bytes_to_uint8_array(bytes_from_base64((!) ed_b64)))
+                        || !manifest_bytes_equal(m_aik_ml, bytes_to_uint8_array(bytes_from_base64((!) ml_b64)))) {
+                    warning("x3dhpq: OWN trust manifest rejected — account AIK mismatch (root swap)");
+                    return false;
+                }
+            } catch (GLib.Error e) { return false; }
+        } else {
+            Bytes pin_ed, pin_ml;
+            if (db.get_peer_aik_pubs(account, bare, out pin_ed, out pin_ml)) {
+                if (!manifest_bytes_equal(m_aik_ed, bytes_to_uint8_array(pin_ed))
+                        || !manifest_bytes_equal(m_aik_ml, bytes_to_uint8_array(pin_ml))) {
+                    warning("x3dhpq: trust manifest from %s rejected — AIK != pinned AIK (root swap)", bare);
+                    db.flag_peer_devicelist_fork(account, bare);
+                    return false;
+                }
+            } else {
+                // First sight: pin the manifest's AIK (TOFU).
+                db.pin_peer_aik_first_use(account, bare, m_aik_ed, m_aik_ml);
+            }
+        }
+
+        // 3. Version / rollback / fork guard.
+        long last = db.get_trust_manifest_version(account, bare);
+        long ver = (long) m.version;
+        string blob_hash = m.hash_hex();
+        if (last >= 0) {
+            if (ver < last) {
+                warning("x3dhpq: trust manifest from %s rejected — version %ld < last %ld (rollback)", bare, ver, last);
+                return false;
+            }
+            if (ver == last) {
+                string? stored_hash = db.get_trust_manifest_blob_hash(account, bare);
+                if (stored_hash != null && stored_hash != blob_hash) {
+                    warning("x3dhpq: trust manifest from %s rejected — same version %ld, different blob (fork)", bare, ver);
+                    return false;
+                }
+            }
+        }
+
+        // 4. Fold. An invalid genesis ⇒ empty fold ⇒ REJECT (keep last good).
+        var folded = m.fold();
+        if (folded.size == 0) {
+            warning("x3dhpq: trust manifest from %s rejected — empty fold (invalid genesis)", bare);
+            return false;
+        }
+
+        // 5. Head signature must verify under some folded device's DIK.
+        bool head_ok = false;
+        foreach (var en in folded.entries) {
+            Protocol.DeviceCertificate dc = en.value;
+            if (m.verify_head(dc.dik_pub_ed25519, dc.dik_pub_mldsa)) {
+                head_ok = true;
+                break;
+            }
+        }
+        if (!head_ok) {
+            warning("x3dhpq: trust manifest from %s rejected — head signature not by a member device", bare);
+            return false;
+        }
+
+        // 6. Accept: persist blob/version/hash and write the folded set into the
+        // trust tables (the same rows the send-time fanout reads).
+        db.store_trust_manifest(account, bare, "current", Base64.encode(bytes), ver, blob_hash);
+        var folded_ids = new Gee.ArrayList<int>();
+        foreach (var en in folded.entries) {
+            Protocol.DeviceCertificate dc = en.value;
+            int did = (int) dc.device_id;
+            folded_ids.add(did);
+            db.store_remote_device(account, bare, did, Base64.encode(dc.marshal()), (long) dc.created_at, dc.flags, true);
+        }
+        db.prune_remote_devices_not_in(account, bare, folded_ids);
+        var loaded = new ArrayList<int>();
+        loaded.add_all(folded_ids);
+        device_list_loaded(jid, loaded);
+        return true;
+    }
+
+    // §D1: migration / genesis. Idempotent. Only an authorized device holding the
+    // account AIK_priv builds the genesis manifest; every other device adopts what
+    // that device published (via fetch/+notify). Called after publish_device_list.
+    public async void ensure_trust_manifest(XmppStream stream) {
+        string own_bare = account.bare_jid.to_string();
+
+        // Already migrated locally? (a `current` manifest is recorded) → extend by
+        // events, never rebuild genesis.
+        if (db.get_trust_manifest_version(account, own_bare) >= 0) {
+            return;
+        }
+        // The server may already hold a manifest (published by a sibling): adopt it.
+        Protocol.TrustManifest? existing = yield fetch_trust_manifest(stream, account.bare_jid);
+        if (existing != null) {
+            verify_and_apply_manifest(account.bare_jid, ((!) existing).marshal());
+            return;
+        }
+        // Genesis requires AIK_priv (the primary/first authorized device).
+        if (!db.has_local_aik_priv(account)) {
+            return;
+        }
+        try {
+            yield build_and_publish_genesis_manifest(stream);
+        } catch (GLib.Error e) {
+            warning("ensure_trust_manifest: genesis build failed for %s: %s", own_bare, e.message);
+        }
+    }
+
+    private async void build_and_publish_genesis_manifest(XmppStream stream) throws GLib.Error {
+        string own_bare = account.bare_jid.to_string();
+        int? self_id_n = db.get_local_device_id(account);
+        if (self_id_n == null) throw new IOError.FAILED("no local device id");
+        uint32 self_id = (uint32) (!) self_id_n;
+
+        Row? row = db.get_local_identity(account.id);
+        if (row == null) throw new IOError.FAILED("no local identity");
+        Bytes aik_priv_ed = bytes_from_base64(((!) row)[db.account_identity.aik_priv_ed25519_base64]);
+        Bytes aik_priv_ml = bytes_from_base64(((!) row)[db.account_identity.aik_priv_mldsa_base64]);
+        Bytes aik_pub_ed = bytes_from_base64(((!) row)[db.account_identity.aik_pub_ed25519_base64]);
+        Bytes aik_pub_ml = bytes_from_base64(((!) row)[db.account_identity.aik_pub_mldsa_base64]);
+        Bytes dik_priv_ed = bytes_from_base64(((!) row)[db.account_identity.dik_priv_ed25519_base64]);
+        Bytes dik_priv_ml = bytes_from_base64(((!) row)[db.account_identity.dik_priv_mldsa_base64]);
+
+        // Self genesis DC (AIK-signed) — this is the account's genesis certificate.
+        string self_cert_b64 = db.ensure_local_device_certificate(account);
+        Protocol.DeviceCertificate? self_dc = Protocol.DeviceCertificate.unmarshal(bytes_from_base64(self_cert_b64));
+        if (self_dc == null) throw new IOError.FAILED("cannot decode self genesis DC");
+        uint8[] self_dc_hash = manifest_sha256(((!) self_dc).marshal());
+
+        var aik_pub = new Protocol.AccountIdentityPub();
+        aik_pub.pub_ed25519 = bytes_to_uint8_array(aik_pub_ed);
+        aik_pub.pub_mldsa = bytes_to_uint8_array(aik_pub_ml);
+
+        var m = new Protocol.TrustManifest();
+        m.aik = aik_pub;
+        m.prev_hash = new uint8[32];
+        m.entries = new Gee.ArrayList<Protocol.TrustEntry>();
+
+        // Genesis entry (AIK-signed, the only AIK-signed edge).
+        var genesis = build_signed_trust_entry(Protocol.TrustEntry.ACTION_ADD, self_id, (!) self_dc,
+            0, new Gee.ArrayList<Bytes>(), self_id, self_dc_hash, aik_priv_ed, aik_priv_ml);
+        m.entries.add(genesis);
+
+        // Each OTHER authorized device: RE-ISSUE its DC under the primary's DIK and
+        // append a DIK-signed ADD entry parented on the current heads.
+        foreach (Protocol.DeviceListDevice other in db.get_device_list_devices(account, own_bare)) {
+            if (other.device_id == self_id) continue;
+            if (other.cert_bytes.length == 0) continue;
+            Protocol.DeviceCertificate? odc = Protocol.DeviceCertificate.unmarshal(new Bytes(other.cert_bytes));
+            if (odc == null) continue;
+            Protocol.DeviceCertificate reissued = Protocol.DeviceCertificate.issue(
+                other.device_id,
+                ((!) odc).dik_pub_ed25519,
+                ((!) odc).dik_pub_x25519,
+                ((!) odc).dik_pub_mldsa,
+                dik_priv_ed, dik_priv_ml,
+                ((!) odc).flags);
+            var add = build_signed_trust_entry(Protocol.TrustEntry.ACTION_ADD, other.device_id, reissued,
+                m.next_lamport(), m.current_heads(), self_id, self_dc_hash, dik_priv_ed, dik_priv_ml);
+            m.entries.add(add);
+        }
+
+        // version = (last devicelist version) + 1.
+        m.version = (uint64) (db.get_device_list_version(account, own_bare) + 1);
+        m.sign_head(dik_priv_ed, dik_priv_ml);
+
+        if (yield publish_trust_manifest_blob(stream, m)) {
+            verify_and_apply_manifest(account.bare_jid, m.marshal());
+        }
+    }
+
+    // §D2: at pairing confirmation, append a DIK-signed ADD for the newcomer and
+    // publish. Replaces the AddDevice audit-entry publish on the pairing path.
+    public async bool append_device_add_to_manifest(XmppStream stream, Protocol.DeviceCertificate newcomer_dc) {
+        string own_bare = account.bare_jid.to_string();
+
+        // Load the current manifest: freshest from the server, else local cache.
+        Protocol.TrustManifest? m = yield fetch_trust_manifest(stream, account.bare_jid);
+        if (m == null) {
+            string? cached = db.get_trust_manifest_payload(account, own_bare);
+            if (cached != null) {
+                try {
+                    m = Protocol.TrustManifest.unmarshal(bytes_to_uint8_array(bytes_from_base64((!) cached)));
+                } catch (GLib.Error e) { m = null; }
+            }
+        }
+        if (m == null) {
+            // Not migrated yet — build genesis first, then reload.
+            yield ensure_trust_manifest(stream);
+            m = yield fetch_trust_manifest(stream, account.bare_jid);
+            if (m == null) {
+                string? cached2 = db.get_trust_manifest_payload(account, own_bare);
+                if (cached2 != null) {
+                    try {
+                        m = Protocol.TrustManifest.unmarshal(bytes_to_uint8_array(bytes_from_base64((!) cached2)));
+                    } catch (GLib.Error e) { m = null; }
+                }
+            }
+        }
+        if (m == null) {
+            warning("append_device_add_to_manifest: no manifest available for %s", own_bare);
+            return false;
+        }
+
+        int? self_id_n = db.get_local_device_id(account);
+        if (self_id_n == null) return false;
+        uint32 self_id = (uint32) (!) self_id_n;
+
+        var fold = ((!) m).fold();
+        if (!fold.has_key(self_id.to_string())) {
+            warning("append_device_add_to_manifest: this device (%u) is not in the manifest fold — cannot author", self_id);
+            return false;
+        }
+        Protocol.DeviceCertificate self_dc = fold.get(self_id.to_string());
+        uint8[] self_dc_hash = manifest_sha256(self_dc.marshal());
+
+        Row? row = db.get_local_identity(account.id);
+        if (row == null) return false;
+        Bytes dik_priv_ed, dik_priv_ml;
+        try {
+            dik_priv_ed = bytes_from_base64(((!) row)[db.account_identity.dik_priv_ed25519_base64]);
+            dik_priv_ml = bytes_from_base64(((!) row)[db.account_identity.dik_priv_mldsa_base64]);
+        } catch (GLib.Error e) {
+            warning("append_device_add_to_manifest: cannot load local DIK priv: %s", e.message);
+            return false;
+        }
+
+        try {
+            uint8[] prev_hash = manifest_sha256(((!) m).marshal());   // before mutation
+            var entry = build_signed_trust_entry(Protocol.TrustEntry.ACTION_ADD, newcomer_dc.device_id,
+                newcomer_dc, ((!) m).next_lamport(), ((!) m).current_heads(),
+                self_id, self_dc_hash, dik_priv_ed, dik_priv_ml);
+            ((!) m).entries.add(entry);
+            ((!) m).version = ((!) m).version + 1;
+            ((!) m).prev_hash = prev_hash;
+            ((!) m).sign_head(dik_priv_ed, dik_priv_ml);
+        } catch (GLib.Error e) {
+            warning("append_device_add_to_manifest: sign failed: %s", e.message);
+            return false;
+        }
+
+        if (yield publish_trust_manifest_blob(stream, (!) m)) {
+            verify_and_apply_manifest(account.bare_jid, ((!) m).marshal());
+            return true;
+        }
+        return false;
+    }
+
+    // §D3: a freshly paired newcomer fetches + verifies + folds the account's own
+    // manifest so it sees itself + siblings (once the confirmer's ADD lands).
+    public async void fetch_and_apply_own_manifest(XmppStream stream) {
+        Protocol.TrustManifest? m = yield fetch_trust_manifest(stream, account.bare_jid);
+        if (m != null) {
+            verify_and_apply_manifest(account.bare_jid, ((!) m).marshal());
+        }
+    }
+
     // §11.7 v1->v2 bridge / genesis. Idempotent — no-op once ANY device-audit
     // row already exists for this account (has_device_audit_entries), so this
     // only ever fires once per account, on whichever publish first has a
@@ -1236,6 +1636,22 @@ public class StreamModule : XmppStreamModule {
         StanzaNode node = node_ ?? new StanzaNode.build("devicelist", Protocol.NS_DEVICELIST).add_self_xmlns();
         string bare = jid.bare_jid.to_string();
         bool is_self = jid.bare_jid.equals(account.bare_jid);
+
+        // Trust Manifest Phase 2 (§C): once a manifest exists for this owner it is
+        // the LIVE trust source — the manifest gate (handle_manifest_event /
+        // verify_and_apply_manifest) already wrote the authoritative folded set
+        // into the trust tables. The devicelist is a derived cache only, so do NOT
+        // let the legacy AIK-attested path re-decide trust here (its dc_attested
+        // check would wrongly drop DIK-delegated siblings). Surface the current
+        // known ids and return. When no manifest exists, fall through to the
+        // legacy path unchanged (§C fallback).
+        if (db.get_trust_manifest_version(account, bare) >= 0) {
+            foreach (int existing_id in db.get_remote_device_ids(account, bare)) {
+                devices.add(existing_id);
+            }
+            device_list_loaded(jid, devices);
+            return devices;
+        }
 
         // Collect device entries once; keep cert base64 + added_at for storage.
         var entries = new Gee.ArrayList<Protocol.DeviceListDevice>();

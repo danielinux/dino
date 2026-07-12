@@ -333,8 +333,16 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
             plugin.db.store_remote_device(account, account.bare_jid.to_string(),
                 (int) cert.device_id, Base64.encode(cert.marshal()), (long) cert.created_at, cert.flags);
             if (stream != null) {
-                module.publish_current_state.begin((!) stream);
-                module.publish_add_device_audit_entry.begin((!) stream, cert);
+                // Trust Manifest Phase 2 (§D2): the newcomer is admitted by
+                // appending a DIK-signed ADD entry to the account's trust manifest
+                // (this device authors it). This replaces the AddDevice audit-entry
+                // publish that used to confer trust. publish_current_state still
+                // runs to republish the devicelist cache (= fold output). The
+                // manifest append also re-publishes the manifest itself.
+                module.append_device_add_to_manifest.begin((!) stream, cert, (o, r) => {
+                    module.append_device_add_to_manifest.end(r);
+                    module.publish_current_state.begin((!) stream);
+                });
                 // §11.8: the newcomer is admitted now — retract its queued
                 // enrollment request (if any) so it stops being re-surfaced as
                 // still-pending on this or any other authorized device's next
@@ -371,6 +379,9 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
             plugin.db.store_local_device_certificate(account, (int) result.cert.device_id, Base64.encode(result.cert.marshal()));
             if (stream != null) {
                 module.publish_current_state.begin((!) stream);
+                // Trust Manifest Phase 2 (§D3): adopt the account manifest so this
+                // newcomer sees itself + siblings once the confirmer's ADD lands.
+                module.fetch_and_apply_own_manifest.begin((!) stream);
             }
         });
         dialog.present();
