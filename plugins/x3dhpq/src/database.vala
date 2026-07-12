@@ -1872,6 +1872,18 @@ public class Database : Qlite.Database {
         audit_entry.delete().with(audit_entry.account_id, "=", account.id).perform();
     }
 
+    // Drop the persisted OWN devicelist snapshot (payload/version/content-key). Used by
+    // account reset: the shrink guard (§8.6) compares a fresh publish against this
+    // snapshot, so a stale snapshot from the OLD identity would refuse to publish the
+    // new single-device list ("dropping known device(s) … without revocation"). After
+    // clearing, the reset republishes with first-publish (empty-prev) semantics.
+    public void clear_own_device_list_snapshot(Account account) {
+        device_list.delete()
+            .with(device_list.account_id, "=", account.id)
+            .with(device_list.bare_jid, "=", account.bare_jid.to_string())
+            .perform();
+    }
+
     private string bytes_to_hex_string(uint8[] b) {
         StringBuilder sb = new StringBuilder();
         foreach (uint8 byte in b) {

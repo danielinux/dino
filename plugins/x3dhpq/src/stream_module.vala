@@ -1657,21 +1657,33 @@ public class StreamModule : XmppStreamModule {
 
             // Verify the whole chain on a FRESH chain with no observer connected, so
             // catching up doesn't replay a "device added" notification for every
-            // historical entry. If it verifies clean, adopt it as the live chain
-            // (with the observer wired for FUTURE events) and persist all entries.
+            // historical entry. verify_and_apply advances state for each valid entry
+            // BEFORE throwing on a bad one, so on failure we adopt whatever
+            // genesis-rooted PREFIX did verify and ignore the stale/forked tail
+            // (e.g. items left on the node signed by a pre-reset AIK). If not even
+            // the genesis verifies, adopt nothing.
             var rebuilt = new Protocol.AccountAuditChain(db);
             try {
                 rebuilt.verify_and_apply(account.id, aik_ed, aik_ml, fetched);
             } catch (Protocol.AccountAuditError e) {
-                warning("fetch_audit_history: chain verification failed: %s", e.message);
-                return;
+                if (rebuilt.expected_next_seq() == 0) {
+                    warning("fetch_audit_history: no valid genesis prefix (%s); ignoring node state", e.message);
+                    return;
+                }
+                warning("fetch_audit_history: adopting valid %llu-entry prefix, ignoring stale tail: %s",
+                    rebuilt.expected_next_seq(), e.message);
             }
             rebuilt.audit_entry_observed.connect((action, detail) => {
                 account_audit_event(action, detail);
             });
             audit_chain = rebuilt;
+            // Persist only the entries that actually verified into the adopted prefix
+            // (seq 0 .. next_seq-1); a stale tail beyond it must not be stored.
+            uint64 applied = rebuilt.expected_next_seq();
             foreach (Protocol.AuditEntry e in fetched) {
-                db.store_account_audit_entry(account, e);
+                if (e.seq < applied) {
+                    db.store_account_audit_entry(account, e);
+                }
             }
         } catch (Error e) {
             warning("fetch_audit_history: %s", e.message);

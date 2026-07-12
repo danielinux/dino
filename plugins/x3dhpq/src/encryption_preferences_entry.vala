@@ -256,6 +256,10 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
         // and would otherwise (a) fail verification under the new AIK and (b) leave the
         // chain non-empty so the fresh primary skips its self-genesis AddDevice (§11).
         plugin.db.clear_account_audit_entries(account);
+        // §8.6 exception "back to genesis": drop the OWN devicelist snapshot so the
+        // shrink guard treats the fresh single-device list as a first publish rather
+        // than an (illegal) unrevoked shrink of the OLD identity's list.
+        plugin.db.clear_own_device_list_snapshot(account);
         plugin.db.mint_fresh_identity(account);
 
         StreamModule? module = plugin.app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
