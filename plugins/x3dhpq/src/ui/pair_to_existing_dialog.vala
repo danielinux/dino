@@ -46,6 +46,14 @@ public class PairToExistingDialog : Adw.Window {
     // Session-ID for the active pairing; matches what we registered with the
     // stream module.
     private uint8[]? active_sid = null;
+    // The pairing code for this session, retained so we can re-arm a fresh FSM
+    // if a stray/ghost existing device fails key confirmation.
+    private string? active_code = null;
+    // The existing device we locked onto (the sender of the first valid PAKE1).
+    // On a multi-resource account, several existing resources may race to
+    // initiate and message carbons duplicate their traffic to us; we handshake
+    // with exactly one and ignore the rest.
+    private Xmpp.Jid? locked_peer = null;
     // Signal-handler ID so we can disconnect on cancel / done.
     private ulong pair_message_handler_id = 0;
 
@@ -336,6 +344,9 @@ public class PairToExistingDialog : Adw.Window {
             return;
         }
         active_sid = sid;
+        // Keep the code so we can re-arm a fresh FSM if a stray/ghost existing
+        // device races in with a stale code and fails key confirmation.
+        active_code = parsed_code;
 
         // Instantiate the PairingNew FSM.
         try {
@@ -408,11 +419,45 @@ public class PairToExistingDialog : Adw.Window {
             return;
         }
 
+        // Lock onto the first existing device that reaches us; ignore stanzas
+        // from any other resource. Several existing resources may race to
+        // initiate, and message carbons duplicate each one's traffic across all
+        // of our resources — we handshake with exactly one peer.
+        if (locked_peer == null) {
+            locked_peer = from_jid;
+        } else if (!from_jid.equals((!) locked_peer)) {
+            warning("X3DHPQ-PAIR: RESPONDER dropping stanza type=%u from non-peer %s (locked=%s)",
+                    msg.msg_type, from_jid.to_string(), ((!) locked_peer).to_string());
+            return;
+        }
+
         set_status("Verifying…");
 
         Protocol.PairingMsg? response = null;
         try {
             response = ((!) new_fsm).step(msg);
+        } catch (Protocol.PairingError.PROTOCOL e) {
+            // Stray/duplicate/out-of-order stanza (e.g. a carbon copy already
+            // consumed, or PAKE1 from a second racing initiator). The FSM
+            // validates the message type before mutating state, so nothing was
+            // corrupted — ignore and keep waiting.
+            warning("X3DHPQ-PAIR: RESPONDER ignoring stray stanza type=%u from %s: %s",
+                    msg.msg_type, from_jid.to_string(), e.message);
+            return;
+        } catch (Protocol.PairingError.AUTH e) {
+            // Key confirmation failed for the peer we locked onto. On a polluted
+            // account this is typically a ghost/stray existing device replaying a
+            // stale code — NOT the genuine device. Re-arm a fresh FSM (fresh CPace
+            // state) for the same sid+code and drop the lock, so the real device
+            // can still complete.
+            if (rearm_new_fsm(from_jid, e)) {
+                return;
+            }
+            string reason = "Pairing failed: %s".printf(e.message);
+            set_status(reason);
+            cleanup_handlers();
+            pairing_failed(reason);
+            return;
         } catch (Protocol.PairingError e) {
             string reason = "Pairing failed: %s".printf(e.message);
             set_status(reason);
@@ -450,6 +495,33 @@ public class PairToExistingDialog : Adw.Window {
     }
 
     // ── Private — helpers ──────────────────────────────────────────────────────
+
+    /**
+     * Re-arm the New-side FSM after a locked peer fails key confirmation, so a
+     * stray/ghost existing device can't tear down a session the genuine device
+     * may still complete. Returns true if re-armed (keep waiting), false if not
+     * (caller should fail normally).
+     */
+    private bool rearm_new_fsm(Xmpp.Jid failed_peer, GLib.Error cause) {
+        if (active_sid == null || active_code == null) {
+            return false;
+        }
+        Protocol.DeviceIdentityKey? dik = load_local_dik();
+        if (dik == null) {
+            return false;
+        }
+        try {
+            new_fsm = new Protocol.PairingNew((!) dik, (!) active_code, (!) active_sid);
+        } catch (GLib.Error e) {
+            warning("X3DHPQ-PAIR: RESPONDER failed to re-arm FSM: %s", e.message);
+            return false;
+        }
+        locked_peer = null;
+        warning("X3DHPQ-PAIR: RESPONDER re-armed after auth-fail from stray %s; still waiting for the genuine device",
+                failed_peer.to_string());
+        set_status("Waiting for your other device to confirm…");
+        return true;
+    }
 
     /**
      * Build a DeviceIdentityKey (full, with private material) from the

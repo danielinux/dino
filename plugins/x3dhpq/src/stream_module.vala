@@ -2026,6 +2026,12 @@ public class StreamModule : XmppStreamModule {
         stanza.to = peer;
         stanza.type_ = Xmpp.MessageStanza.TYPE_CHAT;
         stanza.stanza.put_node(pair_node);
+        // Pairing stanzas are strictly point-to-point between two devices. Tell
+        // the server NOT to carbon-copy them to the account's other resources
+        // (XEP-0280 <private/> + XEP-0334 <no-copy/>). Carbon copies are also
+        // dropped defensively on the receive side (see on_received_message).
+        stanza.stanza.put_node(new StanzaNode.build("private", "urn:xmpp:carbons:2").add_self_xmlns());
+        stanza.stanza.put_node(new StanzaNode.build("no-copy", "urn:xmpp:hints").add_self_xmlns());
         stream.get_module(Xmpp.MessageModule.IDENTITY).send_message.begin(stream, stanza);
     }
 
@@ -2182,6 +2188,16 @@ public class StreamModule : XmppStreamModule {
     // ── Inbound message handler ────────────────────────────────────────────────
 
     private void on_received_message(XmppStream stream, Xmpp.MessageStanza message) {
+        // Pairing is strictly point-to-point between two devices; the genuine
+        // handshake is delivered DIRECTLY to our full JID (never a carbon). A
+        // carbon copy is a duplicate of traffic between two OTHER resources of
+        // this account — the Carbons module rewrites message.stanza to the inner
+        // forwarded copy, so without this guard a <pair>/<pair-hello> nested in a
+        // carbon would drive our FSM with a foreign/duplicate stanza (or an
+        // OMEMO-only resource's echoed envelope). Ignore carboned copies.
+        if (Xmpp.Xep.MessageCarbons.MessageFlag.get_flag(message) != null) {
+            return;
+        }
         // Handle inbound <pair xmlns='urn:xmppqr:x3dhpq:pair:0'> in chat messages.
         // Pairing rendezvous no longer depends on a server-pushed <verify-device>
         // headline: the existing device is triggered by a self-PEP <pair-hello>

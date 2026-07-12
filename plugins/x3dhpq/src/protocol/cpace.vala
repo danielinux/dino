@@ -113,9 +113,14 @@ public class CPaceState : GLib.Object {
     }
 
     private static uint8[] build_transcript(uint8[] password, uint8[] sid_bytes, CPaceContext ctx) {
-        /* "X3DHPQ-CPace-Transcript-v1\x00" */
-        string header = "X3DHPQ-CPace-Transcript-v1\x00";
-        uint8[] t = header.data;
+        /* "X3DHPQ-CPace-Transcript-v1\x00" — the domain separator MUST include the
+         * trailing NUL. Vala's `"...\x00".data` drops it (treats \x00 as the C
+         * string terminator), so we append it explicitly to stay byte-identical
+         * with the Go reference / Java (which pin a 27-byte prefix). */
+        uint8[] hdr = "X3DHPQ-CPace-Transcript-v1".data;
+        uint8[] t = new uint8[hdr.length + 1];
+        Memory.copy(t, hdr, hdr.length);
+        t[hdr.length] = 0x00;
 
         pack_field(ref t, ctx.bare_jid.data);
         pack_field(ref t, ctx.initiator_full_jid.data);
@@ -203,9 +208,12 @@ public class CPaceState : GLib.Object {
             mb = tmp;
         }
 
-        /* thInput = "X3DHPQ-CPace-SessionTranscript-v1\x00" || pack(sid) || pack(transcript) || pack(ma) || pack(mb) */
-        string th_header = "X3DHPQ-CPace-SessionTranscript-v1\x00";
-        uint8[] th_input = th_header.data;
+        /* thInput = "X3DHPQ-CPace-SessionTranscript-v1\x00" || pack(sid) || pack(transcript) || pack(ma) || pack(mb)
+         * As in build_transcript, append the trailing NUL that Vala's string.data drops. */
+        uint8[] th_hdr = "X3DHPQ-CPace-SessionTranscript-v1".data;
+        uint8[] th_input = new uint8[th_hdr.length + 1];
+        Memory.copy(th_input, th_hdr, th_hdr.length);
+        th_input[th_hdr.length] = 0x00;
         pack_field(ref th_input, sid);
         pack_field(ref th_input, transcript);
         pack_field(ref th_input, ma);

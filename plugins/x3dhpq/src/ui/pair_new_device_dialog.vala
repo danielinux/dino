@@ -349,6 +349,17 @@ public class PairNewDeviceDialog : Gtk.Window {
 
     private void on_pair_message_received(Jid from_jid, Protocol.PairingMsg msg) {
         if (existing == null) return;
+        // Bind the handshake to the single peer we sent PAKE1 to. On a
+        // multi-resource account, message carbons fan every directed <pair>
+        // stanza out to all of our resources, so we may see PAKE traffic from
+        // OTHER resources (another existing device racing to initiate, or a
+        // carbon of our peer's reply to someone else). Only act on stanzas from
+        // our chosen peer; drop everything else silently.
+        if (peer_jid != null && !from_jid.equals((!) peer_jid)) {
+            warning("X3DHPQ-PAIR: INITIATOR dropping stanza type=%u from non-peer %s (peer=%s)",
+                    msg.msg_type, from_jid.to_string(), ((!) peer_jid).to_string());
+            return;
+        }
         try {
             Protocol.PairingMsg? reply = ((!) existing).step(msg);
             if (reply != null) {
@@ -367,6 +378,13 @@ public class PairNewDeviceDialog : Gtk.Window {
                 disconnect_signals();
                 close();
             }
+        } catch (Protocol.PairingError.PROTOCOL e) {
+            // A stray/duplicate/out-of-order stanza (e.g. a carbon copy of a
+            // message we already consumed, or one for a different FSM step).
+            // The FSM checks the message type BEFORE mutating any state, so
+            // nothing was corrupted — just ignore it and keep waiting.
+            warning("X3DHPQ-PAIR: INITIATOR ignoring stray stanza type=%u from %s: %s",
+                    msg.msg_type, from_jid.to_string(), e.message);
         } catch (GLib.Error e) {
             set_status("Failed: %s".printf(e.message));
             pairing_failed(e.message);

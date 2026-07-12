@@ -156,6 +156,21 @@ internal uint8[] string_to_bytes(string value) {
     return ((uint8[]) value.data).copy();
 }
 
+// Returns the UTF-8 bytes of `label` followed by a single trailing 0x00. Used
+// for domain-separator prefixes that pin a trailing NUL (e.g. the Go/Java
+// "X3DHPQ-...-v1\0" literals): Vala's string.data drops a trailing \x00 (C
+// terminator), so callers must NOT bake the \x00 into the literal and instead
+// append it here to stay byte-identical across clients.
+internal uint8[] label_with_nul(string label) {
+    uint8[] b = label.data;
+    uint8[] r = new uint8[b.length + 1];
+    if (b.length > 0) {
+        Memory.copy(r, b, b.length);
+    }
+    r[b.length] = 0x00;
+    return r;
+}
+
 internal string account_fingerprint(Bytes ed25519_public_key, Bytes mldsa_public_key) throws GLib.Error {
     uint8[] ed25519 = bytes_to_uint8_array(ed25519_public_key);
     uint8[] mldsa = bytes_to_uint8_array(mldsa_public_key);

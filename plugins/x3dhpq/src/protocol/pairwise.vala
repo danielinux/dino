@@ -8,8 +8,14 @@ private const string INFO_ROOT_KEY = "X3DHPQ-RootKey-v0";
 private const string INFO_MESSAGE_KEY = "X3DHPQ-MessageKey-v0";
 private const string INFO_CHECKPOINT_CHAIN_SEND = "X3DHPQ-ChainSend-v1";
 private const string INFO_CHECKPOINT_CHAIN_RECV = "X3DHPQ-ChainRecv-v1";
-private const string CHECKPOINT_TRANSCRIPT_LABEL = "X3DHPQ-Checkpoint-Transcript-v1\x00";
-private const string CHECKPOINT_HISTORY_LABEL = "X3DHPQ-KEMHistory-v1\x00";
+// These domain separators carry a trailing NUL (Go/Java pin
+// "X3DHPQ-Checkpoint-Transcript-v1\0" (32) and "X3DHPQ-KEMHistory-v1\0" (21)).
+// Vala's string.data / string_to_bytes DROPS a trailing \x00 (C terminator), so
+// the label text is stored WITHOUT it here and the NUL is appended explicitly at
+// use via label_with_nul() — otherwise Dino's KEM-checkpoint rekey would derive
+// keys 1 byte of domain-sep short and diverge from other clients (§9).
+private const string CHECKPOINT_TRANSCRIPT_LABEL = "X3DHPQ-Checkpoint-Transcript-v1";
+private const string CHECKPOINT_HISTORY_LABEL = "X3DHPQ-KEMHistory-v1";
 
 // Bound on the pairwise-ratchet skipped-message-key cache (spec §9.4.2),
 // matching the Java/Go reference's MAX_SKIPPED. Named distinctly from
@@ -734,7 +740,7 @@ private Bytes hkdf_expand_44(Bytes prk_source, string info) throws GLib.Error {
 
 private void kem_checkpoint_mix(Bytes sender_ck, Bytes kem_ss, Bytes sender_dh, Bytes kem_ct, uint32 epoch, Bytes previous_history, out Bytes new_cks, out Bytes new_ckr, out Bytes new_history) throws GLib.Error {
     uint8[] transcript_input = concat_four_byte_arrays(
-        string_to_bytes(CHECKPOINT_TRANSCRIPT_LABEL),
+        label_with_nul(CHECKPOINT_TRANSCRIPT_LABEL),
         uint32_to_bytes(epoch),
         bytes_to_uint8_array(sender_dh),
         bytes_to_uint8_array(kem_ct)
@@ -744,7 +750,7 @@ private void kem_checkpoint_mix(Bytes sender_ck, Bytes kem_ss, Bytes sender_dh, 
     new_cks = global::X3dhpq.Crypto.hkdf_expand_sha512(prk, new Bytes((uint8[]) INFO_CHECKPOINT_CHAIN_SEND.data), 32);
     new_ckr = global::X3dhpq.Crypto.hkdf_expand_sha512(prk, new Bytes((uint8[]) INFO_CHECKPOINT_CHAIN_RECV.data), 32);
     Bytes history_hash = global::X3dhpq.Crypto.sha512(new Bytes(concat_four_byte_arrays(
-        string_to_bytes(CHECKPOINT_HISTORY_LABEL),
+        label_with_nul(CHECKPOINT_HISTORY_LABEL),
         bytes_to_uint8_array(previous_history),
         bytes_to_uint8_array(kem_ss),
         bytes_to_uint8_array(transcript_hash)
