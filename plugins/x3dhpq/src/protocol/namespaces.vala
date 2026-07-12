@@ -11,6 +11,9 @@ public const string NS_GROUP = "urn:xmppqr:x3dhpq:group:0";
 // §11.8: sealed device-state tracker + queued enrollment request (persisted on
 // the existing NS_PAIR node, see StreamModule.publish_enrollment_request).
 public const string NS_DEVTRACKER = "urn:xmppqr:x3dhpq:devtracker:0";
+// Trust Manifest (Phase 1): AIK-rooted delegation DAG of authorized devices,
+// published as a single signed blob. See trust_manifest.vala.
+public const string NS_TRUSTMANIFEST = "urn:xmppqr:x3dhpq:trustmanifest:0";
 
 public const string PAYLOAD_TYPE_SENDER_CHAIN = "sender-chain";
 // A group-sync payload bundles the sender-chain announcement with the current

@@ -93,10 +93,18 @@ public class DeviceCertificate : Object {
         cert.device_id = uint32_from_bytes(data, offset);
         offset += 4;
 
-        uint8[]? dik_ed = read_length_prefixed_bytes(data, ref offset);
-        uint8[]? dik_x = read_length_prefixed_bytes(data, ref offset);
-        uint8[]? dik_m = read_length_prefixed_bytes(data, ref offset);
-        if (dik_ed == null || dik_x == null || dik_m == null || offset + 9 > data.length) {
+        // Use the bool+out reader (not the nullable-return one) for the three
+        // DIK fields: any of them may legitimately be empty (an Ed25519-only DIK
+        // has no ML-DSA pub), and Vala coerces a returned zero-length array to
+        // null, so read_length_prefixed_bytes()'s empty result is indistinguishable
+        // from an underflow. read_length_prefixed_field keeps the empty case valid.
+        uint8[] dik_ed;
+        uint8[] dik_x;
+        uint8[] dik_m;
+        if (!read_length_prefixed_field(data, ref offset, out dik_ed)) return null;
+        if (!read_length_prefixed_field(data, ref offset, out dik_x)) return null;
+        if (!read_length_prefixed_field(data, ref offset, out dik_m)) return null;
+        if (offset + 9 > data.length) {
             return null;
         }
         cert.dik_pub_ed25519 = new Bytes((owned) dik_ed);
@@ -776,6 +784,30 @@ private Bytes slice_bytes(Bytes source, int offset, int length) {
 
 private uint8[] concat_length_prefixed_bytes(uint8[] field) {
     return concat_byte_arrays(uint16_to_bytes((uint16) field.length), field);
+}
+
+// Like read_length_prefixed_bytes but returns success via bool and the field via
+// out, so a legitimately empty (length-0) field is preserved rather than being
+// coerced to null (Vala treats a returned zero-length array as null). Used for
+// the DeviceCertificate DIK fields, any of which may be empty.
+private bool read_length_prefixed_field(uint8[] data, ref int offset, out uint8[] field) {
+    field = new uint8[0];
+    if (offset + 2 > data.length) {
+        return false;
+    }
+    uint16 length = uint16_from_bytes(data, offset);
+    offset += 2;
+    if (offset + length > data.length) {
+        return false;
+    }
+    if (length > 0) {
+        field = new uint8[length];
+        for (int i = 0; i < length; i++) {
+            field[i] = data[offset + i];
+        }
+    }
+    offset += length;
+    return true;
 }
 
 private uint8[]? read_length_prefixed_bytes(uint8[] data, ref int offset) {

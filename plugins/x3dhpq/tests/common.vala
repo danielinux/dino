@@ -8,6 +8,7 @@ int main(string[] args) {
     TestSuite.get_root().add_suite(new MembershipJournalTest().get_suite());
     TestSuite.get_root().add_suite(new MembershipDagTest().get_suite());
     TestSuite.get_root().add_suite(new DeviceDagTest().get_suite());
+    TestSuite.get_root().add_suite(new TrustManifestTest().get_suite());
     TestSuite.get_root().add_suite(new DeviceTrackerTest().get_suite());
     TestSuite.get_root().add_suite(new PairingMsgTest().get_suite());
     TestSuite.get_root().add_suite(new PairingCodeTest().get_suite());
