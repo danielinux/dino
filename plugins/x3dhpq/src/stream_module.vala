@@ -1578,6 +1578,15 @@ public class StreamModule : XmppStreamModule {
             return;
         }
 
+        // Gap: we missed one or more intermediate entries (this device was offline
+        // across several audit events, which live +notify never backfills). Fetch the
+        // full audit-node history and re-verify from genesis instead of rejecting the
+        // newest item as out-of-order.
+        if (entry.seq > audit_chain.expected_next_seq()) {
+            fetch_audit_history.begin(stream);
+            return;
+        }
+
         var entries = new Gee.ArrayList<Protocol.AuditEntry>();
         entries.add(entry);
         try {
@@ -1589,10 +1598,85 @@ public class StreamModule : XmppStreamModule {
                 db.store_account_audit_entry(account, entry);
             }
         } catch (Protocol.AccountAuditError e) {
-            // A gap (entry.seq > expected) means we missed intermediate entries that
-            // live +notify never backfills; log it rather than treating the newest
-            // item as genesis. (Full-history fetch of the audit node is a follow-up.)
             warning("handle_audit_event: chain verification failed: %s", e.message);
+        }
+    }
+
+    // Fetch the FULL account audit-node history (all persisted items) and re-verify
+    // the chain from genesis. Live PEP +notify only ever carries the single newest
+    // item, so a device that was offline across several audit events cannot catch up
+    // from notifications alone. Called on a detected seq gap in handle_audit_event.
+    private bool audit_history_fetch_in_flight = false;
+    public async void fetch_audit_history(XmppStream stream) {
+        if (audit_history_fetch_in_flight) {
+            return;   // coalesce concurrent gap triggers
+        }
+        audit_history_fetch_in_flight = true;
+        try {
+            StanzaNode pubsub_node = new StanzaNode.build("pubsub", Pubsub.NS_URI).add_self_xmlns()
+                .put_node(new StanzaNode.build("items", Pubsub.NS_URI)
+                    .put_attribute("node", Protocol.NS_AUDIT));
+            Iq.Stanza iq = new Iq.Stanza.get(pubsub_node);
+            iq.to = account.bare_jid;
+            Iq.Stanza result = yield stream.get_module(Iq.Module.IDENTITY).send_iq_async(stream, iq);
+            if (result.is_error()) {
+                warning("fetch_audit_history: request failed");
+                return;
+            }
+            StanzaNode? items_node = result.stanza.get_deep_subnode(
+                Pubsub.NS_URI + ":pubsub", Pubsub.NS_URI + ":items");
+            if (items_node == null) {
+                return;
+            }
+
+            var fetched = new Gee.ArrayList<Protocol.AuditEntry>();
+            foreach (StanzaNode item in items_node.get_subnodes("item", Pubsub.NS_URI)) {
+                StanzaNode? entry_node = item.get_subnode("audit-entry", Protocol.NS_AUDIT);
+                string? b64 = entry_node != null ? entry_node.get_string_content() : null;
+                if (b64 == null) continue;
+                Protocol.AuditEntry? e = Protocol.AuditEntry.unmarshal(Base64.decode(b64));
+                if (e != null) fetched.add(e);
+            }
+            if (fetched.size == 0) {
+                return;
+            }
+            // Items may arrive in any order; verify_and_apply requires oldest→newest.
+            fetched.sort((a, b) => {
+                if (a.seq < b.seq) return -1;
+                if (a.seq > b.seq) return 1;
+                return 0;
+            });
+
+            Row? identity_row = db.get_local_identity(account.id);
+            if (identity_row == null) return;
+            string? aik_ed_b64 = identity_row[db.account_identity.aik_pub_ed25519_base64];
+            string? aik_ml_b64 = identity_row[db.account_identity.aik_pub_mldsa_base64];
+            if (aik_ed_b64 == null || aik_ml_b64 == null) return;
+            Bytes aik_ed = bytes_from_base64(aik_ed_b64);
+            Bytes aik_ml = bytes_from_base64(aik_ml_b64);
+
+            // Verify the whole chain on a FRESH chain with no observer connected, so
+            // catching up doesn't replay a "device added" notification for every
+            // historical entry. If it verifies clean, adopt it as the live chain
+            // (with the observer wired for FUTURE events) and persist all entries.
+            var rebuilt = new Protocol.AccountAuditChain(db);
+            try {
+                rebuilt.verify_and_apply(account.id, aik_ed, aik_ml, fetched);
+            } catch (Protocol.AccountAuditError e) {
+                warning("fetch_audit_history: chain verification failed: %s", e.message);
+                return;
+            }
+            rebuilt.audit_entry_observed.connect((action, detail) => {
+                account_audit_event(action, detail);
+            });
+            audit_chain = rebuilt;
+            foreach (Protocol.AuditEntry e in fetched) {
+                db.store_account_audit_entry(account, e);
+            }
+        } catch (Error e) {
+            warning("fetch_audit_history: %s", e.message);
+        } finally {
+            audit_history_fetch_in_flight = false;
         }
     }
 

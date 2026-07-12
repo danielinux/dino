@@ -299,6 +299,12 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
                 // refresh_pair_hello.
                 module.retract_enrollment_request.begin((!) stream);
             }
+            // Reflect the just-confirmed device in the open Encryption page
+            // immediately (pairing_completed fires off the main thread).
+            Idle.add(() => {
+                (anchor as UI.SelfDevicesWidget)?.refresh();
+                return false;
+            });
         });
         dialog.present();
     }
@@ -354,6 +360,12 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
                 // this one — that later observes the account's own devicelist.
                 module.publish_add_device_audit_entry.begin((!) stream, cert);
             }
+            // Reflect the just-added device in the open Encryption page immediately
+            // (pairing_completed fires off the main thread).
+            Idle.add(() => {
+                (anchor as UI.SelfDevicesWidget)?.refresh();
+                return false;
+            });
         });
         dialog.present();
     }
