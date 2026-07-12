@@ -187,8 +187,16 @@ public class SelfDevicesWidget : Gtk.Box {
         }
 
         string own_jid = account.bare_jid.to_string();
-        Gee.List<int> confirmed_ids = db.get_remote_device_ids(account, own_jid);
-        Gee.List<int> pending_ids = db.get_pending_own_device_ids(account);
+        // §8.6: never surface a device we've revoked, even if a stale row lingers.
+        Gee.Set<int> revoked = db.get_revoked_device_ids(account);
+        var confirmed_ids = new Gee.ArrayList<int>();
+        foreach (int did in db.get_remote_device_ids(account, own_jid)) {
+            if (!revoked.contains(did)) confirmed_ids.add(did);
+        }
+        var pending_ids = new Gee.ArrayList<int>();
+        foreach (int did in db.get_pending_own_device_ids(account)) {
+            if (!revoked.contains(did)) pending_ids.add(did);
+        }
 
         int total = confirmed_ids.size + pending_ids.size;
         devices_header_label.label = pending_ids.is_empty
@@ -313,11 +321,16 @@ public class SelfDevicesWidget : Gtk.Box {
     // default label is deterministic and shared across the local and sibling rows.
     private void recompute_ordinals(int? local_device_id) {
         device_ordinals.clear();
+        Gee.Set<int> revoked = db.get_revoked_device_ids(account);
         var ids = new Gee.TreeSet<int>();
         if (local_device_id != null) ids.add((int) ((!) local_device_id));
         string own_jid = account.bare_jid.to_string();
-        foreach (int did in db.get_remote_device_ids(account, own_jid)) ids.add(did);
-        foreach (int did in db.get_pending_own_device_ids(account)) ids.add(did);
+        foreach (int did in db.get_remote_device_ids(account, own_jid)) {
+            if (!revoked.contains(did)) ids.add(did);
+        }
+        foreach (int did in db.get_pending_own_device_ids(account)) {
+            if (!revoked.contains(did)) ids.add(did);
+        }
         int n = 1;
         foreach (int did in ids) {
             device_ordinals.set(did, n);

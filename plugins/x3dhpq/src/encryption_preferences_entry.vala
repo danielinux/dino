@@ -247,6 +247,10 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
         // shrink guard treats the fresh single-device list as a first publish rather
         // than an (illegal) unrevoked shrink of the OLD identity's list.
         plugin.db.clear_own_device_list_snapshot(account);
+        // Fresh AIK/genesis: the new identity's device set starts empty, so old
+        // revocation tombstones (device ids of the prior identity's devices) no
+        // longer apply and would otherwise linger forever.
+        plugin.db.clear_revoked_devices(account);
         plugin.db.mint_fresh_identity(account);
 
         StreamModule? module = plugin.app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);

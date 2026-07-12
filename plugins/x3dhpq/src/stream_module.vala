@@ -1321,10 +1321,18 @@ public class StreamModule : XmppStreamModule {
             }
             return devices;
         }
+        Gee.Set<int> revoked = db.get_revoked_device_ids(account);
         Gee.Set<int> chain_confirmed = audit_chain_confirmed_device_ids();
         var trusted_devices = new ArrayList<int>();
         foreach (Protocol.DeviceListDevice e in entries) {
             int did = (int) e.device_id;
+            // §8.6 tombstone: a device we explicitly revoked must never be
+            // re-seeded from an inbound list — drop it before it can be stored
+            // (trusted OR pending) or surfaced in the UI.
+            if (revoked.contains(did)) {
+                warning("x3dhpq: dropping revoked device %d re-advertised in own devicelist (§8.6 tombstone)", did);
+                continue;
+            }
             devices.add(did);
             bool is_own_local = local_device_id != null && did == (!) local_device_id;
             if (is_own_local || chain_confirmed.contains(did)) {

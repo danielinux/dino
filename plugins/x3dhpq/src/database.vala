@@ -5,7 +5,7 @@ using Xmpp;
 namespace Dino.Plugins.X3dhpq {
 
 public class Database : Qlite.Database {
-    private const int VERSION = 12;
+    private const int VERSION = 13;
 
     public class AccountIdentityTable : Table {
         public Column<int> id = new Column.Integer("id") { primary_key = true, auto_increment = true };
@@ -320,6 +320,23 @@ public class Database : Qlite.Database {
         }
     }
 
+    // Locally-authoritative revocation tombstones (§8.6): a device the user (or
+    // any authorized device) has explicitly revoked. Persisted so an inbound
+    // devicelist — including a stale, old-AIK-signed one the server still serves,
+    // or a peer/pair-hello — can never RE-SEED a revoked device (the phantom
+    // "previous master" case). Keyed by (account, device_id). Added at schema v13.
+    public class RevokedDeviceTable : Table {
+        public Column<int> account_id = new Column.Integer("account_id") { not_null = true };
+        public Column<int> device_id = new Column.Integer("device_id") { not_null = true };
+        public Column<long> revoked_at = new Column.Long("revoked_at") { default = "0" };
+
+        internal RevokedDeviceTable(Database db) {
+            base(db, "revoked_device");
+            init({ account_id, device_id, revoked_at });
+            unique({ account_id, device_id });
+        }
+    }
+
     public class AuditEntryTable : Table {
         public Column<int> account_id = new Column.Integer("account_id") { not_null = true };
         public Column<string> bare_jid = new Column.NonNullText("bare_jid");
@@ -402,6 +419,7 @@ public class Database : Qlite.Database {
     public PairingSessionTable pairing_session { get; private set; }
     public PendingEnrollmentRequestTable pending_enrollment_request { get; private set; }
     public DeviceNicknameTable device_nickname { get; private set; }
+    public RevokedDeviceTable revoked_device { get; private set; }
 
     public Database(string file_name) {
         base(file_name, VERSION);
@@ -422,7 +440,8 @@ public class Database : Qlite.Database {
         pairing_session = new PairingSessionTable(this);
         pending_enrollment_request = new PendingEnrollmentRequestTable(this);
         device_nickname = new DeviceNicknameTable(this);
-        init({ account_identity, peer_account_identity, peer_device, device_list, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, group_session, membership_journal, device_audit, audit_entry, recovery_blob, pairing_session, pending_enrollment_request, device_nickname });
+        revoked_device = new RevokedDeviceTable(this);
+        init({ account_identity, peer_account_identity, peer_device, device_list, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, group_session, membership_journal, device_audit, audit_entry, recovery_blob, pairing_session, pending_enrollment_request, device_nickname, revoked_device });
     }
 
     public Row? get_local_identity(int account_id) {
@@ -1888,6 +1907,39 @@ public class Database : Qlite.Database {
     // (signed by the now-revoked old AIK) blocking it.
     public void clear_account_audit_entries(Account account) {
         audit_entry.delete().with(audit_entry.account_id, "=", account.id).perform();
+    }
+
+    // §8.6 revocation tombstone: record a device as explicitly revoked so no
+    // inbound devicelist/peer/pair-hello can ever re-seed it (the phantom
+    // "previous master" case). Idempotent.
+    public void store_revoked_device(Account account, int device_id) {
+        revoked_device.upsert()
+            .value(revoked_device.account_id, account.id, true)
+            .value(revoked_device.device_id, device_id, true)
+            .value(revoked_device.revoked_at, (long) new DateTime.now_utc().to_unix())
+            .perform();
+    }
+
+    public bool is_device_revoked(Account account, int device_id) {
+        return revoked_device.select()
+            .with(revoked_device.account_id, "=", account.id)
+            .with(revoked_device.device_id, "=", device_id)
+            .count() > 0;
+    }
+
+    public Gee.Set<int> get_revoked_device_ids(Account account) {
+        var result = new Gee.HashSet<int>();
+        foreach (Row row in revoked_device.select()
+                .with(revoked_device.account_id, "=", account.id)) {
+            result.add(row[revoked_device.device_id]);
+        }
+        return result;
+    }
+
+    // Cleared only on account reset (fresh AIK/genesis): the new identity's
+    // device set starts empty, so prior tombstones no longer apply.
+    public void clear_revoked_devices(Account account) {
+        revoked_device.delete().with(revoked_device.account_id, "=", account.id).perform();
     }
 
     // Local device nickname (§10.6 client-side label). Returns null when the user

@@ -2141,6 +2141,11 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         }
         db.store_account_audit_entry(account, entry);
 
+        // §8.6 tombstone: remember this id as revoked so no inbound devicelist
+        // (including a stale, old-AIK-signed one the server still serves) or peer
+        // can ever re-seed it — the phantom "previous master" case.
+        db.store_revoked_device(account, (int) device_id);
+
         // Local teardown: drop the removed device's session/bundle/prekey state.
         db.remove_peer_device(account, account.bare_jid.to_string(), (int) device_id);
 
