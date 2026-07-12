@@ -1658,6 +1658,61 @@ public class Database : Qlite.Database {
         return ((!) row)[account_identity.is_primary];
     }
 
+    // Trust Manifest Phase 2 account reset (task #55, RESET-only, STRICT): mint a
+    // NEW account AIK (ed25519 + ML-DSA-65) while KEEPING this device's DIK and
+    // device_id, and mark this device primary/confirmed of the fresh single-device
+    // lineage. Unlike mint_fresh_identity (which regenerates the whole identity incl.
+    // a new device_id), this preserves device continuity — the fresh Trust Manifest
+    // genesis self-issues a NEW genesis DC under the new AIK over the SAME DIK. The
+    // caller MUST also invalidate the cached self DC (invalidate_local_device_certificate)
+    // so it re-issues under the new AIK, and reset the trust_manifest store
+    // (clear_trust_manifest) so the fresh version=1 genesis is accepted.
+    public void reset_account_identity_new_aik(Account account) {
+        if (!has_local_identity(account)) {
+            // No existing identity to rotate — fall back to a full fresh mint.
+            mint_fresh_identity(account);
+            return;
+        }
+        try {
+            Bytes aik_pub_ed, aik_priv_ed, aik_pub_ml, aik_priv_ml;
+            global::X3dhpq.Crypto.generate_ed25519(out aik_pub_ed, out aik_priv_ed);
+            global::X3dhpq.Crypto.generate_mldsa65(out aik_pub_ml, out aik_priv_ml);
+            account_identity.update()
+                .with(account_identity.account_id, "=", account.id)
+                .set(account_identity.aik_pub_ed25519_base64, bytes_to_base64(aik_pub_ed))
+                .set(account_identity.aik_priv_ed25519_base64, bytes_to_base64(aik_priv_ed))
+                .set(account_identity.aik_pub_mldsa_base64, bytes_to_base64(aik_pub_ml))
+                .set(account_identity.aik_priv_mldsa_base64, bytes_to_base64(aik_priv_ml))
+                .set(account_identity.is_primary, true)
+                .set(account_identity.confirmed, true)
+                .perform();
+        } catch (GLib.Error e) {
+            warning("reset_account_identity_new_aik: key generation failed for %s: %s",
+                account.bare_jid.to_string(), e.message);
+        }
+    }
+
+    // Clear the cached self DeviceCertificate for the own account so
+    // ensure_local_device_certificate re-issues it under the CURRENT (post-reset,
+    // new) AIK instead of returning the stale old-AIK-signed cert.
+    public void invalidate_local_device_certificate(Account account) {
+        bundle.update()
+            .with(bundle.account_id, "=", account.id)
+            .with(bundle.bare_jid, "=", account.bare_jid.to_string())
+            .set(bundle.device_certificate_base64, null)
+            .perform();
+    }
+
+    // Reset the Trust Manifest version/blob store for an owner (own account on
+    // reset) so a fresh genesis at version=1 under a new AIK is a re-pin event, not
+    // a rollback of the old-AIK lineage.
+    public void clear_trust_manifest(Account account, string bare_jid) {
+        trust_manifest.delete()
+            .with(trust_manifest.account_id, "=", account.id)
+            .with(trust_manifest.bare_jid, "=", bare_jid)
+            .perform();
+    }
+
     // §10.6.1: promotes THIS device's own already-generated (throwaway, pending)
     // identity to genuine primary. Called by StreamModule.resolve_pending_primary
     // ONLY after confirming via a live server round-trip that no AIK exists

@@ -34,6 +34,7 @@ class TrustManifestTest : Gee.TestCase {
         add_test("migration_roundtrip", test_migration_roundtrip);
         add_test("confirmer_append", test_confirmer_append);
         add_test("revoke_removes_device", test_revoke_removes_device);
+        add_test("reset_fresh_genesis_new_aik", test_reset_fresh_genesis_new_aik);
     }
 
     // ── DC_SUBJECT / KAT object builders ─────────────────────────────────────
@@ -471,6 +472,56 @@ class TrustManifestTest : Gee.TestCase {
                 "B revoked by trusted non-genesis device A; concurrent non-descendant re-add loses (removal-wins)");
             fail_if_not(trusted.has_key("1001"), "D1 (primary) still authorized");
             fail_if_not(trusted.has_key("1002"), "D2 (revoker) still authorized");
+        } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    // Account reset (task #55): a fresh SELF-ONLY genesis under a NEW AIK
+    // (version=1) folds to only this device — every old sibling is dropped — and
+    // roots a DIFFERENT AIK lineage than the pre-reset manifest.
+    private void test_reset_fresh_genesis_new_aik() {
+        try {
+            // --- Pre-reset lineage under AIK1: {d1 (primary), d2 (sibling)}. ---
+            AccountIdentityKey aik1 = AccountIdentityKey.generate();
+            Dev d1 = make_dev(1001, new Bytes(aik1.priv_ed25519), new Bytes(aik1.priv_mldsa));
+            var g1 = genesis(aik1, d1);
+            Dev d2 = make_dev(1002, new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa));
+            var add2 = sign_entry(TrustEntry.ACTION_ADD, d2.id, d2.dc, 1, parents_of(g1.compute_hash()),
+                d1.id, sha256_arr(d1.dc.marshal()), 1001,
+                new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa));
+            var m_old = manifest_of(aik1.public_key(), new TrustEntry[]{ g1, add2 });
+            fail_if_not_eq_int(m_old.fold().size, 2, "pre-reset lineage folds to {d1, d2}");
+
+            // --- Reset: NEW AIK2, KEEP d1's DIK, self-issue a NEW genesis DC under
+            //     AIK2, SELF-ONLY genesis at version=1. ---
+            AccountIdentityKey aik2 = AccountIdentityKey.generate();
+            DeviceCertificate self_dc2 = DeviceCertificate.issue(d1.id,
+                new Bytes(d1.dik.pub_ed25519), new Bytes(d1.dik.pub_x25519), new Bytes(d1.dik.pub_mldsa),
+                new Bytes(aik2.priv_ed25519), new Bytes(aik2.priv_mldsa), 1);
+            var g2 = sign_entry(TrustEntry.ACTION_ADD, d1.id, self_dc2, 0, parents_of(null),
+                d1.id, sha256_arr(self_dc2.marshal()), 9000,
+                new Bytes(aik2.priv_ed25519), new Bytes(aik2.priv_mldsa));  // AIK2-signed genesis edge
+            var m_new = new TrustManifest();
+            m_new.aik = aik2.public_key();
+            m_new.version = 1;
+            m_new.prev_hash = new uint8[32];
+            m_new.entries = new Gee.ArrayList<TrustEntry>();
+            m_new.entries.add(g2);
+            m_new.sign_head(new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa)); // head under this device's DIK
+
+            var trusted = m_new.fold();
+            fail_if_not_eq_int(trusted.size, 1, "fresh reset genesis is SELF-ONLY (old siblings dropped)");
+            fail_if_not(trusted.has_key("1001"), "self (d1) present in fresh genesis");
+            fail_if(trusted.has_key("1002"), "old sibling d2 must NOT survive the reset");
+            fail_if_not_eq_int((int) m_new.version, 1, "fresh reset lineage starts at version=1");
+
+            // Head verifies under this device's DIK; genesis is AIK2-rooted.
+            fail_if_not(m_new.verify_head(new Bytes(d1.dik.pub_ed25519), new Bytes(d1.dik.pub_mldsa)),
+                "fresh genesis head signed under this device's DIK");
+
+            // Lineage distinction: the new manifest's AIK differs from the old one —
+            // a version=1 genesis under a DIFFERENT AIK is a re-pin, not a rollback.
+            fail_if(hex(m_new.aik.pub_ed25519) == hex(aik1.public_key().pub_ed25519),
+                "reset roots a DIFFERENT AIK lineage than the pre-reset manifest");
         } catch (Error e) { fail_if_reached(e.message); }
     }
 

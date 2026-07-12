@@ -1093,7 +1093,14 @@ public class StreamModule : XmppStreamModule {
         if (m_ == null) return false;
         Protocol.TrustManifest m = (!) m_;
 
-        // 2. AIK pinning (TOFU).
+        // 2. AIK pinning (TOFU) + STRICT account-reset handling (task #55).
+        // CRITICAL ORDERING: the AIK-lineage check runs BEFORE the version/rollback
+        // guard (step 3). A fresh genesis at version=1 under a DIFFERENT AIK is an
+        // account-RESET / re-pin event, NOT a rollback of the old-AIK lineage — the
+        // version guard applies only WITHIN the same AIK lineage. STRICT everywhere:
+        // an AIK change is never auto-adopted (even a valid RotationPointer would
+        // still require manual re-verify); we refuse traffic under the new AIK until
+        // the user re-verifies / re-pairs.
         uint8[] m_aik_ed = m.aik.pub_ed25519;
         uint8[] m_aik_ml = m.aik.pub_mldsa;
         if (is_self) {
@@ -1105,7 +1112,12 @@ public class StreamModule : XmppStreamModule {
             try {
                 if (!manifest_bytes_equal(m_aik_ed, bytes_to_uint8_array(bytes_from_base64((!) ed_b64)))
                         || !manifest_bytes_equal(m_aik_ml, bytes_to_uint8_array(bytes_from_base64((!) ml_b64)))) {
-                    warning("x3dhpq: OWN trust manifest rejected — account AIK mismatch (root swap)");
+                    // Our OWN account's manifest is rooted under an AIK we don't hold:
+                    // either THIS device just reset (its own new-AIK genesis is applied
+                    // via the reset path directly, not here), or ANOTHER of our devices
+                    // reset the account. STRICT: refuse — this device is now on a dead
+                    // lineage and must be re-paired into the new one. No auto-adopt.
+                    warning("x3dhpq: OWN trust manifest rejected — account AIK changed (reset by another device); this device must re-pair (STRICT)");
                     return false;
                 }
             } catch (GLib.Error e) { return false; }
@@ -1114,7 +1126,12 @@ public class StreamModule : XmppStreamModule {
             if (db.get_peer_aik_pubs(account, bare, out pin_ed, out pin_ml)) {
                 if (!manifest_bytes_equal(m_aik_ed, bytes_to_uint8_array(pin_ed))
                         || !manifest_bytes_equal(m_aik_ml, bytes_to_uint8_array(pin_ml))) {
-                    warning("x3dhpq: trust manifest from %s rejected — AIK != pinned AIK (root swap)", bare);
+                    // Same JID, different AIK (peer account reset / reconstruction).
+                    // STRICT: never auto-accept — route to the existing "same-JID,
+                    // different-AIK" re-verify UX (flag_peer_devicelist_fork drives
+                    // contact_details_provider's Review / Accept-new-identity flow)
+                    // and refuse traffic under the new AIK until the user re-verifies.
+                    warning("x3dhpq: trust manifest from %s rejected — AIK != pinned AIK (account reset / reconstruction); flagged for manual re-verify (STRICT)", bare);
                     db.flag_peer_devicelist_fork(account, bare);
                     return false;
                 }
@@ -1124,7 +1141,9 @@ public class StreamModule : XmppStreamModule {
             }
         }
 
-        // 3. Version / rollback / fork guard.
+        // 3. Version / rollback / fork guard (WITHIN the current AIK lineage only —
+        // an AIK mismatch was already handled/rejected above, so `last` here is the
+        // last version seen under the SAME AIK).
         long last = db.get_trust_manifest_version(account, bare);
         long ver = (long) m.version;
         string blob_hash = m.hash_hex();
@@ -1208,7 +1227,32 @@ public class StreamModule : XmppStreamModule {
         }
     }
 
-    private async void build_and_publish_genesis_manifest(XmppStream stream) throws GLib.Error {
+    // Account reset (task #55, RESET-only, STRICT): root a FRESH, self-only Trust
+    // Manifest genesis (version=1, prev_hash=zero, genesis entry AIK-signed under
+    // the NEW AIK, head signed under this device's DIK) and publish it. The caller
+    // (perform_account_reset) has already: minted the new AIK (keeping the DIK),
+    // invalidated the cached self DC so it re-issues under the new AIK, purged the
+    // stale PEP nodes (incl. trustmanifest:0), and cleared the trust_manifest store
+    // so this version=1 genesis is accepted as a new lineage (not a rollback).
+    public async void publish_reset_genesis_manifest(XmppStream stream) {
+        if (!db.has_local_aik_priv(account)) {
+            warning("publish_reset_genesis_manifest: no local AIK_priv after reset — cannot root genesis");
+            return;
+        }
+        try {
+            yield build_and_publish_genesis_manifest(stream, 1, true);
+        } catch (GLib.Error e) {
+            warning("publish_reset_genesis_manifest: fresh genesis build failed for %s: %s",
+                account.bare_jid.to_string(), e.message);
+        }
+    }
+
+    // §D1 migration genesis. `force_version` (>0) pins the genesis version (used by
+    // account reset which roots a FRESH lineage at version=1); 0 uses the normal
+    // (last devicelist version)+1 formula. `self_only` skips re-issuing siblings
+    // (account reset drops all old siblings — SELF-ONLY genesis).
+    private async void build_and_publish_genesis_manifest(XmppStream stream,
+            uint64 force_version = 0, bool self_only = false) throws GLib.Error {
         string own_bare = account.bare_jid.to_string();
         int? self_id_n = db.get_local_device_id(account);
         if (self_id_n == null) throw new IOError.FAILED("no local device id");
@@ -1244,26 +1288,30 @@ public class StreamModule : XmppStreamModule {
         m.entries.add(genesis);
 
         // Each OTHER authorized device: RE-ISSUE its DC under the primary's DIK and
-        // append a DIK-signed ADD entry parented on the current heads.
-        foreach (Protocol.DeviceListDevice other in db.get_device_list_devices(account, own_bare)) {
-            if (other.device_id == self_id) continue;
-            if (other.cert_bytes.length == 0) continue;
-            Protocol.DeviceCertificate? odc = Protocol.DeviceCertificate.unmarshal(new Bytes(other.cert_bytes));
-            if (odc == null) continue;
-            Protocol.DeviceCertificate reissued = Protocol.DeviceCertificate.issue(
-                other.device_id,
-                ((!) odc).dik_pub_ed25519,
-                ((!) odc).dik_pub_x25519,
-                ((!) odc).dik_pub_mldsa,
-                dik_priv_ed, dik_priv_ml,
-                ((!) odc).flags);
-            var add = build_signed_trust_entry(Protocol.TrustEntry.ACTION_ADD, other.device_id, reissued,
-                m.next_lamport(), m.current_heads(), self_id, self_dc_hash, dik_priv_ed, dik_priv_ml);
-            m.entries.add(add);
+        // append a DIK-signed ADD entry parented on the current heads. Skipped for a
+        // SELF-ONLY genesis (account reset drops all prior siblings).
+        if (!self_only) {
+            foreach (Protocol.DeviceListDevice other in db.get_device_list_devices(account, own_bare)) {
+                if (other.device_id == self_id) continue;
+                if (other.cert_bytes.length == 0) continue;
+                Protocol.DeviceCertificate? odc = Protocol.DeviceCertificate.unmarshal(new Bytes(other.cert_bytes));
+                if (odc == null) continue;
+                Protocol.DeviceCertificate reissued = Protocol.DeviceCertificate.issue(
+                    other.device_id,
+                    ((!) odc).dik_pub_ed25519,
+                    ((!) odc).dik_pub_x25519,
+                    ((!) odc).dik_pub_mldsa,
+                    dik_priv_ed, dik_priv_ml,
+                    ((!) odc).flags);
+                var add = build_signed_trust_entry(Protocol.TrustEntry.ACTION_ADD, other.device_id, reissued,
+                    m.next_lamport(), m.current_heads(), self_id, self_dc_hash, dik_priv_ed, dik_priv_ml);
+                m.entries.add(add);
+            }
         }
 
-        // version = (last devicelist version) + 1.
-        m.version = (uint64) (db.get_device_list_version(account, own_bare) + 1);
+        // version: forced (fresh reset lineage = 1) or (last devicelist version)+1.
+        m.version = force_version > 0 ? force_version
+                                      : (uint64) (db.get_device_list_version(account, own_bare) + 1);
         m.sign_head(dik_priv_ed, dik_priv_ml);
 
         if (yield publish_trust_manifest_blob(stream, m)) {

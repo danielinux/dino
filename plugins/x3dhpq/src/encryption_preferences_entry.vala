@@ -251,7 +251,15 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
         // revocation tombstones (device ids of the prior identity's devices) no
         // longer apply and would otherwise linger forever.
         plugin.db.clear_revoked_devices(account);
-        plugin.db.mint_fresh_identity(account);
+        // Trust Manifest Phase 2 account reset (task #55, RESET-only, STRICT):
+        // mint a NEW AIK while KEEPING this device's DIK + device_id, invalidate the
+        // cached self DC so it re-issues under the new AIK, and clear the manifest
+        // version/blob store so the fresh version=1 genesis is accepted as a new AIK
+        // lineage (not a rollback of the old one — the receiver branches on AIK
+        // mismatch BEFORE the version guard).
+        plugin.db.reset_account_identity_new_aik(account);
+        plugin.db.invalidate_local_device_certificate(account);
+        plugin.db.clear_trust_manifest(account, account.bare_jid.to_string());
 
         StreamModule? module = plugin.app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
         XmppStream? stream = plugin.app.stream_interactor.get_stream(account);
@@ -283,6 +291,13 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
         // under the new AIK and re-seed stale/forked devices). Then republish the fresh
         // devicelist + bundle and re-record the self-genesis AddDevice(self)@0 under the
         // new AIK, and finally refresh the UI. Chained so each step observes the prior.
+        // §1338 node purge: overwrite/retract every stale PEP node signed by the
+        // now-dead AIK so nothing lingers to be re-verified under the new one —
+        // devtracker:0, devicelist:0, audit:0, trustmanifest:0 and pair:0 (and the
+        // bundle, republished by publish_current_state). Then root the FRESH,
+        // self-only Trust Manifest genesis (version=1) under the new AIK, republish
+        // the derived devicelist cache + bundle, and refresh the UI. Chained so each
+        // step observes the prior.
         StreamModule m = (!) module;
         XmppStream s = (!) stream;
         m.purge_own_node.begin(s, Protocol.NS_DEVTRACKER, (o0, r0) => {
@@ -291,21 +306,31 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
                 m.purge_own_node.end(r1);
                 m.purge_own_node.begin(s, Protocol.NS_AUDIT, (o2, r2) => {
                     m.purge_own_node.end(r2);
-                    // Also purge the pairing rendezvous node: stale <pair-hello>/
-                    // <enroll-request> items there (from prior devices/attempts,
-                    // possibly signed by the now-revoked AIK) otherwise linger and
-                    // mislead the next pairing's rendezvous.
-                    m.purge_own_node.begin(s, Protocol.NS_PAIR, (op, rp) => {
-                        m.purge_own_node.end(rp);
-                        m.publish_current_state.begin(s, (o3, r3) => {
-                            m.publish_current_state.end(r3);
-                            m.ensure_account_audit_genesis.begin(s, (o4, r4) => {
-                                m.ensure_account_audit_genesis.end(r4);
-                                // Fresh chain (genesis + self device, signed) is published;
-                                // refresh the associated-devices list (main-loop hop).
-                                if (devices_widget != null) {
-                                    Idle.add(() => { ((!) devices_widget).refresh(); return false; });
-                                }
+                    m.purge_own_node.begin(s, Protocol.NS_TRUSTMANIFEST, (ot, rt) => {
+                        m.purge_own_node.end(rt);
+                        // Also purge the pairing rendezvous node: stale <pair-hello>/
+                        // <enroll-request> items there (from prior devices/attempts,
+                        // possibly signed by the now-revoked AIK) otherwise linger and
+                        // mislead the next pairing's rendezvous.
+                        m.purge_own_node.begin(s, Protocol.NS_PAIR, (op, rp) => {
+                            m.purge_own_node.end(rp);
+                            // Root the fresh self-only manifest genesis (version=1)
+                            // under the new AIK BEFORE publish_current_state, so
+                            // ensure_trust_manifest (inside it) sees a current manifest
+                            // and stays a no-op instead of computing a different version.
+                            m.publish_reset_genesis_manifest.begin(s, (og, rg) => {
+                                m.publish_reset_genesis_manifest.end(rg);
+                                m.publish_current_state.begin(s, (o3, r3) => {
+                                    m.publish_current_state.end(r3);
+                                    m.ensure_account_audit_genesis.begin(s, (o4, r4) => {
+                                        m.ensure_account_audit_genesis.end(r4);
+                                        // Fresh genesis + self device published;
+                                        // refresh the devices list (main-loop hop).
+                                        if (devices_widget != null) {
+                                            Idle.add(() => { ((!) devices_widget).refresh(); return false; });
+                                        }
+                                    });
+                                });
                             });
                         });
                     });
