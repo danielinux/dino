@@ -2087,6 +2087,23 @@ public class StreamModule : XmppStreamModule {
         yield publish_add_device_audit_entry(stream, own_dc);
     }
 
+    // Purge ALL items from one of our OWN PEP nodes (pubsub#owner <purge>). Used by
+    // account reset so stale items signed by the now-revoked AIK don't linger on the
+    // server and fail verification under the new one (the earlier item-overwrite
+    // approach could not clear items the fresh chain no longer re-publishes).
+    public async void purge_own_node(XmppStream stream, string node) {
+        StanzaNode pubsub = new StanzaNode.build("pubsub", "http://jabber.org/protocol/pubsub#owner").add_self_xmlns()
+            .put_node(new StanzaNode.build("purge", "http://jabber.org/protocol/pubsub#owner")
+                .put_attribute("node", node));
+        Iq.Stanza iq = new Iq.Stanza.set(pubsub);
+        iq.to = account.bare_jid;
+        try {
+            yield stream.get_module(Iq.Module.IDENTITY).send_iq_async(stream, iq);
+        } catch (Error e) {
+            warning("purge_own_node(%s): %s", node, e.message);
+        }
+    }
+
     // Publish an opaque, client-signed audit entry to the per-account audit:0
     // PEP node. The server stores and notifies subscribed contacts; verification
     // is the recipient's responsibility per X3DHPQ XEP §11.5.

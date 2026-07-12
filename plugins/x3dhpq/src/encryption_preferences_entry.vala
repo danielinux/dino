@@ -287,20 +287,31 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
         // pruned above — so contacts observe the reconstruction event
         // (§10.6.5), plus a fresh bundle so PQXDH can proceed with the new
         // identity.
-        module.publish_current_state.begin((!) stream, (obj, res) => {
-            ((!) module).publish_current_state.end(res);
-            // Immediately re-record the self-genesis AddDevice(self)@0 under the NEW
-            // AIK (overwriting any stale/old-AIK item "0" left on the audit node),
-            // rather than waiting for the next reconnect — so multi-device trust is
-            // usable right after the reset (§11).
-            ((!) module).ensure_account_audit_genesis.begin((!) stream, (obj2, res2) => {
-                ((!) module).ensure_account_audit_genesis.end(res2);
-                // Now that the fresh chain (genesis + self device, signed) is published,
-                // refresh the associated-devices list so it shows the clean single-device
-                // state without a close/reopen. (Async callback → hop to the main loop.)
-                if (devices_widget != null) {
-                    Idle.add(() => { ((!) devices_widget).refresh(); return false; });
-                }
+        // Genesis reset (§8.6 back-to-genesis / §12): PURGE the server's own PEP nodes
+        // first so no item signed by the now-revoked AIK lingers (those fail verification
+        // under the new AIK and re-seed stale/forked devices). Then republish the fresh
+        // devicelist + bundle and re-record the self-genesis AddDevice(self)@0 under the
+        // new AIK, and finally refresh the UI. Chained so each step observes the prior.
+        StreamModule m = (!) module;
+        XmppStream s = (!) stream;
+        m.purge_own_node.begin(s, Protocol.NS_DEVTRACKER, (o0, r0) => {
+            m.purge_own_node.end(r0);
+            m.purge_own_node.begin(s, Protocol.NS_DEVICELIST, (o1, r1) => {
+                m.purge_own_node.end(r1);
+                m.purge_own_node.begin(s, Protocol.NS_AUDIT, (o2, r2) => {
+                    m.purge_own_node.end(r2);
+                    m.publish_current_state.begin(s, (o3, r3) => {
+                        m.publish_current_state.end(r3);
+                        m.ensure_account_audit_genesis.begin(s, (o4, r4) => {
+                            m.ensure_account_audit_genesis.end(r4);
+                            // Fresh chain (genesis + self device, signed) is published;
+                            // refresh the associated-devices list (main-loop hop).
+                            if (devices_widget != null) {
+                                Idle.add(() => { ((!) devices_widget).refresh(); return false; });
+                            }
+                        });
+                    });
+                });
             });
         });
     }
