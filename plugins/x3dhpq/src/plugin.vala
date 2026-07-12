@@ -123,7 +123,11 @@ public class Plugin : RootInterface, Object {
         // addition to the live handshake the dialog itself attempts.
         module.publish_enrollment_request.begin(stream);
 
-        var dialog = new UI.PairToExistingDialog((!) parent, db, account, module, stream);
+        // §10.6.2 single tested direction: this pending device PRESENTS its own
+        // code (show_own_code=true); an existing authorized device enters it via
+        // "Confirm a device…". (The enrollment request published just above lets
+        // an offline authorized device discover this device on its next connect.)
+        var dialog = new UI.PairToExistingDialog((!) parent, db, account, module, stream, true);
         dialog.pairing_completed.connect((result) => {
             db.apply_paired_identity(account, result);
             db.store_local_device_certificate(account, (int) result.cert.device_id, Base64.encode(result.cert.marshal()));

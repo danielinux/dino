@@ -15,7 +15,6 @@ namespace Dino.Plugins.X3dhpq.UI {
 //    devicelist but have NO verified AddDevice entry yet; surfaced here as a
 //    security event rather than silently trusted or silently dropped.
 public class SelfDevicesWidget : Gtk.Box {
-    public signal void add_device_requested();
     public signal void confirm_device_requested();
 
     private Database db;
@@ -25,7 +24,6 @@ public class SelfDevicesWidget : Gtk.Box {
     private Gtk.Label local_device_label;
     private Gtk.Label devices_header_label;
     private Gtk.ListBox devices_listbox;
-    private Gtk.Button add_button;
     private Gtk.Button confirm_button;
 
     public SelfDevicesWidget(Database db, Account account) {
@@ -84,20 +82,17 @@ public class SelfDevicesWidget : Gtk.Box {
         devices_listbox.add_css_class("boxed-list");
         append(devices_listbox);
 
-        // §10.6.2 entry points: "Add / link a device" (existing device
-        // presents a code/QR; a new device scans/enters it — PairNewDeviceDialog)
-        // and "Confirm a device" (a pending device presents its own code/QR;
-        // this device scans/enters it — PairNewDeviceDialog in confirm_mode).
+        // §10.6.2 pairing uses a single direction (the new device presents its
+        // own code/QR; this existing device enters it): "Confirm a device"
+        // (PairNewDeviceDialog in confirm_mode). The opposite direction (this
+        // device presenting a code for a newcomer to enter) is intentionally not
+        // offered — one tested flow keeps the UI unambiguous.
         var button_box = new Gtk.Box(Gtk.Orientation.HORIZONTAL, 6) {
             halign = Gtk.Align.START,
             margin_start = 6,
             margin_top = 6,
             margin_bottom = 6
         };
-        add_button = new Gtk.Button.with_label("Add / link a device…");
-        add_button.clicked.connect(() => add_device_requested());
-        button_box.append(add_button);
-
         confirm_button = new Gtk.Button.with_label("Confirm a device…");
         confirm_button.clicked.connect(() => confirm_device_requested());
         button_box.append(confirm_button);
@@ -148,12 +143,9 @@ public class SelfDevicesWidget : Gtk.Box {
         local_device_label.label = @"This device: $device_id_str ($status_str)";
 
         // §10.6.6: a disabled device holds no AIK_priv and cannot sign the
-        // AddDevice/RemoveDevice entries these two actions require — grey them
-        // out with an explanatory tooltip instead of letting the human hit a
-        // silent failure after completing a pairing handshake.
-        add_button.sensitive = authorized;
-        add_button.tooltip_text = authorized ? "" :
-            "This device is disabled (waiting for sync) and cannot authorize new devices yet.";
+        // AddDevice entry confirming a newcomer requires — grey the button out
+        // with an explanatory tooltip instead of letting the human hit a silent
+        // failure after completing a pairing handshake.
         confirm_button.sensitive = authorized;
         confirm_button.tooltip_text = authorized ? "" :
             "This device is disabled (waiting for sync) and cannot confirm other devices yet.";
