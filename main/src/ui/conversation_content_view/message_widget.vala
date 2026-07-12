@@ -167,6 +167,21 @@ public class MessageMetaItem : ContentMetaItem {
             theme_dependent = true;
         }
 
+        // Per-message attribution supplied by the encryption plugin (e.g. a 1:1
+        // message authored by another of the user's own devices → "from Device 2").
+        // Rendered as a small dim suffix, mirroring the "(edited)" annotation.
+        Application app = GLib.Application.get_default() as Application;
+        if (app != null && message.encryption != Encryption.NONE && message.encryption != Encryption.UNKNOWN) {
+            var encryption_entry = app.plugin_registry.encryption_list_entries[message.encryption];
+            if (encryption_entry != null) {
+                string? attribution = encryption_entry.get_message_attribution(conversation, item);
+                if (attribution != null && attribution != "") {
+                    markup_text += @"  <span size='small' color='$dim_color'>%s</span>".printf(GLib.Markup.escape_text(attribution));
+                    theme_dependent = true;
+                }
+            }
+        }
+
         // Append message status info
         additional_info = AdditionalInfo.NONE;
         if (message.direction == Message.DIRECTION_SENT && (message.marked == Message.Marked.SENDING || message.marked == Message.Marked.UNSENT)) {

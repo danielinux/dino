@@ -5,7 +5,7 @@ using Xmpp;
 namespace Dino.Plugins.X3dhpq {
 
 public class Database : Qlite.Database {
-    private const int VERSION = 14;
+    private const int VERSION = 15;
 
     public class AccountIdentityTable : Table {
         public Column<int> id = new Column.Integer("id") { primary_key = true, auto_increment = true };
@@ -358,6 +358,23 @@ public class Database : Qlite.Database {
         }
     }
 
+    // Records which of the account's OWN devices authored a decrypted 1:1
+    // message, keyed by (account, stanza_id). Written at decrypt time only for
+    // sibling-authored messages (sender bare JID == account, source device_id !=
+    // this device). Local-only, never signed or synced; used purely to render a
+    // "from Device N" attribution. Added at schema v15.
+    public class MessageDeviceTable : Table {
+        public Column<int> account_id = new Column.Integer("account_id") { not_null = true };
+        public Column<string> stanza_id = new Column.NonNullText("stanza_id");
+        public Column<int> device_id = new Column.Integer("device_id") { not_null = true };
+
+        internal MessageDeviceTable(Database db) {
+            base(db, "message_device");
+            init({ account_id, stanza_id, device_id });
+            unique({ account_id, stanza_id });
+        }
+    }
+
     public class AuditEntryTable : Table {
         public Column<int> account_id = new Column.Integer("account_id") { not_null = true };
         public Column<string> bare_jid = new Column.NonNullText("bare_jid");
@@ -442,6 +459,7 @@ public class Database : Qlite.Database {
     public PendingEnrollmentRequestTable pending_enrollment_request { get; private set; }
     public DeviceNicknameTable device_nickname { get; private set; }
     public RevokedDeviceTable revoked_device { get; private set; }
+    public MessageDeviceTable message_device { get; private set; }
 
     public Database(string file_name) {
         base(file_name, VERSION);
@@ -464,7 +482,8 @@ public class Database : Qlite.Database {
         pending_enrollment_request = new PendingEnrollmentRequestTable(this);
         device_nickname = new DeviceNicknameTable(this);
         revoked_device = new RevokedDeviceTable(this);
-        init({ account_identity, peer_account_identity, peer_device, device_list, trust_manifest, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, group_session, membership_journal, device_audit, audit_entry, recovery_blob, pairing_session, pending_enrollment_request, device_nickname, revoked_device });
+        message_device = new MessageDeviceTable(this);
+        init({ account_identity, peer_account_identity, peer_device, device_list, trust_manifest, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, group_session, membership_journal, device_audit, audit_entry, recovery_blob, pairing_session, pending_enrollment_request, device_nickname, revoked_device, message_device });
     }
 
     public Row? get_local_identity(int account_id) {
@@ -2069,6 +2088,56 @@ public class Database : Qlite.Database {
             .value(device_nickname.device_id, device_id, true)
             .value(device_nickname.nickname, trimmed)
             .perform();
+    }
+
+    // The user-facing label for one of the account's own devices: the local
+    // nickname if set, otherwise the "Device N" default. N is a stable 1-based
+    // ordinal over the full known own-device set (this device + confirmed
+    // siblings + pending), sorted ascending by id — matching self_devices_widget
+    // so the same device reads the same everywhere.
+    public string device_display_label(Account account, int device_id) {
+        string? nick = lookup_device_nickname(account, device_id);
+        if (nick != null && nick.strip() != "") return (!) nick;
+
+        Gee.Set<int> revoked = get_revoked_device_ids(account);
+        var ids = new Gee.TreeSet<int>();
+        int? local = get_local_device_id(account);
+        if (local != null) ids.add((int) ((!) local));
+        string own_jid = account.bare_jid.to_string();
+        foreach (int did in get_remote_device_ids(account, own_jid)) {
+            if (!revoked.contains(did)) ids.add(did);
+        }
+        foreach (int did in get_pending_own_device_ids(account)) {
+            if (!revoked.contains(did)) ids.add(did);
+        }
+        int n = 1;
+        foreach (int did in ids) {
+            if (did == device_id) return @"Device $n";
+            n++;
+        }
+        return @"Device $device_id";
+    }
+
+    // Record that a decrypted 1:1 message (identified by stanza_id) was authored
+    // by one of the account's own devices. Written only for genuine sibling
+    // messages so a later render can attribute them. Idempotent per stanza_id.
+    public void store_message_source_device(Account account, string stanza_id, int device_id) {
+        message_device.upsert()
+            .value(message_device.account_id, account.id, true)
+            .value(message_device.stanza_id, stanza_id, true)
+            .value(message_device.device_id, device_id)
+            .perform();
+    }
+
+    // The own-device id that authored the given 1:1 message, or null if none was
+    // recorded (peer message, this device's own message, or pre-v15 history).
+    public int? lookup_message_source_device(Account account, string stanza_id) {
+        Row? row = message_device.select()
+            .with(message_device.account_id, "=", account.id)
+            .with(message_device.stanza_id, "=", stanza_id)
+            .single().row().inner;
+        if (row == null) return null;
+        return ((!) row)[message_device.device_id];
     }
 
     // Drop the persisted OWN devicelist snapshot (payload/version/content-key). Used by

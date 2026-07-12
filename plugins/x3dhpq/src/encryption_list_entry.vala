@@ -24,6 +24,23 @@ public class EncryptionListEntry : Plugins.EncryptionListEntry, Object {
         return "dino-security-high-symbolic";
     }
 
+    // Attribute a 1:1 message that was authored by ANOTHER of the user's own
+    // devices (same bare JID, different x3dhpq device id) with the local device
+    // label. Recorded at decrypt time in the plugin DB, keyed by stanza id.
+    public string? get_message_attribution(Entities.Conversation conversation, ContentItem content_item) {
+        if (content_item.encryption != encryption) return null;
+        if (conversation.type_ != Conversation.Type.CHAT) return null;
+        MessageItem? message_item = content_item as MessageItem;
+        if (message_item == null) return null;
+        string? stanza_id = message_item.message.stanza_id;
+        if (stanza_id == null) return null;
+        int? source_device_id = plugin.db.lookup_message_source_device(conversation.account, (!) stanza_id);
+        if (source_device_id == null) return null;
+        int? local_device_id = plugin.db.get_local_device_id(conversation.account);
+        if (local_device_id != null && ((int) (!) source_device_id) == ((int) (!) local_device_id)) return null;
+        return "from " + plugin.db.device_display_label(conversation.account, (int) (!) source_device_id);
+    }
+
     public void encryption_activated(Entities.Conversation conversation, Plugins.SetInputFieldStatus input_status_callback) {
         encryption_activated_async.begin(conversation, input_status_callback);
     }

@@ -1393,6 +1393,16 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             }
             message.body = plaintext;
             message.encryption = Encryption.X3DHPQ;
+            // Record sibling authorship for a 1:1 message: authored by our own
+            // bare JID but by a DIFFERENT device than this install. Lets the UI
+            // attribute it ("from Device N"). Never recorded for peer messages or
+            // this device's own echoes (sender_device_id == local).
+            if (conversation.type_ == Conversation.Type.CHAT
+                    && message.stanza_id != null
+                    && sender_jid_value == conversation.account.bare_jid.to_string()
+                    && sender_device_id != (int) (!) local_device_id) {
+                db.store_message_source_device(conversation.account, (!) message.stanza_id, sender_device_id);
+            }
             if (conversation.type_ == Conversation.Type.GROUPCHAT) {
                 try {
                     message.real_jid = new Jid(sender_jid_value);

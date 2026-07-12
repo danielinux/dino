@@ -30,6 +30,11 @@ public interface EncryptionListEntry : Object {
     public abstract Object? get_encryption_icon(Entities.Conversation conversation, ContentItem content_item);
     public abstract string? get_encryption_icon_name(Entities.Conversation conversation, ContentItem content_item);
 
+    // Optional, unobtrusive per-message attribution (e.g. "from Device 2" when a
+    // message was authored by another of the user's own devices). Returns null
+    // for the common case; the UI appends it as a small dim suffix on the message.
+    public virtual string? get_message_attribution(Entities.Conversation conversation, ContentItem content_item) { return null; }
+
 }
 
 public interface CallEncryptionEntry : Object {
