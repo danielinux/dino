@@ -2237,6 +2237,10 @@ public class StreamModule : XmppStreamModule {
         stanza.to = peer;
         stanza.type_ = Xmpp.MessageStanza.TYPE_CHAT;
         stanza.stanza.put_node(pair_node);
+        Bind.Flag? _bf = stream.get_flag(Bind.Flag.IDENTITY);
+        warning("X3DHPQ-PAIRDBG: send_pair_stanza: from(me)=%s to=%s sid=%s step=%u msgType=%u",
+            _bf != null && _bf.my_jid != null ? ((!) _bf.my_jid).to_string() : "?",
+            peer.to_string(), sid_b64, step, msg.msg_type);
         // Pairing stanzas are strictly point-to-point between two devices. Tell
         // the server NOT to carbon-copy them to the account's other resources
         // (XEP-0280 <private/> + XEP-0334 <no-copy/>). Carbon copies are also
