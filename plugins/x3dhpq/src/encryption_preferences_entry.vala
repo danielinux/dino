@@ -287,15 +287,22 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
                 m.purge_own_node.end(r1);
                 m.purge_own_node.begin(s, Protocol.NS_AUDIT, (o2, r2) => {
                     m.purge_own_node.end(r2);
-                    m.publish_current_state.begin(s, (o3, r3) => {
-                        m.publish_current_state.end(r3);
-                        m.ensure_account_audit_genesis.begin(s, (o4, r4) => {
-                            m.ensure_account_audit_genesis.end(r4);
-                            // Fresh chain (genesis + self device, signed) is published;
-                            // refresh the associated-devices list (main-loop hop).
-                            if (devices_widget != null) {
-                                Idle.add(() => { ((!) devices_widget).refresh(); return false; });
-                            }
+                    // Also purge the pairing rendezvous node: stale <pair-hello>/
+                    // <enroll-request> items there (from prior devices/attempts,
+                    // possibly signed by the now-revoked AIK) otherwise linger and
+                    // mislead the next pairing's rendezvous.
+                    m.purge_own_node.begin(s, Protocol.NS_PAIR, (op, rp) => {
+                        m.purge_own_node.end(rp);
+                        m.publish_current_state.begin(s, (o3, r3) => {
+                            m.publish_current_state.end(r3);
+                            m.ensure_account_audit_genesis.begin(s, (o4, r4) => {
+                                m.ensure_account_audit_genesis.end(r4);
+                                // Fresh chain (genesis + self device, signed) is published;
+                                // refresh the associated-devices list (main-loop hop).
+                                if (devices_widget != null) {
+                                    Idle.add(() => { ((!) devices_widget).refresh(); return false; });
+                                }
+                            });
                         });
                     });
                 });
