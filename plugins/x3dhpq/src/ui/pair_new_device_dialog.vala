@@ -374,6 +374,11 @@ public class PairNewDeviceDialog : Gtk.Window {
                     msg.msg_type, from_jid.to_string(), ((!) peer_jid).to_string());
             return;
         }
+        // Progress from our peer: reset the stuck-handshake timer. A multi-step
+        // CPace exchange over a laggy link can exceed the base window per step, so
+        // as long as messages keep flowing we must NOT time out — only a genuinely
+        // stalled handshake (no traffic at all for the window) should.
+        arm_pairing_timeout();
         try {
             Protocol.PairingMsg? reply = ((!) existing).step(msg);
             if (reply != null) {
@@ -413,13 +418,16 @@ public class PairNewDeviceDialog : Gtk.Window {
         });
     }
 
-    // The CPace handshake normally completes in well under a second. If nothing has
-    // finished within this window the other device almost certainly got a wrong code
-    // (the responder silently re-arms), so surface a timeout instead of hanging on
-    // "Verifying…". Re-armed on each fresh attempt.
+    // Guards against a stuck handshake (e.g. a wrong code, where the responder
+    // silently re-arms and never replies). This is a per-STEP idle timer, not a
+    // total-handshake budget: it is re-armed on every pair message received from
+    // our peer (see on_pair_message_received), so a slowly-but-steadily-advancing
+    // CPace exchange over a laggy link completes, while a truly silent peer still
+    // surfaces a timeout instead of hanging on "Verifying…". 30s tolerates a very
+    // slow single hop; the previous 15s total budget fired mid-handshake on lag.
     private void arm_pairing_timeout() {
         cancel_pairing_timeout();
-        pairing_timeout_id = Timeout.add_seconds(15, () => {
+        pairing_timeout_id = Timeout.add_seconds(30, () => {
             pairing_timeout_id = 0;
             set_status("Pairing timed out. If you mistyped the code, start over and try again.");
             disconnect_signals();
