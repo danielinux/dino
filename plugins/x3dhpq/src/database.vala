@@ -1864,6 +1864,14 @@ public class Database : Qlite.Database {
         device_audit.delete().with(device_audit.account_id, "=", account.id).perform();
     }
 
+    // Wipe the v1 linear account-audit chain (AddDevice/RemoveDevice/RotateAIK). Used
+    // by account reset so the new AIK starts from an empty chain and the fresh primary
+    // re-records its self-genesis AddDevice(self)@0 (§11) instead of the stale chain
+    // (signed by the now-revoked old AIK) blocking it.
+    public void clear_account_audit_entries(Account account) {
+        audit_entry.delete().with(audit_entry.account_id, "=", account.id).perform();
+    }
+
     private string bytes_to_hex_string(uint8[] b) {
         StringBuilder sb = new StringBuilder();
         foreach (uint8 byte in b) {

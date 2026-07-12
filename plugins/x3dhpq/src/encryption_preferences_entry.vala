@@ -81,6 +81,23 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
         pair_existing_row.activatable_widget = pair_existing_button;
         group.add(pair_existing_row);
 
+        // §10.6.6/§12 Account reset — available on every account (not only inside the
+        // pending-enrollment banner), so a primary/authorized device can rekey and
+        // restart from genesis. Destructive: mints a new AIK, de-associates all
+        // devices, forces per-contact re-verification. Guarded by a confirm dialog.
+        var reset_row = new ActionRow() {
+            title = "Reset This Account's x3dhpq Identity",
+            subtitle = "Destructive — mints a brand-new key (AIK) from genesis, de-associates ALL devices, and forces every contact to re-verify you. Use this to start over."
+        };
+        var reset_button = new Gtk.Button.with_label("Account reset…") {
+            valign = Gtk.Align.CENTER
+        };
+        reset_button.add_css_class("destructive-action");
+        reset_button.clicked.connect(() => confirm_account_reset(account, reset_row));
+        reset_row.add_suffix(reset_button);
+        reset_row.activatable_widget = reset_button;
+        group.add(reset_row);
+
         return group;
     }
 
@@ -235,6 +252,10 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
         // to resolve against entries signed by the now-revoked old one.
         plugin.db.prune_remote_devices_not_in(account, account.bare_jid.to_string(), new Gee.HashSet<int>());
         plugin.db.clear_device_audit_entries(account);
+        // Also wipe the v1 account-audit chain: its entries are signed by the OLD AIK
+        // and would otherwise (a) fail verification under the new AIK and (b) leave the
+        // chain non-empty so the fresh primary skips its self-genesis AddDevice (§11).
+        plugin.db.clear_account_audit_entries(account);
         plugin.db.mint_fresh_identity(account);
 
         StreamModule? module = plugin.app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
