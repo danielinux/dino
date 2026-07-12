@@ -2084,6 +2084,8 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     // publish-time guard refuses accidental shrinks, so the removal is routed
     // through republish_device_list_removing, which whitelists exactly this id.
     public async bool remove_own_device(Dino.Entities.Account account, uint32 device_id) {
+        warning("X3DHPQ-PAIRDBG: remove_own_device: requested revoke of device %u (authorized=%s)",
+            device_id, db.is_authorized(account).to_string());
         // §10.6.6: any AUTHORIZED device may revoke — not only the original
         // primary — but a disabled/pending device holds no AIK_priv and MUST
         // NOT be able to append a (forged-looking, unsignable) RemoveDevice
@@ -2096,6 +2098,13 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         XmppStream? stream = app.stream_interactor.get_stream(account);
         StreamModule? module = app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
         if (stream == null || module == null) {
+            // Offline: still tombstone + drop locally so the UI clears and the id
+            // can't be re-seeded; the RemoveDevice audit entry + republish happen
+            // on next connect via the normal bootstrap.
+            warning("X3DHPQ-PAIRDBG: remove_own_device: no stream/module (offline) — tombstoning + dropping device %u locally, deferring publish", device_id);
+            db.store_revoked_device(account, (int) device_id);
+            db.remove_peer_device(account, account.bare_jid.to_string(), (int) device_id);
+            db.delete_own_device(account, device_id);
             return false;
         }
 
@@ -2157,6 +2166,7 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         // exactly this id (§8.6). The removed device is now absent from the
         // union, so the content changes and the version bumps (§8.2).
         yield module.republish_device_list_removing(stream, device_id);
+        warning("X3DHPQ-PAIRDBG: remove_own_device: device %u revoked+tombstoned, RemoveDevice published, devicelist republished", device_id);
         return true;
     }
 }
