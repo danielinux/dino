@@ -1322,33 +1322,53 @@ public class StreamModule : XmppStreamModule {
             return devices;
         }
         Gee.Set<int> revoked = db.get_revoked_device_ids(account);
-        Gee.Set<int> chain_confirmed = audit_chain_confirmed_device_ids();
+        // §10.6.3 (trust-manifest model): trust = AIK-ATTESTED MEMBERSHIP. A
+        // sibling is trusted iff its embedded DC verifies (both hybrid sigs)
+        // under the CURRENT account AIK — no genesis-rooted audit chain, no
+        // fail-closed on a missing genesis. The whole list was already
+        // signature-verified above; here we drop any single entry whose DC is
+        // NOT attested by the current AIK (a stale/phantom device signed by an
+        // old AIK), tolerating one bad entry instead of rejecting the list.
+        Bytes? aik_ed = null;
+        Bytes? aik_mldsa = null;
+        Row? aik_row = db.get_local_identity(account.id);
+        if (aik_row != null) {
+            string? ed_b64 = ((!) aik_row)[db.account_identity.aik_pub_ed25519_base64];
+            string? ml_b64 = ((!) aik_row)[db.account_identity.aik_pub_mldsa_base64];
+            if (ed_b64 != null && ed_b64 != "" && ml_b64 != null && ml_b64 != "") {
+                aik_ed = bytes_from_base64((!) ed_b64);
+                aik_mldsa = bytes_from_base64((!) ml_b64);
+            }
+        }
         var trusted_devices = new ArrayList<int>();
         foreach (Protocol.DeviceListDevice e in entries) {
             int did = (int) e.device_id;
-            // §8.6 tombstone: a device we explicitly revoked must never be
-            // re-seeded from an inbound list — drop it before it can be stored
-            // (trusted OR pending) or surfaced in the UI.
+            // §8.6 tombstone: a device we explicitly revoked must never be re-seeded.
             if (revoked.contains(did)) {
                 warning("x3dhpq: dropping revoked device %d re-advertised in own devicelist (§8.6 tombstone)", did);
                 continue;
             }
-            devices.add(did);
             bool is_own_local = local_device_id != null && did == (!) local_device_id;
-            if (is_own_local || chain_confirmed.contains(did)) {
+            bool dc_attested = false;
+            if (aik_ed != null && aik_mldsa != null && e.cert_bytes != null && e.cert_bytes.length > 0) {
+                Protocol.DeviceCertificate? dc = Protocol.DeviceCertificate.unmarshal(new Bytes(e.cert_bytes));
+                if (dc != null) {
+                    try {
+                        dc_attested = ((!) dc).verify((!) aik_ed, (!) aik_mldsa);
+                    } catch (GLib.Error err) {
+                        dc_attested = false;
+                    }
+                }
+            }
+            if (is_own_local || dc_attested) {
+                devices.add(did);
                 trusted_devices.add(did);
                 db.store_remote_device(account, bare, did, cert_by_id[did], added_by_id[did] ?? 0, e.flags, true);
             } else {
-                // §10.6.3: persist the row anyway, but INACTIVE — this keeps it
-                // out of get_remote_device_ids / get_device_list_devices (both
-                // filter active=true, so nothing here changes trust or what we
-                // republish), while making it queryable via
-                // db.get_pending_own_device_ids so the devices-list UI can
-                // surface it as a pending/unconfirmed security event instead of
-                // silently dropping it.
-                warning("x3dhpq: sibling device %d appears in own devicelist but has NO " +
-                    "valid AddDevice audit entry — NOT auto-trusting (§10.6.3)", did);
-                db.store_remote_device(account, bare, did, cert_by_id[did], added_by_id[did] ?? 0, e.flags, false);
+                // DC not attested by the current AIK → not a member. Drop it
+                // (do not trust, do not surface as pending, do not keep for
+                // pruning) so a phantom/old-AIK entry cannot poison the list.
+                warning("x3dhpq: dropping device %d from own devicelist — DC not attested by the current AIK (not a member)", did);
             }
         }
         db.store_device_list_payload(account, bare, id, node.to_string());

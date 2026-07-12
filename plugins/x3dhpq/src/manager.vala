@@ -2084,8 +2084,16 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     // publish-time guard refuses accidental shrinks, so the removal is routed
     // through republish_device_list_removing, which whitelists exactly this id.
     public async bool remove_own_device(Dino.Entities.Account account, uint32 device_id) {
-        warning("X3DHPQ-PAIRDBG: remove_own_device: requested revoke of device %u (authorized=%s)",
-            device_id, db.is_authorized(account).to_string());
+        // HARD GUARD: never revoke the device we are running on. Self-revoke
+        // tombstones the account's own root and republishes a devicelist without
+        // any real device, orphaning the identity (observed: this device revoked
+        // its own primary 1239182299 → genesis at seq=1, everything fails).
+        // Removing THIS device is what "Account reset" is for.
+        int? local_id_guard = db.get_local_device_id(account);
+        if (local_id_guard != null && (uint32) ((!) local_id_guard) == device_id) {
+            warning("x3dhpq remove_own_device: REFUSING to revoke this device (%u) — self-revoke orphans the account; use Account reset instead", device_id);
+            return false;
+        }
         // §10.6.6: any AUTHORIZED device may revoke — not only the original
         // primary — but a disabled/pending device holds no AIK_priv and MUST
         // NOT be able to append a (forged-looking, unsignable) RemoveDevice
