@@ -108,7 +108,15 @@ public class PairNewDeviceDialog : Gtk.Window {
             opts.new_device_id = 1;
             warning("PairNewDeviceDialog: failed to generate device id: %s", e.message);
         }
-        opts.share_primary = false;
+        // §10.6.6 / #46: a confirmed device embraces the account membership — it
+        // MUST drop its own provisional AIK and adopt the account AIK_priv so it
+        // becomes a full authorized manager (shows the account fingerprint, can
+        // verify/anchor the account audit chain, and can itself confirm/revoke).
+        // Transferring share_primary is what carries AIK_priv in the issuance;
+        // without it the new device keeps its own AIK and stays fail-closed
+        // (observed: paired device shows its own AIK, "not covered by AddDevice",
+        // audit chain cannot anchor).
+        opts.share_primary = true;
         opts.new_device_flags = 0;
 
         build_ui();
