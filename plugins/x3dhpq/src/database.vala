@@ -1180,6 +1180,29 @@ public class Database : Qlite.Database {
         return row[trust_manifest.payload_base64];
     }
 
+    // Trust Manifest Phase 2 (task #54): is the LOCAL device a trusted member —
+    // i.e. present in the current OWN manifest fold — and therefore able to author
+    // DIK-signed edits such as a REVOKE? This is the manifest-model authorization
+    // for revoke, which needs only fold membership + this device's DIK, NOT
+    // AIK_priv. Falls back to the legacy is_authorized() gate when no manifest
+    // exists yet (pre-migration), so behaviour is unchanged before migration.
+    // Never throws.
+    public bool is_local_device_trusted_member(Account account) {
+        int? local_id = get_local_device_id(account);
+        if (local_id == null) return false;
+        string own_bare = account.bare_jid.to_string();
+        string? payload = get_trust_manifest_payload(account, own_bare);
+        if (payload != null) {
+            Protocol.TrustManifest? m = Protocol.TrustManifest.unmarshal(Base64.decode((!) payload));
+            if (m != null) {
+                var fold = ((!) m).fold();
+                return fold.has_key(((uint32) ((!) local_id)).to_string());
+            }
+        }
+        // No manifest yet — legacy co-account/devicelist membership gate.
+        return is_authorized(account);
+    }
+
     public void store_trust_manifest(Account account, string bare_jid, string? item_id,
             string payload_base64, long version, string blob_hash_hex) {
         trust_manifest.upsert()

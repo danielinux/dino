@@ -290,12 +290,13 @@ public class SelfDevicesWidget : Gtk.Box {
             });
         }
 
-        // §10.6.6: any AUTHORIZED device can revoke another device from here,
-        // including a pending/unconfirmed one (in fact that's the primary way
-        // to kick out a rogue addition) — except the device the user is
-        // currently using. A disabled (not-yet-authorized) local device holds
-        // no AIK_priv and cannot sign a RemoveDevice entry at all.
-        bool can_revoke = !this_device && db.is_authorized(account);
+        // Trust Manifest Phase 2 (task #54): any TRUSTED device — one present in
+        // the current manifest fold — can revoke another device, not only the
+        // AIK_priv holder, because revoke is a DIK-signed REMOVE entry the local
+        // device signs with its own DIK. Except the device the user is currently
+        // using (hard self-revoke guard). A device not in the fold (disabled/
+        // pending/waiting-for-sync) cannot author a valid REMOVE.
+        bool can_revoke = !this_device && db.is_local_device_trusted_member(account);
         var revoke_button = new Gtk.Button.with_label("Revoke") {
             valign = Gtk.Align.CENTER,
             sensitive = can_revoke

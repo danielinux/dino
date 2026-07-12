@@ -2104,13 +2104,16 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             warning("x3dhpq remove_own_device: REFUSING to revoke this device (%u) — self-revoke orphans the account; use Account reset instead", device_id);
             return false;
         }
-        // §10.6.6: any AUTHORIZED device may revoke — not only the original
-        // primary — but a disabled/pending device holds no AIK_priv and MUST
-        // NOT be able to append a (forged-looking, unsignable) RemoveDevice
-        // entry. Check explicitly up front for a clear failure rather than
-        // relying on the signing calls below to throw on empty key material.
-        if (!db.is_authorized(account)) {
-            warning("x3dhpq remove_own_device: this device is not authorized (disabled/pending) — refusing to revoke device %u", device_id);
+        // Trust Manifest Phase 2 (task #54): revocation is a DIK-signed REMOVE
+        // entry (see StreamModule.append_device_remove_to_manifest), so authorship
+        // needs only that the LOCAL device is present in the current manifest fold
+        // (a trusted member holding its own DIK) — NOT the account AIK_priv. This
+        // lets any folded device revoke, not just the genesis/primary. A device
+        // that is not in the fold (disabled/pending, or already revoked) cannot
+        // author a valid REMOVE, so refuse up front for a clear failure. Falls back
+        // to is_authorized() only before the account has migrated to a manifest.
+        if (!db.is_local_device_trusted_member(account)) {
+            warning("x3dhpq remove_own_device: this device is not a trusted member (not in the manifest fold) — refusing to revoke device %u", device_id);
             return false;
         }
         XmppStream? stream = app.stream_interactor.get_stream(account);
