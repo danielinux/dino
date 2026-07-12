@@ -93,7 +93,7 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
             valign = Gtk.Align.CENTER
         };
         reset_button.add_css_class("destructive-action");
-        reset_button.clicked.connect(() => confirm_account_reset(account, reset_row));
+        reset_button.clicked.connect(() => confirm_account_reset(account, reset_row, devices_widget));
         reset_row.add_suffix(reset_button);
         reset_row.activatable_widget = reset_button;
         group.add(reset_row);
@@ -185,7 +185,7 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
     // disturbs peers. Mints a brand-new AIK (a new ratchet root), explicitly
     // de-associating every previously associated device — MUST be presented as
     // destructive per the XEP.
-    private void confirm_account_reset(Account account, Gtk.Widget anchor) {
+    private void confirm_account_reset(Account account, Gtk.Widget anchor, UI.SelfDevicesWidget? devices_widget = null) {
         var dialog = new Adw.AlertDialog(
             "Reset this account's identity?",
             "This performs an ACCOUNT RESET: it creates a brand-new post-quantum identity for " +
@@ -210,7 +210,7 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
         dialog.close_response = "cancel";
         dialog.response.connect((id) => {
             if (id != "reset") return;
-            perform_account_reset(account);
+            perform_account_reset(account, devices_widget);
         });
         dialog.present(anchor);
     }
@@ -223,7 +223,7 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
     // never crash bootstrap or leave the account without a usable local
     // identity: mint_fresh_identity() always succeeds locally regardless of
     // whether the (best-effort, network-dependent) RotateAIK signal does.
-    private void perform_account_reset(Account account) {
+    private void perform_account_reset(Account account, UI.SelfDevicesWidget? devices_widget) {
         Bytes? old_aik_priv_ed = null;
         Bytes? old_aik_priv_mldsa = null;
         if (plugin.db.has_local_identity(account)) {
@@ -265,10 +265,10 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
         StreamModule? module = plugin.app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
         XmppStream? stream = plugin.app.stream_interactor.get_stream(account);
         if (module == null || stream == null) {
-            // Offline: the new identity is minted locally; the devicelist
-            // publish (and the best-effort RotateAIK signal) happen on next
-            // connect via the normal publish_current_state bootstrap path,
-            // which re-derives everything needed from persisted state.
+            // Offline: the new identity is minted locally; the devicelist publish +
+            // self-genesis happen on next connect via the normal bootstrap path. The
+            // local device set is already fresh, so reflect it in the UI now.
+            if (devices_widget != null) ((!) devices_widget).refresh();
             return;
         }
 
@@ -293,7 +293,15 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
             // AIK (overwriting any stale/old-AIK item "0" left on the audit node),
             // rather than waiting for the next reconnect — so multi-device trust is
             // usable right after the reset (§11).
-            ((!) module).ensure_account_audit_genesis.begin((!) stream);
+            ((!) module).ensure_account_audit_genesis.begin((!) stream, (obj2, res2) => {
+                ((!) module).ensure_account_audit_genesis.end(res2);
+                // Now that the fresh chain (genesis + self device, signed) is published,
+                // refresh the associated-devices list so it shows the clean single-device
+                // state without a close/reopen. (Async callback → hop to the main loop.)
+                if (devices_widget != null) {
+                    Idle.add(() => { ((!) devices_widget).refresh(); return false; });
+                }
+            });
         });
     }
 
