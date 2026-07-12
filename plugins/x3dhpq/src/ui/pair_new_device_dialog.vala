@@ -30,6 +30,14 @@ public class PairNewDeviceDialog : Gtk.Window {
 
     private Protocol.PairingExisting? existing;
     private Jid? peer_jid;
+    // Same-account, resource-to-resource <pair> delivery on some servers is
+    // intermittently lossy (observed: a PAKE1 simply never reaches the peer,
+    // while the same direction succeeds on another attempt). Retransmit our
+    // last-sent handshake message on a short timer until the peer's next message
+    // arrives; the responder's FSM safely ignores a duplicate (it checks the
+    // message type before mutating state). 0 = not armed.
+    private Protocol.PairingMsg? last_sent_msg;
+    private uint pair_resend_id = 0;
 
     // §10.6.2 "Confirm a device" direction: this device (existing/primary)
     // does NOT generate its own code — the user types in / scans the code
@@ -352,6 +360,9 @@ public class PairNewDeviceDialog : Gtk.Window {
             if (pake1 != null) {
                 warning("X3DHPQ-PAIRDBG: dialog: sending PAKE1 to %s", new_full_jid.to_string());
                 stream_module.send_pair_stanza(new_full_jid, sid, (!) pake1);
+                // Arm retransmission until the peer's first reply (see field doc).
+                last_sent_msg = pake1;
+                arm_pair_resend();
             }
             set_status("Verifying…");
             arm_pairing_timeout();
@@ -374,6 +385,8 @@ public class PairNewDeviceDialog : Gtk.Window {
                     msg.msg_type, from_jid.to_string(), ((!) peer_jid).to_string());
             return;
         }
+        // First reply from our peer: PAKE1 was delivered — stop retransmitting it.
+        cancel_pair_resend();
         // Progress from our peer: reset the stuck-handshake timer. A multi-step
         // CPace exchange over a laggy link can exceed the base window per step, so
         // as long as messages keep flowing we must NOT time out — only a genuinely
@@ -384,6 +397,12 @@ public class PairNewDeviceDialog : Gtk.Window {
             if (reply != null) {
                 Jid target = peer_jid ?? from_jid;
                 stream_module.send_pair_stanza(target, sid, (!) reply);
+                // Retransmit this reply too until the peer's next message, so a
+                // lost mid-handshake stanza (e.g. our msgType=3) doesn't stall it.
+                if (!((!) existing).is_done()) {
+                    last_sent_msg = reply;
+                    arm_pair_resend();
+                }
             }
             if (((!) existing).is_done()) {
                 Protocol.DeviceCertificate? cert = ((!) existing).get_issued_cert();
@@ -436,6 +455,29 @@ public class PairNewDeviceDialog : Gtk.Window {
         });
     }
 
+    // Retransmit PAKE1 every 4s until the peer's first reply, to survive an
+    // intermittently-lossy same-account <pair> delivery. Cancelled by the first
+    // inbound message (cancel_pair_resend) or when the dialog/timeout tears down.
+    private void arm_pair_resend() {
+        cancel_pair_resend();
+        pair_resend_id = Timeout.add_seconds(4, () => {
+            if (last_sent_msg == null || peer_jid == null || existing == null) {
+                pair_resend_id = 0;
+                return false;
+            }
+            warning("X3DHPQ-PAIRDBG: dialog: RETRANSMIT PAKE1 to %s (no reply yet)", ((!) peer_jid).to_string());
+            stream_module.send_pair_stanza((!) peer_jid, sid, (!) last_sent_msg);
+            return true; // keep retransmitting until cancelled
+        });
+    }
+
+    private void cancel_pair_resend() {
+        if (pair_resend_id != 0) {
+            Source.remove(pair_resend_id);
+            pair_resend_id = 0;
+        }
+    }
+
     private void cancel_pairing_timeout() {
         if (pairing_timeout_id != 0) {
             Source.remove(pairing_timeout_id);
@@ -445,6 +487,7 @@ public class PairNewDeviceDialog : Gtk.Window {
 
     private void disconnect_signals() {
         cancel_pairing_timeout();
+        cancel_pair_resend();
         if (pair_hello_handler_id != 0) {
             stream_module.disconnect(pair_hello_handler_id);
             pair_hello_handler_id = 0;
