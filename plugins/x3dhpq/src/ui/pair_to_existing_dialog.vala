@@ -517,9 +517,7 @@ public class PairToExistingDialog : Adw.Window {
             return false;
         }
         locked_peer = null;
-        warning("X3DHPQ-PAIR: RESPONDER re-armed after auth-fail from stray %s; still waiting for the genuine device",
-                failed_peer.to_string());
-        set_status("Waiting for your other device to confirm…");
+        set_status("That code didn't match. Re-check the code and enter it again on the other device.");
         return true;
     }
 

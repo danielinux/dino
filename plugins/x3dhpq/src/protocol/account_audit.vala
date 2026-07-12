@@ -265,6 +265,29 @@ public class AccountAuditChain : GLib.Object {
         return genesis_seen;
     }
 
+    // The seq the chain expects next (0 = genesis not yet applied).
+    public uint64 expected_next_seq() {
+        return next_seq;
+    }
+
+    // Seed the in-memory chain state from entries already persisted &amp; verified in a
+    // previous session, WITHOUT re-verifying or re-emitting observations. Live PEP
+    // +notify only ever delivers the single newest audit item, so a fresh verifier
+    // (next_seq=0) would reject a legitimate seq=N entry with "seq mismatch". Trust
+    // the persisted tail (each entry was verified before it was stored) and advance
+    // next_seq / tail_hash to it, so the next live entry is checked against the real
+    // tail. `persisted` MUST be ordered oldest→newest.
+    public void seed_from_persisted(Gee.List<AuditEntry> persisted) {
+        if (persisted.size == 0) {
+            return;
+        }
+        AuditEntry last = persisted.get(persisted.size - 1);
+        tail_hash = last.compute_hash();
+        next_seq = last.seq + 1;
+        last_timestamp = last.timestamp;
+        genesis_seen = true;
+    }
+
     private string action_detail(AuditEntry entry) {
         switch (entry.action) {
             case (uint8) AccountAuditAction.ADD_DEVICE:

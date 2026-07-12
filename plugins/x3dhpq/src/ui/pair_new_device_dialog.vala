@@ -24,6 +24,9 @@ public class PairNewDeviceDialog : Gtk.Window {
 
     private ulong pair_hello_handler_id;
     private ulong msg_handler_id;
+    // GLib timeout source guarding against a stuck handshake (e.g. a wrong code, where
+    // the other device silently re-arms and never sends its confirm). 0 = not armed.
+    private uint pairing_timeout_id = 0;
 
     private Protocol.PairingExisting? existing;
     private Jid? peer_jid;
@@ -341,6 +344,7 @@ public class PairNewDeviceDialog : Gtk.Window {
                 stream_module.send_pair_stanza(new_full_jid, sid, (!) pake1);
             }
             set_status("Verifying…");
+            arm_pairing_timeout();
         } catch (GLib.Error e) {
             set_status("Failed: %s".printf(e.message));
             pairing_failed(e.message);
@@ -399,7 +403,30 @@ public class PairNewDeviceDialog : Gtk.Window {
         });
     }
 
+    // The CPace handshake normally completes in well under a second. If nothing has
+    // finished within this window the other device almost certainly got a wrong code
+    // (the responder silently re-arms), so surface a timeout instead of hanging on
+    // "Verifying…". Re-armed on each fresh attempt.
+    private void arm_pairing_timeout() {
+        cancel_pairing_timeout();
+        pairing_timeout_id = Timeout.add_seconds(15, () => {
+            pairing_timeout_id = 0;
+            set_status("Pairing timed out. If you mistyped the code, start over and try again.");
+            disconnect_signals();
+            pairing_failed("timed out");
+            return false;
+        });
+    }
+
+    private void cancel_pairing_timeout() {
+        if (pairing_timeout_id != 0) {
+            Source.remove(pairing_timeout_id);
+            pairing_timeout_id = 0;
+        }
+    }
+
     private void disconnect_signals() {
+        cancel_pairing_timeout();
         if (pair_hello_handler_id != 0) {
             stream_module.disconnect(pair_hello_handler_id);
             pair_hello_handler_id = 0;

@@ -1566,6 +1566,16 @@ public class StreamModule : XmppStreamModule {
             audit_chain.audit_entry_observed.connect((action, detail) => {
                 account_audit_event(action, detail);
             });
+            // Live PEP +notify only carries the single newest audit item, so seed the
+            // verifier from the persisted tail — otherwise a legitimate seq=N entry is
+            // rejected against a fresh next_seq=0 ("seq mismatch: expected 0 got N").
+            audit_chain.seed_from_persisted(db.list_account_audit_entries(account));
+        }
+
+        // Already applied (e.g. our own PEP self-echo of an entry we just published,
+        // or a duplicate notification): nothing to do.
+        if (entry.seq < audit_chain.expected_next_seq()) {
+            return;
         }
 
         var entries = new Gee.ArrayList<Protocol.AuditEntry>();
@@ -1579,6 +1589,9 @@ public class StreamModule : XmppStreamModule {
                 db.store_account_audit_entry(account, entry);
             }
         } catch (Protocol.AccountAuditError e) {
+            // A gap (entry.seq > expected) means we missed intermediate entries that
+            // live +notify never backfills; log it rather than treating the newest
+            // item as genesis. (Full-history fetch of the audit node is a follow-up.)
             warning("handle_audit_event: chain verification failed: %s", e.message);
         }
     }

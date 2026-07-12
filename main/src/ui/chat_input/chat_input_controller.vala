@@ -121,7 +121,12 @@ public class ChatInputController : Object {
 
         status_description_label.label = status.message;
 
-        chat_input.file_button.sensitive = status.input_state == Plugins.InputFieldStatus.InputState.NORMAL;
+        bool can_write = status.input_state == Plugins.InputFieldStatus.InputState.NORMAL;
+        chat_input.file_button.sensitive = can_write;
+        // Grey out the composer itself when sending is blocked (e.g. this device is
+        // pending-enrollment / waiting for sync, §10.6.6) instead of leaving it looking
+        // editable while every send silently no-ops. The status label above explains why.
+        chat_input.chat_text_view.sensitive = can_write;
     }
 
     private void reset_input_field_status() {
