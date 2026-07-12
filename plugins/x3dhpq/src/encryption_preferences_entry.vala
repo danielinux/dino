@@ -272,22 +272,15 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
             return;
         }
 
-        // §12.1 step 3 / §11.4 RotateAIK: signal the OLD chain, signed by the
-        // OLD AIK, so any peer still watching it can chain-detect the
-        // reconstruction (§12.3) — best-effort, and entirely skipped when the
-        // old AIK_priv was not held locally.
-        if (old_aik_priv_ed != null && old_aik_priv_mldsa != null) {
-            try {
-                Bytes new_aik_pub_ed = plugin.db.get_local_identity_bytes(account, plugin.db.account_identity.aik_pub_ed25519_base64);
-                Bytes new_aik_pub_mldsa = plugin.db.get_local_identity_bytes(account, plugin.db.account_identity.aik_pub_mldsa_base64);
-                uint8[] new_aik_marshalled = Protocol.DeviceAuditEntryV2.aik_pub_marshal(
-                    bytes_to_uint8_array(new_aik_pub_ed), bytes_to_uint8_array(new_aik_pub_mldsa));
-                module.publish_rotate_aik_audit_entry.begin(
-                    (!) stream, (!) old_aik_priv_ed, (!) old_aik_priv_mldsa, new_aik_marshalled);
-            } catch (GLib.Error e) {
-                warning("x3dhpq account reset: RotateAIK signal failed (continuing anyway): %s", e.message);
-            }
-        }
+        // NOTE: we deliberately do NOT publish a best-effort RotateAIK entry to the
+        // account-audit chain on reset. Because the reset clears the local chain first
+        // (so the fresh primary can re-record its self-genesis AddDevice(self)@0), a
+        // RotateAIK published here would compute seq=0 and land — signed by the OLD,
+        // now-revoked AIK — as item "0" on the audit node, becoming a bogus genesis
+        // that fails signature verification under the new AIK on EVERY device
+        // (fail-closed: no sibling ever trusted). Peers still chain-detect the
+        // reconstruction from the AIK change on the devicelist itself (§8.5/§10.6.5).
+        // (old_aik_priv_ed/_mldsa remain captured above for a future, seq-safe signal.)
 
         // Publishes the fresh, self-signed devicelist under the new AIK —
         // containing ONLY this device, every prior device having just been
