@@ -249,6 +249,8 @@ public class PairNewDeviceDialog : Gtk.Window {
         entry.sensitive = false;
         if (confirm_button != null) ((!) confirm_button).sensitive = false;
         set_status("Waiting for that device to respond…");
+        warning("X3DHPQ-PAIRDBG: dialog.on_confirm_clicked: code confirmed, calling refresh_pair_hello (active_stream=%s)",
+            (active_stream != null).to_string());
         if (active_stream != null) {
             stream_module.refresh_pair_hello.begin((!) active_stream);
         }
@@ -314,6 +316,8 @@ public class PairNewDeviceDialog : Gtk.Window {
     }
 
     private void on_pair_hello_received(Jid new_full_jid, uint8[] hello_sid) {
+        warning("X3DHPQ-PAIRDBG: dialog.on_pair_hello_received: from=%s confirm_mode=%s code_confirmed=%s existing=%s",
+            new_full_jid.to_string(), confirm_mode.to_string(), code_confirmed.to_string(), (existing != null).to_string());
         if (confirm_mode && !code_confirmed) {
             // Not yet — the user hasn't entered/confirmed a code, so we don't
             // know which pending device (if several were mid-rendezvous) or
@@ -341,6 +345,7 @@ public class PairNewDeviceDialog : Gtk.Window {
             existing = new Protocol.PairingExisting((!) aik, code, sid, opts);
             Protocol.PairingMsg? pake1 = ((!) existing).step(null);
             if (pake1 != null) {
+                warning("X3DHPQ-PAIRDBG: dialog: sending PAKE1 to %s", new_full_jid.to_string());
                 stream_module.send_pair_stanza(new_full_jid, sid, (!) pake1);
             }
             set_status("Verifying…");

@@ -1729,9 +1729,12 @@ public class StreamModule : XmppStreamModule {
     // downstream behavior to a self-PEP one.
     private void handle_pair_hello_node(XmppStream stream, Jid from, StanzaNode item_node) {
         if (!from.bare_jid.equals(account.bare_jid)) {
+            warning("X3DHPQ-PAIRDBG: handle_pair_hello_node: DROP — from %s not our bare jid %s",
+                from.to_string(), account.bare_jid.to_string());
             return;
         }
         if (item_node.name != "pair-hello") {
+            warning("X3DHPQ-PAIRDBG: handle_pair_hello_node: DROP — child is <%s> not <pair-hello>", item_node.name);
             return;
         }
         string? full_jid_str  = item_node.get_attribute("full-jid");
@@ -1753,10 +1756,13 @@ public class StreamModule : XmppStreamModule {
         Bind.Flag? bind_flag = stream.get_flag(Bind.Flag.IDENTITY);
         Jid? my_jid = bind_flag != null ? bind_flag.my_jid : null;
         if (my_jid != null && my_jid.equals(new_full_jid)) {
+            warning("X3DHPQ-PAIRDBG: handle_pair_hello_node: DROP — own echo (full-jid=%s)", new_full_jid.to_string());
             return;
         }
         uint device_id = (uint) int64.parse(device_id_str);
         uint8[] sid = base64url_decode(sid_b64url);
+        warning("X3DHPQ-PAIRDBG: handle_pair_hello_node: OK — firing pair_hello_received from %s device-id=%u",
+            new_full_jid.to_string(), device_id);
         pair_hello_received(new_full_jid, device_id, sid);
     }
 
@@ -2329,10 +2335,18 @@ public class StreamModule : XmppStreamModule {
             if (result.is_error()) return;
             StanzaNode? items_node = result.stanza.get_deep_subnode(
                 Pubsub.NS_URI + ":pubsub", Pubsub.NS_URI + ":items");
-            if (items_node == null) return;
-            foreach (StanzaNode item in items_node.get_subnodes("item", Pubsub.NS_URI)) {
+            if (items_node == null) {
+                warning("X3DHPQ-PAIRDBG: refresh_pair_hello: no <items> node in result (node empty or access denied)");
+                return;
+            }
+            var item_list = items_node.get_subnodes("item", Pubsub.NS_URI);
+            warning("X3DHPQ-PAIRDBG: refresh_pair_hello: fetched %d item(s) on pair:0", item_list.size);
+            foreach (StanzaNode item in item_list) {
                 if (item.sub_nodes.size == 0) continue;
                 StanzaNode child = item.sub_nodes[0];
+                warning("X3DHPQ-PAIRDBG: refresh_pair_hello: item id=%s child=<%s full-jid=%s device-id=%s>",
+                    item.get_attribute("id") ?? "?", child.name,
+                    child.get_attribute("full-jid") ?? "?", child.get_attribute("device-id") ?? "?");
                 if (child.name == "enroll-request") {
                     handle_enroll_request_node(stream, account.bare_jid, child);
                 } else {
