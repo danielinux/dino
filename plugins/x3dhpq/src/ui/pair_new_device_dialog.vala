@@ -249,8 +249,13 @@ public class PairNewDeviceDialog : Gtk.Window {
         entry.sensitive = false;
         if (confirm_button != null) ((!) confirm_button).sensitive = false;
         set_status("Waiting for that device to respond…");
-        warning("X3DHPQ-PAIRDBG: dialog.on_confirm_clicked: code confirmed, calling refresh_pair_hello (active_stream=%s)",
+        warning("X3DHPQ-PAIRDBG: dialog.on_confirm_clicked: code confirmed, replay cached hello + refresh_pair_hello (active_stream=%s)",
             (active_stream != null).to_string());
+        // Act on a hello already received (via +notify) before the dialog was
+        // ready — replayed synchronously so we don't depend on the network
+        // re-fetch, which can stall and leave PAKE1 unsent (pairing hang).
+        stream_module.replay_last_pair_hello();
+        // Also re-fetch in case a newer hello landed on the node meanwhile.
         if (active_stream != null) {
             stream_module.refresh_pair_hello.begin((!) active_stream);
         }

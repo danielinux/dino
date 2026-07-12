@@ -59,6 +59,18 @@ public class StreamModule : XmppStreamModule {
     // existing device reacts by initiating the pairing FSM (PAKE1) toward the
     // full JID using this sid.
     public signal void pair_hello_received(Jid new_full_jid, uint device_id, uint8[] sid);
+
+    // Most-recent <pair-hello> seen for this account (via live +notify OR an
+    // explicit refresh_pair_hello fetch), cached so the "Confirm a device" dialog
+    // can act on a hello that arrived BEFORE it opened / before the code was
+    // typed. Without this, a hello delivered by +notify while no dialog is
+    // listening is lost, and the confirm flow depends entirely on a re-fetch that
+    // may stall — the exact failure seen in the pairing hang. See
+    // replay_last_pair_hello().
+    private Jid? last_pair_hello_jid = null;
+    private uint last_pair_hello_device_id = 0;
+    private uint8[]? last_pair_hello_sid = null;
+    private int64 last_pair_hello_at = 0;   // GLib monotonic time (µs)
     // §11.8 queued enrollment request: a disabled/pending device's persisted
     // <enroll-request> item was seen (live +notify or an explicit
     // refresh_pair_hello fetch) and its DIK hybrid signature verified. Carries
@@ -1761,9 +1773,35 @@ public class StreamModule : XmppStreamModule {
         }
         uint device_id = (uint) int64.parse(device_id_str);
         uint8[] sid = base64url_decode(sid_b64url);
+        // Cache before firing so a dialog opened later (or a confirm-time replay)
+        // can still reach this hello even if no dialog was listening just now.
+        last_pair_hello_jid = new_full_jid;
+        last_pair_hello_device_id = device_id;
+        last_pair_hello_sid = sid;
+        last_pair_hello_at = GLib.get_monotonic_time();
         warning("X3DHPQ-PAIRDBG: handle_pair_hello_node: OK — firing pair_hello_received from %s device-id=%u",
             new_full_jid.to_string(), device_id);
         pair_hello_received(new_full_jid, device_id, sid);
+    }
+
+    // Re-fire the most-recent cached <pair-hello> so a "Confirm a device" dialog
+    // that has just had its code confirmed can act on a hello which arrived (via
+    // +notify) before it was ready — without depending on a fresh network fetch
+    // that may stall. Bounded to a short freshness window so we never resurrect a
+    // hello from a dead resource of a previous attempt.
+    public void replay_last_pair_hello() {
+        if (last_pair_hello_jid == null || last_pair_hello_sid == null) {
+            warning("X3DHPQ-PAIRDBG: replay_last_pair_hello: nothing cached");
+            return;
+        }
+        int64 age_s = (GLib.get_monotonic_time() - last_pair_hello_at) / 1000000;
+        if (age_s > 180) {
+            warning("X3DHPQ-PAIRDBG: replay_last_pair_hello: cached hello too old (%llds) — skipping", age_s);
+            return;
+        }
+        warning("X3DHPQ-PAIRDBG: replay_last_pair_hello: re-firing cached hello from %s device-id=%u (age %llds)",
+            ((!) last_pair_hello_jid).to_string(), last_pair_hello_device_id, age_s);
+        pair_hello_received((!) last_pair_hello_jid, last_pair_hello_device_id, (!) last_pair_hello_sid);
     }
 
     // §11.8 queued enrollment request: parse+verify+surface the persisted
