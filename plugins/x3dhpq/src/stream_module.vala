@@ -2407,6 +2407,16 @@ public class StreamModule : XmppStreamModule {
     // ── Inbound message handler ────────────────────────────────────────────────
 
     private void on_received_message(XmppStream stream, Xmpp.MessageStanza message) {
+        bool is_carbon = Xmpp.Xep.MessageCarbons.MessageFlag.get_flag(message) != null;
+        bool has_pair = message.stanza.get_subnode("pair", Protocol.NS_PAIR) != null;
+        bool has_hello = message.stanza.get_subnode("pair-hello", Protocol.NS_PAIR) != null;
+        if (has_pair || has_hello) {
+            Bind.Flag? bf = stream.get_flag(Bind.Flag.IDENTITY);
+            string me = bf != null && bf.my_jid != null ? ((!) bf.my_jid).to_string() : "?";
+            warning("X3DHPQ-PAIRDBG: on_received_message: pair=%s hello=%s from=%s to(me)=%s type=%s carbon=%s",
+                has_pair.to_string(), has_hello.to_string(), message.from.to_string(), me,
+                message.type_ ?? "(none)", is_carbon.to_string());
+        }
         // Pairing is strictly point-to-point between two devices; the genuine
         // handshake is delivered DIRECTLY to our full JID (never a carbon). A
         // carbon copy is a duplicate of traffic between two OTHER resources of
@@ -2414,7 +2424,11 @@ public class StreamModule : XmppStreamModule {
         // forwarded copy, so without this guard a <pair>/<pair-hello> nested in a
         // carbon would drive our FSM with a foreign/duplicate stanza (or an
         // OMEMO-only resource's echoed envelope). Ignore carboned copies.
-        if (Xmpp.Xep.MessageCarbons.MessageFlag.get_flag(message) != null) {
+        if (is_carbon) {
+            if (has_pair || has_hello) {
+                warning("X3DHPQ-PAIRDBG: on_received_message: DROPPED as carbon (pair=%s hello=%s)",
+                    has_pair.to_string(), has_hello.to_string());
+            }
             return;
         }
         // Handle inbound <pair xmlns='urn:xmppqr:x3dhpq:pair:0'> in chat messages.
@@ -2425,6 +2439,10 @@ public class StreamModule : XmppStreamModule {
         if (pair_node != null && message.type_ == Xmpp.MessageStanza.TYPE_CHAT) {
             handle_pair_message(message.from, pair_node);
             return;
+        }
+        if (pair_node != null) {
+            warning("X3DHPQ-PAIRDBG: on_received_message: DROPPED <pair> — type=%s is not TYPE_CHAT=%s",
+                message.type_ ?? "(none)", Xmpp.MessageStanza.TYPE_CHAT);
         }
         // XEP §10.1a method A: <pair-hello> delivered as a directed message when
         // this device displayed the QR and a peer device scanned it, rather than
