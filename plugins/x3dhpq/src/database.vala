@@ -1571,8 +1571,14 @@ public class Database : Qlite.Database {
     // account share a single AIK (§7) — that is the account fingerprint shown
     // prominently once — but each device holds its own DIK, so this value
     // differs per device and lets a user out-of-band-compare a specific device.
-    // Returns null if we have not yet learned this device's DIK (e.g. its bundle
-    // has not been fetched).
+    //
+    // Trust Manifest Phase 2 (task #67): the DIK pubs are taken from the device's
+    // DeviceCertificate as carried in the manifest fold — verify_and_apply_manifest
+    // persists each folded DC into peer_device.certificate_base64 — so the value is
+    // available immediately from the fold, WITHOUT waiting for a separately-fetched
+    // bundle. Falls back to the legacy dik_pub_* columns (populated from a bundle)
+    // when no certificate is stored. Returns null ONLY when there is genuinely no
+    // DC and no learned DIK for this device.
     public string? get_device_fingerprint(Account account, string bare_jid, int device_id) {
         Row? row = peer_device.select()
             .with(peer_device.account_id, "=", account.id)
@@ -1580,6 +1586,20 @@ public class Database : Qlite.Database {
             .with(peer_device.device_id, "=", device_id)
             .single().row().inner;
         if (row == null) return null;
+        // Prefer the DC from the manifest fold (peer_device.certificate_base64).
+        string? cert_b64 = ((!) row)[peer_device.certificate_base64];
+        if (cert_b64 != null && cert_b64 != "") {
+            Protocol.DeviceCertificate? dc = Protocol.DeviceCertificate.unmarshal(bytes_from_base64((!) cert_b64));
+            if (dc != null && ((!) dc).dik_pub_ed25519 != null && ((!) dc).dik_pub_mldsa != null) {
+                try {
+                    return account_fingerprint(((!) dc).dik_pub_ed25519, ((!) dc).dik_pub_mldsa);
+                } catch (GLib.Error e) {
+                    warning("Unable to compute x3dhpq device fingerprint from DC for %s/%d: %s", bare_jid, device_id, e.message);
+                    // fall through to the legacy column path
+                }
+            }
+        }
+        // Legacy fallback: DIK pubs learned from a fetched bundle.
         string? dik_ed = ((!) row)[peer_device.dik_pub_ed25519_base64];
         string? dik_ml = ((!) row)[peer_device.dik_pub_mldsa_base64];
         if (dik_ed == null || dik_ml == null) return null;

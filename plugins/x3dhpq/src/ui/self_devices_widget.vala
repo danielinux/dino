@@ -6,14 +6,16 @@ using Dino.Entities;
 namespace Dino.Plugins.X3dhpq.UI {
 
 // §10.6: the account's associated-devices list. One row per device known
-// under this account's AIK — sourced from the local devicelist (peer_device,
-// keyed by our own bare JID) plus the audit-chain trust gate already applied
-// by StreamModule.parse_device_list's is_self branch:
-//  - "confirmed" devices (peer_device.active=true) are covered by a
-//    chain-verified AddDevice entry (or are this local device) — §10.6.3.
-//  - "pending" devices (peer_device.active=false) appear in the signed
-//    devicelist but have NO verified AddDevice entry yet; surfaced here as a
-//    security event rather than silently trusted or silently dropped.
+// under this account's AIK — sourced from the local peer_device rows (keyed by
+// our own bare JID). Trust Manifest Phase 2: trust = presence in the account's
+// manifest fold, which StreamModule.verify_and_apply_manifest persists as
+// active peer_device rows (each carrying the folded DeviceCertificate):
+//  - "confirmed"/trusted devices (peer_device.active=true) are present in the
+//    current manifest fold (or are this local device).
+//  - "not-in-manifest" devices (peer_device.active=false) appear under the
+//    account but are NOT in the current fold; surfaced here so the user can
+//    confirm or revoke them rather than silently trusting or dropping them.
+// (The retired audit-chain "AddDevice record" gate no longer decides trust.)
 public class SelfDevicesWidget : Gtk.Box {
     public signal void confirm_device_requested();
 
@@ -250,7 +252,7 @@ public class SelfDevicesWidget : Gtk.Box {
         subtitle_parts.add(@"ID $(((uint32) device_id).to_string())");
         subtitle_parts.add(role);
         if (this_device) subtitle_parts.add("this device");
-        if (!confirmed) subtitle_parts.add("PENDING — not yet confirmed");
+        if (!confirmed) subtitle_parts.add("NOT IN MANIFEST — not trusted yet");
 
         var row = new Adw.ExpanderRow() {
             title = device_display_name(device_id),
@@ -270,10 +272,14 @@ public class SelfDevicesWidget : Gtk.Box {
         rename_button.clicked.connect(() => rename_device(rename_id));
         row.add_suffix(rename_button);
 
+        // Trust Manifest Phase 2 (task #67): the device fingerprint is derived from
+        // the device's DeviceCertificate as carried in the manifest fold (its DIK
+        // pubs) — no separate bundle fetch required. Only show a "not known" message
+        // when there is genuinely no certificate for this device.
         string? device_fp = db.get_device_fingerprint(account, own_jid, device_id);
         var fp_row = new Adw.ActionRow() {
             title = "Device key fingerprint",
-            subtitle = device_fp ?? "Not yet known (bundle not fetched)"
+            subtitle = device_fp ?? "Not known (no device certificate yet)"
         };
         fp_row.subtitle_selectable = true;
         row.add_row(fp_row);
@@ -282,11 +288,16 @@ public class SelfDevicesWidget : Gtk.Box {
         row.add_row(new Adw.ActionRow() { title = "Added", subtitle = added_str });
 
         if (!confirmed) {
+            // Trust Manifest Phase 2 (task #67): trust = presence in the account's
+            // manifest fold (the audit-chain "AddDevice record" gate is retired). A
+            // device shown here appears under the account but is NOT in the current
+            // fold, so it is not trusted yet — admit it via "Confirm a device…" or
+            // revoke it if unrecognized.
             row.add_row(new Adw.ActionRow() {
-                title = "Not yet confirmed",
-                subtitle = "This device appears in the signed devicelist but has no verified " +
-                    "AddDevice audit-chain record. If you don't recognize it, revoke it — this " +
-                    "may be an unauthorized device (§10.6.3)."
+                title = "Not in the trust manifest",
+                subtitle = "This device appears under the account but is not part of the current " +
+                    "trust manifest, so it is not trusted yet. Confirm it via “Confirm a device…”, " +
+                    "or revoke it if you don't recognize it."
             });
         }
 
@@ -376,7 +387,7 @@ public class SelfDevicesWidget : Gtk.Box {
     private void confirm_and_remove(int device_id) {
         var dialog = new Adw.AlertDialog(
             "Revoke device %s?".printf(((uint32) device_id).to_string()),
-            "The device will be revoked: a signed RemoveDevice record is published to your account's audit chain and the local session, bundle and pre-key state for it are torn down. Contacts drop it when they see it disappear from a signed, version-advanced devicelist."
+            "The device will be revoked: a DIK-signed REMOVE entry is appended to your account's trust manifest and the local session, bundle and pre-key state for it are torn down. Contacts drop it when they see it leave the version-advanced manifest (and the derived devicelist)."
         );
         dialog.add_response("cancel", "Cancel");
         dialog.add_response("remove", "Revoke");
