@@ -1342,9 +1342,10 @@ public class StreamModule : XmppStreamModule {
                                       : (uint64) (db.get_device_list_version(account, own_bare) + 1);
         m.sign_head(dik_priv_ed, dik_priv_ml);
 
-        if (yield publish_trust_manifest_blob(stream, m)) {
-            verify_and_apply_manifest(account.bare_jid, m.marshal());
-        }
+        // Persist locally first, publish best-effort (see append_device_add_to_manifest):
+        // a hung publish IQ must not drop our freshly-built genesis on the floor.
+        verify_and_apply_manifest(account.bare_jid, m.marshal());
+        publish_trust_manifest_blob.begin(stream, m);
     }
 
     // §D2: at pairing confirmation, append a DIK-signed ADD for the newcomer and
@@ -1420,15 +1421,18 @@ public class StreamModule : XmppStreamModule {
             return false;
         }
 
-        warning("X3DHPQ-PAIR: append_device_add_to_manifest publishing newcomer=%u version=%llu entries=%d",
-                newcomer_dc.device_id, ((!) m).version, ((!) m).entries.size);
-        if (yield publish_trust_manifest_blob(stream, (!) m)) {
-            verify_and_apply_manifest(account.bare_jid, ((!) m).marshal());
-            warning("X3DHPQ-PAIR: append_device_add_to_manifest DONE persisted version=%llu", ((!) m).version);
-            return true;
-        }
-        warning("X3DHPQ-PAIR: append_device_add_to_manifest publish FAILED");
-        return false;
+        // Persist LOCALLY first, then publish best-effort. The PEP publish IQ almost
+        // certainly succeeds server-side (the server stores the item); it is only the
+        // RESPONSE that is sometimes lost under load, which would hang an awaited publish
+        // and — with the old publish-gated persist — drop our own v+1 on the floor. So
+        // apply locally now (our fold is immediately correct: the newcomer is trusted and
+        // future revokes have a real manifest), and fire-and-forget the publish so PQ can
+        // fetch it via +notify.
+        bool applied = verify_and_apply_manifest(account.bare_jid, ((!) m).marshal());
+        warning("X3DHPQ-PAIR: append_device_add_to_manifest applied=%s version=%llu entries=%d",
+                applied.to_string(), ((!) m).version, ((!) m).entries.size);
+        publish_trust_manifest_blob.begin(stream, (!) m);
+        return applied;
     }
 
     // §D4: revoke a device by appending a DIK-signed REMOVE entry (removal-wins in
@@ -1491,11 +1495,10 @@ public class StreamModule : XmppStreamModule {
             return false;
         }
 
-        if (yield publish_trust_manifest_blob(stream, (!) m)) {
-            verify_and_apply_manifest(account.bare_jid, ((!) m).marshal());
-            return true;
-        }
-        return false;
+        // Persist locally first, publish best-effort (see append_device_add_to_manifest).
+        bool applied = verify_and_apply_manifest(account.bare_jid, ((!) m).marshal());
+        publish_trust_manifest_blob.begin(stream, (!) m);
+        return applied;
     }
 
     // §D3: a freshly paired newcomer fetches + verifies + folds the account's own
