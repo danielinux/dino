@@ -44,8 +44,6 @@ public class StreamModule : XmppStreamModule {
     private HashMap<string, uint> pair_step_counters = new HashMap<string, uint>();
     // active pairing sessions registered by the UI dialogs
     private HashMap<string, PairSessionRecord> pair_sessions = new HashMap<string, PairSessionRecord>();
-    // per-account audit chain verifier (lazily initialised on first audit event)
-    private Protocol.AccountAuditChain? audit_chain = null;
 
     // XmppStream reference stored at attach() for message-received connection
     private XmppStream? attached_stream = null;
@@ -55,7 +53,6 @@ public class StreamModule : XmppStreamModule {
 
     public signal void device_list_loaded(Jid jid, ArrayList<int> devices);
     public signal void bundle_fetched(Jid jid, int device_id, StanzaNode bundle);
-    public signal void audit_entry_received(Jid from, string? id, string b64_payload);
     public signal void membership_entry_received(Jid room_jid, string? id, string b64_payload);
 
     // Emitted when a <pair> message arrives from a peer.
@@ -86,8 +83,6 @@ public class StreamModule : XmppStreamModule {
     // without needing the human to already know a device is waiting.
     public signal void enrollment_request_received(Jid new_full_jid, uint device_id, uint8[] sid,
         uint8[] dik_ed25519, uint8[] dik_x25519, uint8[] dik_mldsa);
-    // Emitted for each verified account audit entry (action code + human detail).
-    public signal void account_audit_event(int action, string detail);
 
     public StreamModule(Account account, Database db) {
         this.account = account;
@@ -113,9 +108,6 @@ public class StreamModule : XmppStreamModule {
                 return;
             }
             parse_bundle(stream, jid, int.parse(id), node);
-        }, null, null);
-        pubsub.add_filtered_notification(stream, Protocol.NS_AUDIT, (stream, jid, id, node) => {
-            handle_audit_event(stream, jid, id, node);
         }, null, null);
         pubsub.add_filtered_notification(stream, Protocol.NS_GROUP, (stream, jid, id, node) => {
             handle_group_event(stream, jid, id, node);
@@ -158,7 +150,6 @@ public class StreamModule : XmppStreamModule {
         Pubsub.Module pubsub = stream.get_module(Pubsub.Module.IDENTITY);
         pubsub.remove_filtered_notification(stream, Protocol.NS_DEVICELIST);
         pubsub.remove_filtered_notification(stream, Protocol.NS_BUNDLE);
-        pubsub.remove_filtered_notification(stream, Protocol.NS_AUDIT);
         pubsub.remove_filtered_notification(stream, Protocol.NS_GROUP);
         pubsub.remove_filtered_notification(stream, Protocol.NS_PAIR);
         pubsub.remove_filtered_notification(stream, Protocol.NS_DEVTRACKER);
@@ -2065,36 +2056,6 @@ public class StreamModule : XmppStreamModule {
         }
     }
 
-    // §10.6.3: the set of device ids covered by a chain-verified AddDevice entry
-    // (minus any later chain-verified RemoveDevice) in OUR OWN account audit
-    // chain. Presence in db.list_account_audit_entries is itself proof of prior
-    // verification — store_account_audit_entry (database.vala) is only ever
-    // called after Protocol.AccountAuditChain.verify_and_apply succeeds
-    // (handle_audit_event, above), so this fails closed: an empty/unfetched
-    // chain confirms nothing.
-    private Gee.Set<int> audit_chain_confirmed_device_ids() {
-        var ids = new Gee.HashSet<int>();
-        foreach (Protocol.AuditEntry entry in db.list_account_audit_entries(account)) {
-            if (entry.action == (uint8) Protocol.AccountAuditAction.ADD_DEVICE) {
-                int? did = parse_device_id_from_audit_payload(entry.payload);
-                if (did != null) ids.add((!) did);
-            } else if (entry.action == (uint8) Protocol.AccountAuditAction.REMOVE_DEVICE) {
-                int? did = parse_device_id_from_audit_payload(entry.payload);
-                if (did != null) ids.remove((!) did);
-            }
-        }
-        return ids;
-    }
-
-    // AddDevice/RemoveDevice payload (§11.4): uint32(device_id) [| uint32(cert_len) | cert],
-    // big-endian. RemoveDevice payload is exactly the 4-byte device_id.
-    private int? parse_device_id_from_audit_payload(uint8[] payload) {
-        if (payload.length < 4) return null;
-        uint32 did = ((uint32) payload[0] << 24) | ((uint32) payload[1] << 16)
-                   | ((uint32) payload[2] << 8) | (uint32) payload[3];
-        return (int) did;
-    }
-
     // Apply the §8.5 verification/version gate for an inbound peer devicelist.
     // Returns true to ACCEPT (caller stores devices + version + content); false
     // to REJECT (caller keeps the last good state). On accept, out_version /
@@ -2215,167 +2176,6 @@ public class StreamModule : XmppStreamModule {
         Row? identity = db.get_local_identity(account.id);
         assert(identity != null);
         return ((!) identity)[column];
-    }
-
-    private void handle_audit_event(XmppStream stream, Jid from, string? id, StanzaNode? item_node) {
-        // X3DHPQ XEP §11. Server is transport-only; client verifies the chain.
-        // Surface the opaque payload so higher layers can store and inspect it,
-        // and also route through AccountAuditChain for verification.
-        string? payload = item_node != null ? item_node.get_string_content() : null;
-        if (payload == null) {
-            return;
-        }
-        audit_entry_received(from, id, payload);
-
-        // Route through AccountAuditChain if we have local AIK material.
-        // The chain is lazily created the first time an audit event arrives.
-        uint8[] raw = Base64.decode(payload);
-        Protocol.AuditEntry? entry = Protocol.AuditEntry.unmarshal(raw);
-        if (entry == null) {
-            warning("handle_audit_event: failed to unmarshal AuditEntry from %s", from.to_string());
-            return;
-        }
-        Row? identity_row = db.get_local_identity(account.id);
-        if (identity_row == null) {
-            return;
-        }
-        string? aik_ed_b64   = identity_row[db.account_identity.aik_pub_ed25519_base64];
-        string? aik_ml_b64   = identity_row[db.account_identity.aik_pub_mldsa_base64];
-        if (aik_ed_b64 == null || aik_ml_b64 == null) {
-            return;
-        }
-        Bytes aik_ed  = bytes_from_base64(aik_ed_b64);
-        Bytes aik_ml  = bytes_from_base64(aik_ml_b64);
-
-        if (audit_chain == null) {
-            audit_chain = new Protocol.AccountAuditChain(db);
-            audit_chain.audit_entry_observed.connect((action, detail) => {
-                account_audit_event(action, detail);
-            });
-            // Live PEP +notify only carries the single newest audit item, so seed the
-            // verifier from the persisted tail — otherwise a legitimate seq=N entry is
-            // rejected against a fresh next_seq=0 ("seq mismatch: expected 0 got N").
-            audit_chain.seed_from_persisted(db.list_account_audit_entries(account));
-        }
-
-        // Already applied (e.g. our own PEP self-echo of an entry we just published,
-        // or a duplicate notification): nothing to do.
-        if (entry.seq < audit_chain.expected_next_seq()) {
-            return;
-        }
-
-        // Gap: we missed one or more intermediate entries (this device was offline
-        // across several audit events, which live +notify never backfills). Fetch the
-        // full audit-node history and re-verify from genesis instead of rejecting the
-        // newest item as out-of-order.
-        if (entry.seq > audit_chain.expected_next_seq()) {
-            fetch_audit_history.begin(stream);
-            return;
-        }
-
-        var entries = new Gee.ArrayList<Protocol.AuditEntry>();
-        entries.add(entry);
-        try {
-            audit_chain.verify_and_apply(account.id, aik_ed, aik_ml, entries);
-            // Persist verified entries for OUR OWN account so the local audit-chain
-            // tail (seq + prev_hash) is known when we later append a
-            // locally-originated entry such as RemoveDevice (§8.6/§11.4).
-            if (from.bare_jid.equals(account.bare_jid)) {
-                db.store_account_audit_entry(account, entry);
-            }
-        } catch (Protocol.AccountAuditError e) {
-            warning("handle_audit_event: chain verification failed: %s", e.message);
-        }
-    }
-
-    // Fetch the FULL account audit-node history (all persisted items) and re-verify
-    // the chain from genesis. Live PEP +notify only ever carries the single newest
-    // item, so a device that was offline across several audit events cannot catch up
-    // from notifications alone. Called on a detected seq gap in handle_audit_event.
-    private bool audit_history_fetch_in_flight = false;
-    public async void fetch_audit_history(XmppStream stream) {
-        if (audit_history_fetch_in_flight) {
-            return;   // coalesce concurrent gap triggers
-        }
-        audit_history_fetch_in_flight = true;
-        try {
-            StanzaNode pubsub_node = new StanzaNode.build("pubsub", Pubsub.NS_URI).add_self_xmlns()
-                .put_node(new StanzaNode.build("items", Pubsub.NS_URI)
-                    .put_attribute("node", Protocol.NS_AUDIT));
-            Iq.Stanza iq = new Iq.Stanza.get(pubsub_node);
-            iq.to = account.bare_jid;
-            Iq.Stanza result = yield stream.get_module(Iq.Module.IDENTITY).send_iq_async(stream, iq);
-            if (result.is_error()) {
-                warning("fetch_audit_history: request failed");
-                return;
-            }
-            StanzaNode? items_node = result.stanza.get_deep_subnode(
-                Pubsub.NS_URI + ":pubsub", Pubsub.NS_URI + ":items");
-            if (items_node == null) {
-                return;
-            }
-
-            var fetched = new Gee.ArrayList<Protocol.AuditEntry>();
-            foreach (StanzaNode item in items_node.get_subnodes("item", Pubsub.NS_URI)) {
-                StanzaNode? entry_node = item.get_subnode("audit-entry", Protocol.NS_AUDIT);
-                string? b64 = entry_node != null ? entry_node.get_string_content() : null;
-                if (b64 == null) continue;
-                Protocol.AuditEntry? e = Protocol.AuditEntry.unmarshal(Base64.decode(b64));
-                if (e != null) fetched.add(e);
-            }
-            if (fetched.size == 0) {
-                return;
-            }
-            // Items may arrive in any order; verify_and_apply requires oldest→newest.
-            fetched.sort((a, b) => {
-                if (a.seq < b.seq) return -1;
-                if (a.seq > b.seq) return 1;
-                return 0;
-            });
-
-            Row? identity_row = db.get_local_identity(account.id);
-            if (identity_row == null) return;
-            string? aik_ed_b64 = identity_row[db.account_identity.aik_pub_ed25519_base64];
-            string? aik_ml_b64 = identity_row[db.account_identity.aik_pub_mldsa_base64];
-            if (aik_ed_b64 == null || aik_ml_b64 == null) return;
-            Bytes aik_ed = bytes_from_base64(aik_ed_b64);
-            Bytes aik_ml = bytes_from_base64(aik_ml_b64);
-
-            // Verify the whole chain on a FRESH chain with no observer connected, so
-            // catching up doesn't replay a "device added" notification for every
-            // historical entry. verify_and_apply advances state for each valid entry
-            // BEFORE throwing on a bad one, so on failure we adopt whatever
-            // genesis-rooted PREFIX did verify and ignore the stale/forked tail
-            // (e.g. items left on the node signed by a pre-reset AIK). If not even
-            // the genesis verifies, adopt nothing.
-            var rebuilt = new Protocol.AccountAuditChain(db);
-            try {
-                rebuilt.verify_and_apply(account.id, aik_ed, aik_ml, fetched);
-            } catch (Protocol.AccountAuditError e) {
-                if (rebuilt.expected_next_seq() == 0) {
-                    warning("fetch_audit_history: no valid genesis prefix (%s); ignoring node state", e.message);
-                    return;
-                }
-                warning("fetch_audit_history: adopting valid %llu-entry prefix, ignoring stale tail: %s",
-                    rebuilt.expected_next_seq(), e.message);
-            }
-            rebuilt.audit_entry_observed.connect((action, detail) => {
-                account_audit_event(action, detail);
-            });
-            audit_chain = rebuilt;
-            // Persist only the entries that actually verified into the adopted prefix
-            // (seq 0 .. next_seq-1); a stale tail beyond it must not be stored.
-            uint64 applied = rebuilt.expected_next_seq();
-            foreach (Protocol.AuditEntry e in fetched) {
-                if (e.seq < applied) {
-                    db.store_account_audit_entry(account, e);
-                }
-            }
-        } catch (Error e) {
-            warning("fetch_audit_history: %s", e.message);
-        } finally {
-            audit_history_fetch_in_flight = false;
-        }
     }
 
     private void handle_group_event(XmppStream stream, Jid room_jid, string? id, StanzaNode? item_node) {
@@ -2646,155 +2446,6 @@ public class StreamModule : XmppStreamModule {
         }
     }
 
-    // §10.6.3: builds, persists and publishes a hybrid-signed AddDevice audit
-    // entry (§11.4) for a device that was just confirmed via CPace pairing.
-    // Called by the existing/primary side (encryption_preferences_entry.vala's
-    // pairing_completed handler for PairNewDeviceDialog) right after issuing the
-    // device its DC. This is what lets audit_chain_confirmed_device_ids (above)
-    // trust the sibling on every device — including this one — that later
-    // observes the account's own devicelist.
-    public async bool publish_add_device_audit_entry(XmppStream stream, Protocol.DeviceCertificate issued_cert) {
-        Row? identity = db.get_local_identity(account.id);
-        if (identity == null) {
-            warning("publish_add_device_audit_entry: no local AIK — cannot sign");
-            return false;
-        }
-        string? aik_priv_ed_b64 = ((!) identity)[db.account_identity.aik_priv_ed25519_base64];
-        string? aik_priv_ml_b64 = ((!) identity)[db.account_identity.aik_priv_mldsa_base64];
-        if (aik_priv_ed_b64 == null || aik_priv_ed_b64 == "" || aik_priv_ml_b64 == null || aik_priv_ml_b64 == "") {
-            warning("publish_add_device_audit_entry: no local AIK private key material — " +
-                "cannot sign (this device is not primary/shared-primary)");
-            return false;
-        }
-
-        var chain = db.list_account_audit_entries(account);
-        uint64 seq = 0;
-        uint8[] prev_hash = new uint8[32];
-        if (chain.size > 0) {
-            Protocol.AuditEntry last = chain[chain.size - 1];
-            seq = last.seq + 1;
-            prev_hash = last.compute_hash();
-        }
-
-        uint8[] cert_bytes = issued_cert.marshal();
-        uint8[] payload = new uint8[4 + 4 + cert_bytes.length];
-        uint32 device_id = issued_cert.device_id;
-        payload[0] = (uint8)(device_id >> 24);
-        payload[1] = (uint8)(device_id >> 16);
-        payload[2] = (uint8)(device_id >> 8);
-        payload[3] = (uint8) device_id;
-        uint32 cert_len = (uint32) cert_bytes.length;
-        payload[4] = (uint8)(cert_len >> 24);
-        payload[5] = (uint8)(cert_len >> 16);
-        payload[6] = (uint8)(cert_len >> 8);
-        payload[7] = (uint8) cert_len;
-        Memory.copy((uint8*) payload + 8, cert_bytes, cert_bytes.length);
-
-        Protocol.AuditEntry entry = new Protocol.AuditEntry();
-        entry.seq = seq;
-        entry.prev_hash = prev_hash;
-        entry.action = (uint8) Protocol.AccountAuditAction.ADD_DEVICE;
-        entry.payload = payload;
-        entry.timestamp = (int64) new DateTime.now_utc().to_unix();
-
-        try {
-            Bytes aik_priv_ed = bytes_from_base64((!) aik_priv_ed_b64);
-            Bytes aik_priv_ml = bytes_from_base64((!) aik_priv_ml_b64);
-            uint8[] sp = entry.signed_part();
-            entry.signature = bytes_to_uint8_array(global::X3dhpq.Crypto.ed25519_sign(aik_priv_ed, new Bytes(sp)));
-            entry.mldsa_signature = bytes_to_uint8_array(global::X3dhpq.Crypto.mldsa65_sign(aik_priv_ml, new Bytes(sp)));
-        } catch (GLib.Error e) {
-            warning("publish_add_device_audit_entry: signing failed: %s", e.message);
-            return false;
-        }
-
-        db.store_account_audit_entry(account, entry);
-        bool ok = yield publish_audit_entry(stream, seq.to_string(), Base64.encode(entry.marshal()));
-        if (!ok) {
-            warning("publish_add_device_audit_entry: publish failed for device %u", device_id);
-        }
-        return ok;
-    }
-
-    // §12.1/§11.4 account reset: append + publish a RotateAIK audit entry
-    // (action=3, payload = uint16(new_aik_len)|AccountIdentityPub.marshal() —
-    // unchanged wire format, reusing Protocol.DeviceAuditEntryV2's §11.4 codec
-    // verbatim) to the OLD account's audit:0 chain, signed by the OLD AIK.
-    // Called by encryption_preferences_entry.vala's account-reset flow BEFORE
-    // the new identity has published anything, so any peer still watching the
-    // old chain can chain-detect the reconstruction (§12.3) — though this is
-    // NOT sufficient evidence of authenticity on its own; the receiving peer
-    // still MUST re-verify out-of-band (§12.3 RotationTrustStrict). Only ever
-    // called when the OLD AIK_priv is still held locally; the caller skips
-    // this entirely otherwise (§12: "where the old AIK_priv is still held").
-    // Best-effort: a failure here is logged and returned, never thrown —
-    // the caller must not let this block the reset itself.
-    public async bool publish_rotate_aik_audit_entry(XmppStream stream, Bytes old_aik_priv_ed, Bytes old_aik_priv_mldsa, uint8[] new_aik_marshalled) {
-        var entries = db.list_account_audit_entries(account);
-        uint64 next_seq = 0;
-        uint8[] prev_hash = new uint8[32];
-        if (entries.size > 0) {
-            Protocol.AuditEntry last = entries[entries.size - 1];
-            next_seq = last.seq + 1;
-            prev_hash = last.compute_hash();
-        }
-
-        Protocol.AuditEntry entry = new Protocol.AuditEntry();
-        entry.seq = next_seq;
-        entry.prev_hash = prev_hash;
-        entry.action = (uint8) Protocol.AccountAuditAction.ROTATE_AIK;
-        entry.payload = Protocol.DeviceAuditEntryV2.build_rotate_aik_payload(new_aik_marshalled);
-        entry.timestamp = (int64) new DateTime.now_utc().to_unix();
-        try {
-            uint8[] sp = entry.signed_part();
-            entry.signature = bytes_to_uint8_array(global::X3dhpq.Crypto.ed25519_sign(old_aik_priv_ed, new Bytes(sp)));
-            entry.mldsa_signature = bytes_to_uint8_array(global::X3dhpq.Crypto.mldsa65_sign(old_aik_priv_mldsa, new Bytes(sp)));
-        } catch (GLib.Error e) {
-            warning("publish_rotate_aik_audit_entry: signing failed: %s", e.message);
-            return false;
-        }
-
-        db.store_account_audit_entry(account, entry);
-        bool ok = yield publish_audit_entry(stream, next_seq.to_string(), Base64.encode(entry.marshal()));
-        if (!ok) {
-            warning("publish_rotate_aik_audit_entry: publish failed");
-        }
-        return ok;
-    }
-
-    // §11 self-genesis: the account's PRIMARY records ITSELF as ADD_DEVICE(self)@0.
-    // Without this the primary/genesis device is never the subject of any AddDevice
-    // entry (AddDevice is only ever published BY the primary FOR new devices), so a
-    // newly-paired sibling never audit-trusts the primary as a co-account device →
-    // omits it from the encrypt fan-out and clobbers it out of the republished
-    // devicelist. Recording the primary in the chain makes every device trust it,
-    // fixing multi-device sync symmetrically.
-    public async void ensure_account_audit_genesis(XmppStream stream) {
-        Row? identity = db.get_local_identity(account.id);
-        if (identity == null) return;
-        bool is_primary = ((!) identity)[db.account_identity.is_primary];
-        string? aik_ed = ((!) identity)[db.account_identity.aik_priv_ed25519_base64];
-        // Only a PRIMARY that actually holds AIK_priv can (and should) self-add.
-        if (!is_primary || aik_ed == null || aik_ed == "") return;
-        // Reflect the server's authoritative chain FIRST: a share_primary secondary
-        // also carries is_primary, so we must not mistake an as-yet-unfetched empty
-        // local chain for a genuine genesis and self-add a conflicting seq-0 entry.
-        yield fetch_audit_history(stream);
-        if (db.list_account_audit_entries(account).size > 0) {
-            return;   // chain already established (our genesis, or devices added)
-        }
-        string dc_b64;
-        try {
-            dc_b64 = db.ensure_local_device_certificate(account);
-        } catch (GLib.Error e) {
-            warning("ensure_account_audit_genesis: cannot obtain own DC: %s", e.message);
-            return;
-        }
-        Protocol.DeviceCertificate? own_dc = Protocol.DeviceCertificate.unmarshal(new Bytes(Base64.decode(dc_b64)));
-        if (own_dc == null) return;
-        yield publish_add_device_audit_entry(stream, own_dc);
-    }
-
     // Purge ALL items from one of our OWN PEP nodes (pubsub#owner <purge>). Used by
     // account reset so stale items signed by the now-revoked AIK don't linger on the
     // server and fail verification under the new one (the earlier item-overwrite
@@ -2810,17 +2461,6 @@ public class StreamModule : XmppStreamModule {
         } catch (Error e) {
             warning("purge_own_node(%s): %s", node, e.message);
         }
-    }
-
-    // Publish an opaque, client-signed audit entry to the per-account audit:0
-    // PEP node. The server stores and notifies subscribed contacts; verification
-    // is the recipient's responsibility per X3DHPQ XEP §11.5.
-    public async bool publish_audit_entry(XmppStream stream, string item_id, string base64_payload) {
-        StanzaNode entry = new StanzaNode.build("audit-entry", Protocol.NS_AUDIT)
-            .add_self_xmlns()
-            .put_node(new StanzaNode.text(base64_payload));
-        return yield stream.get_module(Pubsub.Module.IDENTITY).publish(
-            stream, null, Protocol.NS_AUDIT, item_id, entry, PUBLISH_OPTIONS);
     }
 
     // Distribute an opaque, owner/admin-signed membership entry to a room by

@@ -329,10 +329,6 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
         // to resolve against entries signed by the now-revoked old one.
         plugin.db.prune_remote_devices_not_in(account, account.bare_jid.to_string(), new Gee.HashSet<int>());
         plugin.db.clear_device_audit_entries(account);
-        // Also wipe the v1 account-audit chain: its entries are signed by the OLD AIK
-        // and would otherwise (a) fail verification under the new AIK and (b) leave the
-        // chain non-empty so the fresh primary skips its self-genesis AddDevice (§11).
-        plugin.db.clear_account_audit_entries(account);
         // §8.6 exception "back to genesis": drop the OWN devicelist snapshot so the
         // shrink guard treats the fresh single-device list as a first publish rather
         // than an (illegal) unrevoked shrink of the OLD identity's list.
@@ -361,15 +357,9 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
             return;
         }
 
-        // NOTE: we deliberately do NOT publish a best-effort RotateAIK entry to the
-        // account-audit chain on reset. Because the reset clears the local chain first
-        // (so the fresh primary can re-record its self-genesis AddDevice(self)@0), a
-        // RotateAIK published here would compute seq=0 and land — signed by the OLD,
-        // now-revoked AIK — as item "0" on the audit node, becoming a bogus genesis
-        // that fails signature verification under the new AIK on EVERY device
-        // (fail-closed: no sibling ever trusted). Peers still chain-detect the
-        // reconstruction from the AIK change on the devicelist itself (§8.5/§10.6.5).
-        // (old_aik_priv_ed/_mldsa remain captured above for a future, seq-safe signal.)
+        // Peers chain-detect the account reconstruction from the AIK change on the
+        // devicelist / Trust Manifest genesis itself (§8.5/§10.6.5/§12.3); there is
+        // no separate account-audit signal to emit on reset.
 
         // Publishes the fresh, self-signed devicelist under the new AIK —
         // containing ONLY this device, every prior device having just been
@@ -383,10 +373,10 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
         // new AIK, and finally refresh the UI. Chained so each step observes the prior.
         // §1338 node purge: overwrite/retract every stale PEP node signed by the
         // now-dead AIK so nothing lingers to be re-verified under the new one —
-        // devtracker:0, devicelist:0, audit:0, trustmanifest:0 and pair:0 (and the
-        // bundle, republished by publish_current_state). Then root the FRESH,
-        // self-only Trust Manifest genesis (version=1) under the new AIK, republish
-        // the derived devicelist cache + bundle, and refresh the UI. Chained so each
+        // devtracker:0, devicelist:0, trustmanifest:0 and pair:0 (and the bundle,
+        // republished by publish_current_state). Then root the FRESH, self-only
+        // Trust Manifest genesis (version=1) under the new AIK, republish the
+        // derived devicelist cache + bundle, and refresh the UI. Chained so each
         // step observes the prior.
         StreamModule m = (!) module;
         XmppStream s = (!) stream;
@@ -394,33 +384,27 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
             m.purge_own_node.end(r0);
             m.purge_own_node.begin(s, Protocol.NS_DEVICELIST, (o1, r1) => {
                 m.purge_own_node.end(r1);
-                m.purge_own_node.begin(s, Protocol.NS_AUDIT, (o2, r2) => {
-                    m.purge_own_node.end(r2);
-                    m.purge_own_node.begin(s, Protocol.NS_TRUSTMANIFEST, (ot, rt) => {
-                        m.purge_own_node.end(rt);
-                        // Also purge the pairing rendezvous node: stale <pair-hello>/
-                        // <enroll-request> items there (from prior devices/attempts,
-                        // possibly signed by the now-revoked AIK) otherwise linger and
-                        // mislead the next pairing's rendezvous.
-                        m.purge_own_node.begin(s, Protocol.NS_PAIR, (op, rp) => {
-                            m.purge_own_node.end(rp);
-                            // Root the fresh self-only manifest genesis (version=1)
-                            // under the new AIK BEFORE publish_current_state, so
-                            // ensure_trust_manifest (inside it) sees a current manifest
-                            // and stays a no-op instead of computing a different version.
-                            m.publish_reset_genesis_manifest.begin(s, (og, rg) => {
-                                m.publish_reset_genesis_manifest.end(rg);
-                                m.publish_current_state.begin(s, (o3, r3) => {
-                                    m.publish_current_state.end(r3);
-                                    m.ensure_account_audit_genesis.begin(s, (o4, r4) => {
-                                        m.ensure_account_audit_genesis.end(r4);
-                                        // Fresh genesis + self device published;
-                                        // refresh the devices list (main-loop hop).
-                                        if (devices_widget != null) {
-                                            Idle.add(() => { ((!) devices_widget).refresh(); return false; });
-                                        }
-                                    });
-                                });
+                m.purge_own_node.begin(s, Protocol.NS_TRUSTMANIFEST, (ot, rt) => {
+                    m.purge_own_node.end(rt);
+                    // Also purge the pairing rendezvous node: stale <pair-hello>/
+                    // <enroll-request> items there (from prior devices/attempts,
+                    // possibly signed by the now-revoked AIK) otherwise linger and
+                    // mislead the next pairing's rendezvous.
+                    m.purge_own_node.begin(s, Protocol.NS_PAIR, (op, rp) => {
+                        m.purge_own_node.end(rp);
+                        // Root the fresh self-only manifest genesis (version=1)
+                        // under the new AIK BEFORE publish_current_state, so
+                        // ensure_trust_manifest (inside it) sees a current manifest
+                        // and stays a no-op instead of computing a different version.
+                        m.publish_reset_genesis_manifest.begin(s, (og, rg) => {
+                            m.publish_reset_genesis_manifest.end(rg);
+                            m.publish_current_state.begin(s, (o3, r3) => {
+                                m.publish_current_state.end(r3);
+                                // Fresh genesis + self device published;
+                                // refresh the devices list (main-loop hop).
+                                if (devices_widget != null) {
+                                    Idle.add(() => { ((!) devices_widget).refresh(); return false; });
+                                }
                             });
                         });
                     });

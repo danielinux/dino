@@ -705,15 +705,10 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     private void on_stream_negotiated(Account account, XmppStream stream) {
         StreamModule? module = app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
         if (module != null) {
-            // Ensure our own audit genesis (primary self-ADD) exists BEFORE processing
-            // the own devicelist, so the audit-chain trust gate can confirm every
-            // audited sibling — including the primary — rather than dropping it to
-            // active=false. ensure_account_audit_genesis fetches the authoritative
-            // chain first, so this is safe on secondaries too.
-            module.ensure_account_audit_genesis.begin(stream, (obj, res) => {
-                ((!) module).ensure_account_audit_genesis.end(res);
-                ((!) module).request_device_list.begin(stream, account.bare_jid);
-            });
+            // Fetch our own devicelist on connect. Device trust is derived entirely
+            // from the Trust Manifest fold (trustmanifest:0) plus the devtracker
+            // snapshot — the retired account-audit chain no longer gates it.
+            module.request_device_list.begin(stream, account.bare_jid);
         }
     }
 
@@ -2081,12 +2076,12 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         return st.admins.contains(Protocol.hex_of(fp));
     }
 
-    // Revoke one of the account's own devices (§8.6). Publishes a RemoveDevice
-    // audit entry (action=2, payload uint32_BE(device_id); §11.4) to the account
-    // audit node, tears down local session/bundle/prekey state for that device,
-    // drops it from the account's own persisted device set, and republishes our
-    // signed devicelist with the shrink explicitly permitted so the new,
-    // versioned list omits the revoked id.
+    // Revoke one of the account's own devices (§8.6). Appends a DIK-signed REMOVE
+    // entry to the account's trust manifest (the live trust source), tears down
+    // local session/bundle/prekey state for that device, drops it from the
+    // account's own persisted device set, and republishes our signed devicelist
+    // with the shrink explicitly permitted so the new, versioned list omits the
+    // revoked id.
     //
     // The publish is now union-based (StreamModule.publish_device_list lists
     // every device under the account's AIK), so omitting the revoked id is a
@@ -2128,13 +2123,10 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             return false;
         }
 
-        // Trust Manifest Phase 2 (§D4): revocation is now a DIK-signed REMOVE entry
-        // appended to the account's trust manifest — the LIVE trust source — rather
-        // than a RemoveDevice audit entry (which no longer feeds the fold, so a
-        // device removed only via audit would stay in the fold and keep receiving
-        // messages). fold()'s removal-wins semantics drop the target; the derived
-        // devicelist cache is republished below. The old audit REMOVE path is
-        // retired from the trust decision (Phase 3 removes the code wholesale).
+        // Trust Manifest Phase 2 (§D4): revocation is a DIK-signed REMOVE entry
+        // appended to the account's trust manifest — the LIVE and only trust source.
+        // fold()'s removal-wins semantics drop the target; the derived devicelist
+        // cache is republished below.
         if (!yield module.append_device_remove_to_manifest(stream, device_id)) {
             warning("x3dhpq remove_own_device: manifest REMOVE publish failed for device %u", device_id);
             return false;

@@ -28,7 +28,6 @@ sources = files(
     'src/protocol/groupmsg.vala',
     'src/protocol/groupsession.vala',
     'src/protocol/groupshare.vala',
-    'src/protocol/account_audit.vala',
     'src/protocol/devicelist.vala',
     'src/protocol/devicelist_guard.vala',
     'src/protocol/membership_journal.vala',
@@ -91,7 +90,6 @@ test_sources = [
     'tests/devicelist_guard.vala',
     'tests/pairing_msg.vala',
     'tests/cpace.vala',
-    'tests/account_audit.vala',
     'tests/pairing.vala',
 ]
 

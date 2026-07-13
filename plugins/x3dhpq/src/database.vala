@@ -2162,20 +2162,9 @@ public class Database : Qlite.Database {
     // pinned AIK's fingerprint, so leftover OLD-AIK entries could never fold
     // again anyway — this just clears the dead weight). Mirrors
     // prune_remote_devices_not_in's "wipe everything from the old identity"
-    // role, but for the v2 DAG cache. Deliberately does NOT touch the v1
-    // account_audit chain (audit_entry table): that chain intentionally
-    // continues unbroken so a RotateAIK entry can still be appended and
-    // hash-linked to it (§12.1 step 3).
+    // role, but for the v2 DAG cache.
     public void clear_device_audit_entries(Account account) {
         device_audit.delete().with(device_audit.account_id, "=", account.id).perform();
-    }
-
-    // Wipe the v1 linear account-audit chain (AddDevice/RemoveDevice/RotateAIK). Used
-    // by account reset so the new AIK starts from an empty chain and the fresh primary
-    // re-records its self-genesis AddDevice(self)@0 (§11) instead of the stale chain
-    // (signed by the now-revoked old AIK) blocking it.
-    public void clear_account_audit_entries(Account account) {
-        audit_entry.delete().with(audit_entry.account_id, "=", account.id).perform();
     }
 
     // §8.6 revocation tombstone: record a device as explicitly revoked so no
@@ -2308,35 +2297,6 @@ public class Database : Qlite.Database {
             sb.append_printf("%02x", byte);
         }
         return sb.str;
-    }
-
-    // Account audit chain (§11) persisted rows for our own account, ordered by
-    // seq ascending. Used to derive the chain tail (seq + prev_hash) when we
-    // append a new locally-originated entry (e.g. RemoveDevice, §8.6).
-    public Gee.List<Protocol.AuditEntry> list_account_audit_entries(Account account) {
-        var parsed = new Gee.ArrayList<Protocol.AuditEntry>();
-        var rows = audit_entry.select()
-            .with(audit_entry.account_id, "=", account.id)
-            .with(audit_entry.bare_jid, "=", account.bare_jid.to_string());
-        foreach (Row r in rows) {
-            string? b64 = r[audit_entry.entry_base64];
-            if (b64 == null) continue;
-            Protocol.AuditEntry? e = Protocol.AuditEntry.unmarshal(Base64.decode((!) b64));
-            if (e != null) parsed.add(e);
-        }
-        parsed.sort((a, b) => (a.seq < b.seq) ? -1 : (a.seq > b.seq ? 1 : 0));
-        return parsed;
-    }
-
-    public void store_account_audit_entry(Account account, Protocol.AuditEntry entry) {
-        audit_entry.upsert()
-            .value(audit_entry.account_id, account.id, true)
-            .value(audit_entry.bare_jid, account.bare_jid.to_string(), true)
-            .value(audit_entry.item_id, entry.seq.to_string(), true)
-            .value(audit_entry.entry_base64, Base64.encode(entry.marshal()))
-            .value(audit_entry.previous_hash_hex, bytes_to_hex_string(entry.prev_hash))
-            .value(audit_entry.created_at, (long) new DateTime.now_utc().to_unix())
-            .perform();
     }
 
     // Emitted when a peer's observed AIK changes from a previously-stored one

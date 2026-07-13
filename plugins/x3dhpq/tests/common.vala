@@ -14,7 +14,6 @@ int main(string[] args) {
     TestSuite.get_root().add_suite(new PairingCodeTest().get_suite());
     TestSuite.get_root().add_suite(new DeviceListGuardTest().get_suite());
     TestSuite.get_root().add_suite(new CPaceTest().get_suite());
-    TestSuite.get_root().add_suite(new AccountAuditTest().get_suite());
     TestSuite.get_root().add_suite(new PairingTest().get_suite());
     return GLib.Test.run();
 }
