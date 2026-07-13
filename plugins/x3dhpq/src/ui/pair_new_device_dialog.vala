@@ -328,7 +328,7 @@ public class PairNewDeviceDialog : Gtk.Window {
         // replaces the old server-pushed <verify-device> headline: we learn the
         // new device's full JID and the shared sid, then send PAKE1.
         pair_hello_handler_id = stream_module.pair_hello_received.connect((new_full_jid, device_id, hello_sid) => {
-            on_pair_hello_received(new_full_jid, hello_sid);
+            on_pair_hello_received(new_full_jid, device_id, hello_sid);
         });
 
         // pair_message_received: carries subsequent FSM messages matched by sid.
@@ -346,7 +346,7 @@ public class PairNewDeviceDialog : Gtk.Window {
         return true;
     }
 
-    private void on_pair_hello_received(Jid new_full_jid, uint8[] hello_sid) {
+    private void on_pair_hello_received(Jid new_full_jid, uint device_id, uint8[] hello_sid) {
         if (confirm_mode && !code_confirmed) {
             // Not yet — the user hasn't entered/confirmed a code, so we don't
             // know which pending device (if several were mid-rendezvous) or
@@ -370,6 +370,13 @@ public class PairNewDeviceDialog : Gtk.Window {
         // the <pair> stanza matching) to line up on both sides.
         sid = hello_sid;
         peer_jid = new_full_jid;
+        // Issue the newcomer's DC under the device id IT chose (carried in its <pair-hello>),
+        // NOT a random one generated here. Otherwise the manifest entry never matches the id
+        // the new device actually reports, and re-pairing the same device mints a second
+        // entry (same key fingerprint, different id) instead of updating the existing one.
+        if (device_id != 0) {
+            opts.new_device_id = (uint32) device_id;
+        }
         try {
             existing = new Protocol.PairingExisting((!) aik, code, sid, opts);
             Protocol.PairingMsg? pake1 = ((!) existing).step(null);
