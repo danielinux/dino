@@ -1349,13 +1349,17 @@ public class StreamModule : XmppStreamModule {
         }
     }
 
-    // §D1 migration genesis. `force_version` (>0) pins the genesis version (used by
-    // account reset which roots a FRESH lineage at version=1); 0 uses the normal
-    // (last devicelist version)+1 formula. `self_only` skips re-issuing siblings
-    // (account reset drops all old siblings — SELF-ONLY genesis).
-    private async void build_and_publish_genesis_manifest(XmppStream stream,
-            uint64 force_version = 0, bool self_only = false) throws GLib.Error {
-        string own_bare = account.bare_jid.to_string();
+    // Build a COMPACT, AIK-anchored snapshot manifest asserting exactly the CURRENT `members`
+    // (device_id → DC). We do NOT track history: each published manifest is a fresh snapshot
+    // of the current membership (size bounded by the number of devices, NOT by how many
+    // pair/revoke operations have happened), chained to the previous version only by
+    // `prev_hash` — enough to prove authenticity + monotonicity, which is all we need. The
+    // genesis edge is AIK-signed and every other member is a DIK-signed ADD authored by THIS
+    // device, so the whole set is verifiably derived from the account AIK. Requires AIK_priv.
+    // `members` need not contain self (this device is always the genesis).
+    private Protocol.TrustManifest build_snapshot_manifest(
+            Gee.Map<uint32, Protocol.DeviceCertificate> members,
+            uint64 version, uint8[] prev_hash) throws GLib.Error {
         int? self_id_n = db.get_local_device_id(account);
         if (self_id_n == null) throw new IOError.FAILED("no local device id");
         uint32 self_id = (uint32) (!) self_id_n;
@@ -1369,7 +1373,6 @@ public class StreamModule : XmppStreamModule {
         Bytes dik_priv_ed = bytes_from_base64(((!) row)[db.account_identity.dik_priv_ed25519_base64]);
         Bytes dik_priv_ml = bytes_from_base64(((!) row)[db.account_identity.dik_priv_mldsa_base64]);
 
-        // Self genesis DC (AIK-signed) — this is the account's genesis certificate.
         string self_cert_b64 = db.ensure_local_device_certificate(account);
         Protocol.DeviceCertificate? self_dc = Protocol.DeviceCertificate.unmarshal(bytes_from_base64(self_cert_b64));
         if (self_dc == null) throw new IOError.FAILED("cannot decode self genesis DC");
@@ -1381,43 +1384,62 @@ public class StreamModule : XmppStreamModule {
 
         var m = new Protocol.TrustManifest();
         m.aik = aik_pub;
-        m.prev_hash = new uint8[32];
+        m.prev_hash = prev_hash;
         m.entries = new Gee.ArrayList<Protocol.TrustEntry>();
 
-        // Genesis entry (AIK-signed, the only AIK-signed edge).
+        // Genesis entry (AIK-signed): this device roots the snapshot.
         var genesis = build_signed_trust_entry(Protocol.TrustEntry.ACTION_ADD, self_id, (!) self_dc,
             0, new Gee.ArrayList<Bytes>(), self_id, self_dc_hash, aik_priv_ed, aik_priv_ml);
         m.entries.add(genesis);
 
-        // Each OTHER authorized device: RE-ISSUE its DC under the primary's DIK and
-        // append a DIK-signed ADD entry parented on the current heads. Skipped for a
-        // SELF-ONLY genesis (account reset drops all prior siblings).
+        // One DIK-signed ADD per OTHER current member (DC re-issued under this device's DIK).
+        foreach (var e in members.entries) {
+            if (e.key == self_id) continue;
+            Protocol.DeviceCertificate odc = e.value;
+            Protocol.DeviceCertificate reissued = Protocol.DeviceCertificate.issue(
+                e.key, odc.dik_pub_ed25519, odc.dik_pub_x25519, odc.dik_pub_mldsa,
+                dik_priv_ed, dik_priv_ml, odc.flags);
+            var add = build_signed_trust_entry(Protocol.TrustEntry.ACTION_ADD, e.key, reissued,
+                m.next_lamport(), m.current_heads(), self_id, self_dc_hash, dik_priv_ed, dik_priv_ml);
+            m.entries.add(add);
+        }
+
+        m.version = version;
+        m.sign_head(dik_priv_ed, dik_priv_ml);
+        return m;
+    }
+
+    // The members of the current manifest fold as a device_id → DC map (self included).
+    private Gee.HashMap<uint32, Protocol.DeviceCertificate> fold_members(Protocol.TrustManifest m) {
+        var members = new Gee.HashMap<uint32, Protocol.DeviceCertificate>();
+        var fold = m.fold();
+        foreach (var fe in fold.entries) {
+            members.set((uint32) uint64.parse(fe.key), fe.value);
+        }
+        return members;
+    }
+
+    // §D1 genesis / migration: publish a snapshot of the current authorized set (self +
+    // devicelist siblings), or self-only for a reset. `force_version` pins a reset lineage.
+    private async void build_and_publish_genesis_manifest(XmppStream stream,
+            uint64 force_version = 0, bool self_only = false) throws GLib.Error {
+        string own_bare = account.bare_jid.to_string();
+        int? self_id_n = db.get_local_device_id(account);
+        if (self_id_n == null) throw new IOError.FAILED("no local device id");
+        uint32 self_id = (uint32) (!) self_id_n;
+
+        var members = new Gee.HashMap<uint32, Protocol.DeviceCertificate>();
         if (!self_only) {
             foreach (Protocol.DeviceListDevice other in db.get_device_list_devices(account, own_bare)) {
                 if (other.device_id == self_id) continue;
                 if (other.cert_bytes.length == 0) continue;
                 Protocol.DeviceCertificate? odc = Protocol.DeviceCertificate.unmarshal(new Bytes(other.cert_bytes));
-                if (odc == null) continue;
-                Protocol.DeviceCertificate reissued = Protocol.DeviceCertificate.issue(
-                    other.device_id,
-                    ((!) odc).dik_pub_ed25519,
-                    ((!) odc).dik_pub_x25519,
-                    ((!) odc).dik_pub_mldsa,
-                    dik_priv_ed, dik_priv_ml,
-                    ((!) odc).flags);
-                var add = build_signed_trust_entry(Protocol.TrustEntry.ACTION_ADD, other.device_id, reissued,
-                    m.next_lamport(), m.current_heads(), self_id, self_dc_hash, dik_priv_ed, dik_priv_ml);
-                m.entries.add(add);
+                if (odc != null) members.set(other.device_id, (!) odc);
             }
         }
-
-        // version: forced (fresh reset lineage = 1) or (last devicelist version)+1.
-        m.version = force_version > 0 ? force_version
-                                      : (uint64) (db.get_device_list_version(account, own_bare) + 1);
-        m.sign_head(dik_priv_ed, dik_priv_ml);
-
-        // Cache locally for durability, then publish to the server (source of truth) with
-        // retry until confirmed — a lost ACK must not silently leave the server behind.
+        uint64 version = force_version > 0 ? force_version
+                                           : (uint64) (db.get_device_list_version(account, own_bare) + 1);
+        var m = build_snapshot_manifest(members, version, new uint8[32]);
         verify_and_apply_manifest(account.bare_jid, m.marshal());
         publish_manifest_with_retry.begin(stream, m);
     }
@@ -1438,75 +1460,37 @@ public class StreamModule : XmppStreamModule {
     public async bool append_device_add_to_manifest(XmppStream stream, Protocol.DeviceCertificate newcomer_dc) {
         string own_bare = account.bare_jid.to_string();
         warning("X3DHPQ-PAIR: append_device_add_to_manifest ENTRY newcomer=%u", newcomer_dc.device_id);
-
-        // Load the current manifest, preferring our LOCAL cached copy: we are the
-        // authoritative primary and just published it, and a fresh server fetch here can
-        // hang on a lost PEP IQ under the heavy <pair> traffic that just completed
-        // (observed: the append silently stalled on fetch_trust_manifest right after
-        // pairing_completed). Fall back to a server fetch / genesis build only if we hold
-        // no local manifest at all.
-        Protocol.TrustManifest? m = load_local_manifest(own_bare);
-        if (m == null) {
-            m = yield fetch_trust_manifest(stream, account.bare_jid);
+        // Snapshot model: the manifest is a COMPACT current-membership assertion rooted at
+        // the AIK, so only the primary (AIK_priv holder) rebuilds it. A non-primary edit is
+        // deferred to the primary's next publish/reconcile.
+        if (!db.has_local_aik_priv(account)) {
+            warning("append_device_add_to_manifest: no AIK_priv — primary maintains the snapshot manifest");
+            return false;
         }
+        // Current members = the fold of our latest manifest (local cache, else server, else
+        // build genesis). Adding a device = republish a fresh snapshot of members ∪ {newcomer}.
+        Protocol.TrustManifest? m = load_local_manifest(own_bare);
+        if (m == null) m = yield fetch_trust_manifest(stream, account.bare_jid);
         if (m == null) {
             yield ensure_trust_manifest(stream);
             m = load_local_manifest(own_bare);
         }
-        if (m == null) {
-            warning("append_device_add_to_manifest: no manifest available for %s", own_bare);
-            return false;
-        }
-
-        int? self_id_n = db.get_local_device_id(account);
-        if (self_id_n == null) return false;
-        uint32 self_id = (uint32) (!) self_id_n;
-
-        var fold = ((!) m).fold();
-        if (!fold.has_key(self_id.to_string())) {
-            warning("append_device_add_to_manifest: this device (%u) is not in the manifest fold — cannot author", self_id);
-            return false;
-        }
-        Protocol.DeviceCertificate self_dc = fold.get(self_id.to_string());
-        uint8[] self_dc_hash = manifest_sha256(self_dc.marshal());
-
-        Row? row = db.get_local_identity(account.id);
-        if (row == null) return false;
-        Bytes dik_priv_ed, dik_priv_ml;
+        var members = (m != null) ? fold_members((!) m)
+                                  : new Gee.HashMap<uint32, Protocol.DeviceCertificate>();
+        uint64 base_ver = (m != null) ? ((!) m).version : 0;
+        uint8[] prev_hash = (m != null) ? manifest_sha256(((!) m).marshal()) : new uint8[32];
+        members.set(newcomer_dc.device_id, newcomer_dc);
         try {
-            dik_priv_ed = bytes_from_base64(((!) row)[db.account_identity.dik_priv_ed25519_base64]);
-            dik_priv_ml = bytes_from_base64(((!) row)[db.account_identity.dik_priv_mldsa_base64]);
+            var snap = build_snapshot_manifest(members, base_ver + 1, prev_hash);
+            bool applied = verify_and_apply_manifest(account.bare_jid, snap.marshal());
+            warning("X3DHPQ-PAIR: append_device_add applied=%s version=%llu members=%d",
+                    applied.to_string(), snap.version, members.size);
+            publish_manifest_with_retry.begin(stream, snap);
+            return applied;
         } catch (GLib.Error e) {
-            warning("append_device_add_to_manifest: cannot load local DIK priv: %s", e.message);
+            warning("append_device_add_to_manifest: snapshot build failed: %s", e.message);
             return false;
         }
-
-        try {
-            uint8[] prev_hash = manifest_sha256(((!) m).marshal());   // before mutation
-            var entry = build_signed_trust_entry(Protocol.TrustEntry.ACTION_ADD, newcomer_dc.device_id,
-                newcomer_dc, ((!) m).next_lamport(), ((!) m).current_heads(),
-                self_id, self_dc_hash, dik_priv_ed, dik_priv_ml);
-            ((!) m).entries.add(entry);
-            ((!) m).version = ((!) m).version + 1;
-            ((!) m).prev_hash = prev_hash;
-            ((!) m).sign_head(dik_priv_ed, dik_priv_ml);
-        } catch (GLib.Error e) {
-            warning("append_device_add_to_manifest: sign failed: %s", e.message);
-            return false;
-        }
-
-        // Persist LOCALLY first, then publish best-effort. The PEP publish IQ almost
-        // certainly succeeds server-side (the server stores the item); it is only the
-        // RESPONSE that is sometimes lost under load, which would hang an awaited publish
-        // and — with the old publish-gated persist — drop our own v+1 on the floor. So
-        // apply locally now (our fold is immediately correct: the newcomer is trusted and
-        // future revokes have a real manifest), and fire-and-forget the publish so PQ can
-        // fetch it via +notify.
-        bool applied = verify_and_apply_manifest(account.bare_jid, ((!) m).marshal());
-        warning("X3DHPQ-PAIR: append_device_add_to_manifest applied=%s version=%llu entries=%d",
-                applied.to_string(), ((!) m).version, ((!) m).entries.size);
-        publish_manifest_with_retry.begin(stream, (!) m);
-        return applied;
     }
 
     // §D4: revoke a device by appending a DIK-signed REMOVE entry (removal-wins in
@@ -1514,65 +1498,37 @@ public class StreamModule : XmppStreamModule {
     // at the manager call site (remove_own_device). Returns true on publish+apply.
     public async bool append_device_remove_to_manifest(XmppStream stream, uint32 target_device_id) {
         string own_bare = account.bare_jid.to_string();
-
-        // Prefer the LOCAL cached manifest (authoritative primary; avoids a server fetch
-        // that can hang on a lost PEP IQ). Fall back to a server fetch only if absent.
-        Protocol.TrustManifest? m = load_local_manifest(own_bare);
-        if (m == null) {
-            m = yield fetch_trust_manifest(stream, account.bare_jid);
+        // Snapshot model (see append_device_add_to_manifest): only the primary rebuilds the
+        // AIK-rooted current-membership manifest. Revoke = republish a snapshot of members\{target}.
+        if (!db.has_local_aik_priv(account)) {
+            warning("append_device_remove_to_manifest: no AIK_priv — primary maintains the snapshot manifest");
+            return false;
         }
+        Protocol.TrustManifest? m = load_local_manifest(own_bare);
+        if (m == null) m = yield fetch_trust_manifest(stream, account.bare_jid);
         if (m == null) {
             warning("append_device_remove_to_manifest: no manifest available for %s", own_bare);
             return false;
         }
-
-        int? self_id_n = db.get_local_device_id(account);
-        if (self_id_n == null) return false;
-        uint32 self_id = (uint32) (!) self_id_n;
-
-        var fold = ((!) m).fold();
-        if (!fold.has_key(self_id.to_string())) {
-            warning("append_device_remove_to_manifest: this device (%u) is not in the manifest fold — cannot author", self_id);
-            return false;
-        }
-        if (!fold.has_key(target_device_id.to_string())) {
-            // Already absent from the fold — nothing to revoke (idempotent).
+        var members = fold_members((!) m);
+        if (!members.has_key(target_device_id)) {
+            // Already absent — nothing to revoke (idempotent).
             warning("append_device_remove_to_manifest: target %u not in fold — nothing to remove", target_device_id);
             return true;
         }
-        Protocol.DeviceCertificate self_dc = fold.get(self_id.to_string());
-        Protocol.DeviceCertificate target_dc = fold.get(target_device_id.to_string());
-        uint8[] self_dc_hash = manifest_sha256(self_dc.marshal());
-
-        Row? row = db.get_local_identity(account.id);
-        if (row == null) return false;
-        Bytes dik_priv_ed, dik_priv_ml;
+        members.unset(target_device_id);
+        uint8[] prev_hash = manifest_sha256(((!) m).marshal());
         try {
-            dik_priv_ed = bytes_from_base64(((!) row)[db.account_identity.dik_priv_ed25519_base64]);
-            dik_priv_ml = bytes_from_base64(((!) row)[db.account_identity.dik_priv_mldsa_base64]);
+            var snap = build_snapshot_manifest(members, ((!) m).version + 1, prev_hash);
+            bool applied = verify_and_apply_manifest(account.bare_jid, snap.marshal());
+            warning("x3dhpq: revoke %u — republished snapshot version=%llu members=%d",
+                    target_device_id, snap.version, members.size);
+            publish_manifest_with_retry.begin(stream, snap);
+            return applied;
         } catch (GLib.Error e) {
-            warning("append_device_remove_to_manifest: cannot load local DIK priv: %s", e.message);
+            warning("append_device_remove_to_manifest: snapshot build failed: %s", e.message);
             return false;
         }
-
-        try {
-            uint8[] prev_hash = manifest_sha256(((!) m).marshal());   // before mutation
-            var entry = build_signed_trust_entry(Protocol.TrustEntry.ACTION_REMOVE, target_device_id,
-                target_dc, ((!) m).next_lamport(), ((!) m).current_heads(),
-                self_id, self_dc_hash, dik_priv_ed, dik_priv_ml);
-            ((!) m).entries.add(entry);
-            ((!) m).version = ((!) m).version + 1;
-            ((!) m).prev_hash = prev_hash;
-            ((!) m).sign_head(dik_priv_ed, dik_priv_ml);
-        } catch (GLib.Error e) {
-            warning("append_device_remove_to_manifest: sign failed: %s", e.message);
-            return false;
-        }
-
-        // Cache locally, then publish to the server with retry until confirmed.
-        bool applied = verify_and_apply_manifest(account.bare_jid, ((!) m).marshal());
-        publish_manifest_with_retry.begin(stream, (!) m);
-        return applied;
     }
 
     // §D3: a freshly paired newcomer fetches + verifies + folds the account's own
