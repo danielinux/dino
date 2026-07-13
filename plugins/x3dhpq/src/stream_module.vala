@@ -1213,7 +1213,29 @@ public class StreamModule : XmppStreamModule {
         // The server may already hold a manifest (published by a sibling): adopt it.
         Protocol.TrustManifest? existing = yield fetch_trust_manifest(stream, account.bare_jid);
         if (existing != null) {
-            verify_and_apply_manifest(account.bare_jid, ((!) existing).marshal());
+            bool applied = verify_and_apply_manifest(account.bare_jid, ((!) existing).marshal());
+            if (applied) {
+                return;
+            }
+            // The server holds a manifest we could NOT apply (broken/stale genesis, empty
+            // fold, or under an AIK we don't recognise). If we hold AIK_priv we are the sole
+            // account authority — post-Phase-2 no other device holds AIK_priv, and only an
+            // AIK_priv holder can publish a valid genesis to our own (server-authenticated)
+            // PEP node — so any unapplicable manifest here is necessarily our own stale/broken
+            // one. Self-heal by republishing a fresh genesis at a SUPERSEDING version.
+            // Without this, a once-broken manifest is rejected forever and never replaced,
+            // which cascades into revoke being a no-op and fresh peers seeing no identity.
+            // A device WITHOUT AIK_priv keeps last-good and waits for the primary / re-pair.
+            if (!db.has_local_aik_priv(account)) {
+                warning("ensure_trust_manifest: server manifest for %s failed to apply and we hold no AIK_priv; keeping last good (awaiting primary / re-pair)", own_bare);
+                return;
+            }
+            warning("ensure_trust_manifest: server manifest for %s failed to apply (broken genesis) — republishing a fresh genesis at version %llu", own_bare, ((!) existing).version + 1);
+            try {
+                yield build_and_publish_genesis_manifest(stream, ((!) existing).version + 1, false);
+            } catch (GLib.Error e) {
+                warning("ensure_trust_manifest: self-heal genesis build failed for %s: %s", own_bare, e.message);
+            }
             return;
         }
         // Genesis requires AIK_priv (the primary/first authorized device).

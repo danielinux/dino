@@ -538,7 +538,19 @@ public class Database : Qlite.Database {
         if (bundle_row.is_present()) {
             string? cached = bundle_row[bundle.device_certificate_base64];
             if (cached != null && cached != "") {
-                return cached;
+                // Only reuse the cached DC if it still verifies under the CURRENT account
+                // AIK. After an AIK change (account reset) a DC issued under the OLD AIK is
+                // stale: reusing it makes the genesis manifest fold empty (the genesis DC
+                // fails to verify under the new AIK) and the published devicelist fails its
+                // own AIK-signature check. On mismatch, fall through and re-issue under the
+                // current AIK.
+                Protocol.DeviceCertificate? cdc =
+                    Protocol.DeviceCertificate.unmarshal(bytes_from_base64((!) cached));
+                if (cdc != null && ((!) cdc).verify(
+                        bytes_from_base64(row[account_identity.aik_pub_ed25519_base64]),
+                        bytes_from_base64(row[account_identity.aik_pub_mldsa_base64]))) {
+                    return (!) cached;
+                }
             }
         }
         Protocol.DeviceCertificate cert = Protocol.DeviceCertificate.issue(
