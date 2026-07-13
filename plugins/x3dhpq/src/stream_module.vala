@@ -1417,10 +1417,14 @@ public class StreamModule : XmppStreamModule {
             return false;
         }
 
+        warning("X3DHPQ-PAIR: append_device_add_to_manifest publishing newcomer=%u version=%llu entries=%d",
+                newcomer_dc.device_id, ((!) m).version, ((!) m).entries.size);
         if (yield publish_trust_manifest_blob(stream, (!) m)) {
             verify_and_apply_manifest(account.bare_jid, ((!) m).marshal());
+            warning("X3DHPQ-PAIR: append_device_add_to_manifest DONE persisted version=%llu", ((!) m).version);
             return true;
         }
+        warning("X3DHPQ-PAIR: append_device_add_to_manifest publish FAILED");
         return false;
     }
 

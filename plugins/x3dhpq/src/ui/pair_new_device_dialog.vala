@@ -47,6 +47,11 @@ public class PairNewDeviceDialog : Gtk.Window {
     // direction; only who originates the code differs (§10.6.2).
     private bool confirm_mode;
     private bool code_confirmed = false;
+    // Set once we have fired pairing_completed. The initiator fires it as soon as it
+    // has ISSUED + sent the newcomer's cert (SENT_PAYLOAD), NOT on the final TYPE_ACK
+    // (which is frequently lost on the same-account path) — so the manifest ADD append
+    // happens reliably. Guards against double-firing when the ACK later arrives.
+    private bool completion_fired = false;
     private Gtk.Entry? code_entry;
     private Gtk.Button? confirm_button;
 
@@ -413,14 +418,32 @@ public class PairNewDeviceDialog : Gtk.Window {
                     arm_pair_resend();
                 }
             }
+            // The initiator (confirmer) has everything it needs the moment it has ISSUED
+            // the newcomer's cert and sent the issuance payload — the responder installs
+            // it on receipt. Fire completion (→ manifest ADD append) NOW rather than
+            // gating on the final TYPE_ACK, which is frequently LOST on the same-account
+            // <pair> path and would otherwise leave the newcomer un-appended forever
+            // (observed live: PQ completes + adopts the manifest, but Dino sits at
+            // expected-TYPE_ACK and never appends, so the manifest never bumps to include
+            // the new device). We keep the session alive (arm_pair_resend above still runs
+            // while !is_done) so the issuance payload keeps retransmitting until the ACK
+            // lands or we time out.
+            if (!completion_fired && ((!) existing).get_issued_cert() != null) {
+                completion_fired = true;
+                set_status("Done");
+                pairing_completed((!) ((!) existing).get_issued_cert());
+            }
             if (((!) existing).is_done()) {
-                Protocol.DeviceCertificate? cert = ((!) existing).get_issued_cert();
-                if (cert != null) {
-                    set_status("Done");
-                    pairing_completed((!) cert);
-                } else {
-                    set_status("Failed: no certificate issued");
-                    pairing_failed("no certificate issued");
+                if (!completion_fired) {
+                    Protocol.DeviceCertificate? cert = ((!) existing).get_issued_cert();
+                    if (cert != null) {
+                        completion_fired = true;
+                        set_status("Done");
+                        pairing_completed((!) cert);
+                    } else {
+                        set_status("Failed: no certificate issued");
+                        pairing_failed("no certificate issued");
+                    }
                 }
                 disconnect_signals();
                 close();
@@ -469,6 +492,15 @@ public class PairNewDeviceDialog : Gtk.Window {
         cancel_pairing_timeout();
         pairing_timeout_id = Timeout.add_seconds(90, () => {
             pairing_timeout_id = 0;
+            if (completion_fired) {
+                // The cert was issued + sent and the newcomer was appended to the
+                // manifest; only the final ACK was outstanding. That is a success —
+                // close quietly rather than reporting a spurious timeout failure.
+                set_status("Done");
+                disconnect_signals();
+                close();
+                return false;
+            }
             set_status("Pairing timed out. If you mistyped the code, start over and try again.");
             disconnect_signals();
             pairing_failed("timed out");
