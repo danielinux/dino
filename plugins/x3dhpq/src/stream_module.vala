@@ -958,16 +958,17 @@ public class StreamModule : XmppStreamModule {
             .put_node(new StanzaNode.build("mldsa-sig", Protocol.NS_DEVICELIST)
                 .put_node(new StanzaNode.text(mldsa_sig_b64)));
 
-        if (yield stream.get_module(Pubsub.Module.IDENTITY).publish(stream, null, Protocol.NS_DEVICELIST, "current", node, PUBLISH_OPTIONS)) {
-            yield try_make_node_public(stream, Protocol.NS_DEVICELIST);
+        bool dl_pub = yield stream.get_module(Pubsub.Module.IDENTITY).publish(stream, null, Protocol.NS_DEVICELIST, "current", node, PUBLISH_OPTIONS);
+        if (dl_pub) {
+            // Best-effort steps are FIRE-AND-FORGET: a hung node-config reconfigure or
+            // sealed-tracker publish (both observed to hang intermittently on an IQ that
+            // never gets a response) must NOT block the critical devicelist→manifest
+            // bootstrap that follows in publish_current_state. The node is already public
+            // via PUBLISH_OPTIONS (access_model=open); try_make_node_public is only a
+            // belt-and-suspenders reconfigure, and the tracker is explicitly best-effort.
+            try_make_node_public.begin(stream, Protocol.NS_DEVICELIST);
             db.store_device_list_payload(account, own_jid, "current", node.to_string(), version, true, content_key);
-            // §11.8: re-seal and republish the sealed device-state tracker to the
-            // SAME device union just published, whenever a device is authorized
-            // and the device set changes (and, harmlessly, on every idempotent
-            // republish too). Best-effort — see publish_device_tracker's own
-            // guardrail comment; a failure here can never undo or block the
-            // devicelist publish that already succeeded above.
-            yield publish_device_tracker(stream, devices);
+            publish_device_tracker.begin(stream, devices);
         }
         // The primary already persists a newly-enrolled device's DC under our own
         // bare JID at pairing completion (encryption_preferences_entry.vala's
@@ -1045,7 +1046,9 @@ public class StreamModule : XmppStreamModule {
         bool ok = yield stream.get_module(Pubsub.Module.IDENTITY).publish(stream, null,
             Protocol.NS_TRUSTMANIFEST, "current", node, MANIFEST_PUBLISH_OPTIONS);
         if (ok) {
-            yield try_make_node_public(stream, Protocol.NS_TRUSTMANIFEST);
+            // fire-and-forget (see publish_device_list): node already open via
+            // MANIFEST_PUBLISH_OPTIONS; don't let a hung reconfigure block persistence.
+            try_make_node_public.begin(stream, Protocol.NS_TRUSTMANIFEST);
         } else {
             warning("publish_trust_manifest_blob: publish failed for %s", account.bare_jid.to_string());
         }
@@ -1054,17 +1057,20 @@ public class StreamModule : XmppStreamModule {
 
     // §A fetch helper: fetch owner `jid`'s current manifest (own or a contact).
     public async Protocol.TrustManifest? fetch_trust_manifest(XmppStream stream, Jid jid) {
-        StanzaNode pubsub = new StanzaNode.build("pubsub", Pubsub.NS_URI).add_self_xmlns()
-            .put_node(new StanzaNode.build("items", Pubsub.NS_URI)
-                .put_attribute("node", Protocol.NS_TRUSTMANIFEST)
-                .put_node(new StanzaNode.build("item", Pubsub.NS_URI).put_attribute("id", "current")));
-        Iq.Stanza iq = new Iq.Stanza.get(pubsub) { to = jid };
+        // Use the framework's tested Pubsub items-fetch (callback-based send_iq via
+        // Pubsub.Module.request, mirroring request_device_list) rather than a hand-rolled
+        // send_iq_async. The async variant could hang forever awaiting a response the
+        // responder never matched, which stalled the ENTIRE manifest bootstrap (genesis
+        // was never built/published) and the revoke path. request()'s listener always
+        // fires on a response, delivering a null node when the item/node is absent.
+        Promise<Protocol.TrustManifest?> promise = new Promise<Protocol.TrustManifest?>();
+        stream.get_module(Pubsub.Module.IDENTITY).request(stream, jid, Protocol.NS_TRUSTMANIFEST, (stream, from, id, node) => {
+            promise.set_value(unmarshal_manifest_node(node));
+        });
         try {
-            Iq.Stanza result = yield stream.get_module(Iq.Module.IDENTITY).send_iq_async(stream, iq);
-            StanzaNode? item = result.stanza.get_deep_subnode(Pubsub.NS_URI + ":pubsub", Pubsub.NS_URI + ":items", Pubsub.NS_URI + ":item");
-            if (item == null || item.sub_nodes.size == 0) return null;
-            return unmarshal_manifest_node(item.sub_nodes[0]);
-        } catch (Error e) {
+            return yield promise.future.wait_async();
+        } catch (FutureError e) {
+            warning("fetch_trust_manifest: request failed for %s: %s", jid.to_string(), e.message);
             return null;
         }
     }
