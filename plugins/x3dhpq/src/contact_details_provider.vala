@@ -34,7 +34,7 @@ public class ContactDetailsProvider : Plugins.ContactDetailsProvider, Object {
             subtitle = supports_x3dhpq ? "This contact has advertised x3dhpq support." : "This contact has not advertised x3dhpq support yet.",
         });
         group.add(new ActionRow() {
-            title = "Account fingerprint",
+            title = "Identity fingerprint",
             subtitle = fingerprint,
         });
         var trust_row = new ActionRow() {

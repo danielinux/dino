@@ -74,7 +74,7 @@ public class PairToExistingDialog : Adw.Window {
         Object(
             modal: true,
             transient_for: parent,
-            title: show_own_code ? "Show this device's code" : "Pair this device",
+            title: "Pair this device",
             default_width: 400,
             default_height: -1
         );
@@ -117,7 +117,7 @@ public class PairToExistingDialog : Adw.Window {
             // PairNewDeviceDialog's own code display), and the pairing kicks
             // off automatically once built (begin_show_own_code()).
             var instruction = new Gtk.Label(
-                "Show this code to whoever is confirming this device on your existing device, or read it out."
+                "On one of your existing devices, open its device list and choose “Confirm a waiting device”, then enter (or scan) this code."
             ) {
                 halign    = Gtk.Align.START,
                 wrap      = true,

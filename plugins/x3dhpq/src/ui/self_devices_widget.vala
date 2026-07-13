@@ -38,7 +38,7 @@ public class SelfDevicesWidget : Gtk.Box {
         this.db = db;
         this.account = account;
 
-        var fp_header = new Gtk.Label("Account fingerprint") {
+        var fp_header = new Gtk.Label("Identity fingerprint") {
             halign = Gtk.Align.START,
             margin_start = 6,
             margin_top = 6
@@ -116,7 +116,7 @@ public class SelfDevicesWidget : Gtk.Box {
             margin_top = 6,
             margin_bottom = 6
         };
-        confirm_button = new Gtk.Button.with_label("Confirm a device…");
+        confirm_button = new Gtk.Button.with_label("Confirm a waiting device");
         confirm_button.clicked.connect(() => confirm_device_requested());
         button_box.append(confirm_button);
         append(button_box);
@@ -134,7 +134,7 @@ public class SelfDevicesWidget : Gtk.Box {
         uint32 device_id = (uint32) req[db.pending_enrollment_request.device_id];
         var row = new Adw.ActionRow() {
             title = @"Device $device_id wants to join this account",
-            subtitle = "Received via this account's pairing rendezvous. Use “Confirm a device…” " +
+            subtitle = "Received via this account's pairing rendezvous. Use “Confirm a waiting device” " +
                 "below and complete the manual code/QR handshake to admit it."
         };
         row.add_css_class("warning");
@@ -172,8 +172,9 @@ public class SelfDevicesWidget : Gtk.Box {
         // with an explanatory tooltip instead of letting the human hit a silent
         // failure after completing a pairing handshake.
         confirm_button.sensitive = authorized;
-        confirm_button.tooltip_text = authorized ? "" :
-            "This device is disabled (waiting for sync) and cannot confirm other devices yet.";
+        confirm_button.tooltip_text = authorized
+            ? "Enter (or scan) the code shown on the device you're pairing."
+            : "This device is disabled (waiting for sync) and cannot confirm other devices yet.";
 
         // Remove all existing rows from the listbox
         Gtk.Widget? child = devices_listbox.get_first_child();
@@ -252,7 +253,7 @@ public class SelfDevicesWidget : Gtk.Box {
         subtitle_parts.add(@"ID $(((uint32) device_id).to_string())");
         subtitle_parts.add(role);
         if (this_device) subtitle_parts.add("this device");
-        if (!confirmed) subtitle_parts.add("NOT IN MANIFEST — not trusted yet");
+        if (!confirmed) subtitle_parts.add("Not in the account's trust manifest yet");
 
         var row = new Adw.ExpanderRow() {
             title = device_display_name(device_id),
@@ -291,13 +292,13 @@ public class SelfDevicesWidget : Gtk.Box {
             // Trust Manifest Phase 2 (task #67): trust = presence in the account's
             // manifest fold (the audit-chain "AddDevice record" gate is retired). A
             // device shown here appears under the account but is NOT in the current
-            // fold, so it is not trusted yet — admit it via "Confirm a device…" or
-            // revoke it if unrecognized.
+            // fold, so it is not trusted yet — admit it via "Confirm a waiting
+            // device" or revoke it if unrecognized.
             row.add_row(new Adw.ActionRow() {
-                title = "Not in the trust manifest",
-                subtitle = "This device appears under the account but is not part of the current " +
-                    "trust manifest, so it is not trusted yet. Confirm it via “Confirm a device…”, " +
-                    "or revoke it if you don't recognize it."
+                title = "Not in the account's trust manifest yet",
+                subtitle = "This device appears under the account but is not one of its trusted " +
+                    "devices yet, so it can't send or receive as this account. Confirm it via " +
+                    "“Confirm a waiting device”, or revoke it if you don't recognize it."
             });
         }
 

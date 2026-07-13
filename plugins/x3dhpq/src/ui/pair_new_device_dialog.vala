@@ -58,7 +58,7 @@ public class PairNewDeviceDialog : Gtk.Window {
 
     public PairNewDeviceDialog(Gtk.Window parent, Database db, Account account, StreamModule stream_module, XmppStream? stream = null, bool confirm_mode = false) {
         Object(
-            title: confirm_mode ? "Confirm a device" : "Add new device",
+            title: confirm_mode ? "Confirm a waiting device" : "Add new device",
             modal: true,
             transient_for: parent,
             default_width: 400,
@@ -137,7 +137,7 @@ public class PairNewDeviceDialog : Gtk.Window {
 
     private void build_ui() {
         var header = new Gtk.HeaderBar();
-        header.set_title_widget(new Gtk.Label(confirm_mode ? "Confirm a device" : "Add new device"));
+        header.set_title_widget(new Gtk.Label(confirm_mode ? "Confirm a waiting device" : "Add new device"));
         var cancel_button = new Gtk.Button.with_label("Cancel");
         cancel_button.clicked.connect(() => cancel());
         header.pack_start(cancel_button);
@@ -152,7 +152,7 @@ public class PairNewDeviceDialog : Gtk.Window {
 
         if (confirm_mode) {
             var hint_label = new Gtk.Label(
-                "Enter (or scan) the code shown on the device that's waiting to be confirmed."
+                "Enter (or scan) the code shown on the device you're pairing."
             ) {
                 halign = Gtk.Align.CENTER,
                 wrap = true

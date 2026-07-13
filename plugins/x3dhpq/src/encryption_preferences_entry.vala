@@ -75,10 +75,10 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
         // restart from genesis. Destructive: mints a new AIK, de-associates all
         // devices, forces per-contact re-verification. Guarded by a confirm dialog.
         var reset_row = new ActionRow() {
-            title = "Reset This Account's x3dhpq Identity",
-            subtitle = "Destructive — mints a brand-new key (AIK) from genesis, de-associates ALL devices, and forces every contact to re-verify you. Use this to start over."
+            title = "Reset this account's identity",
+            subtitle = "Destructive — creates a brand-new identity from scratch, de-associates ALL devices, and forces every contact to re-verify you. Use this to start over."
         };
-        var reset_button = new Gtk.Button.with_label("Account reset…") {
+        var reset_button = new Gtk.Button.with_label("Account reset") {
             valign = Gtk.Align.CENTER
         };
         reset_button.add_css_class("destructive-action");
@@ -96,10 +96,10 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
         // discards THIS device's local identity and re-pairs as a secondary.
         if (!plugin.db.is_pending_enrollment(account)) {
             var join_row = new ActionRow() {
-                title = "Join an Existing Identity",
-                subtitle = "This device currently has its own x3dhpq identity. Discard it and re-join the identity your other devices already use — you'll confirm this device from one of them. Your account's key is unchanged."
+                title = "Join an existing identity",
+                subtitle = "This device currently has its own x3dhpq identity. Discard it and re-join the identity your other devices already use — you'll confirm this device from one of them using “Confirm a waiting device”. Your account's key is unchanged."
             };
-            var join_button = new Gtk.Button.with_label("Join existing…") {
+            var join_button = new Gtk.Button.with_label("Join an existing identity") {
                 valign = Gtk.Align.CENTER
             };
             join_button.clicked.connect(() => confirm_join_existing_identity(account, join_row, devices_widget));
@@ -121,14 +121,14 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
             " • Discard THIS device's current identity/key locally. This device stops acting as " +
             "its own identity and becomes a pending device waiting to be confirmed.\n" +
             " • Re-detect the account's existing identity. If your other devices already have an " +
-            "identity, this device will wait to be confirmed from one of them (Associate / enter " +
-            "its code) and then rejoin as a secondary.\n" +
+            "identity, this device will wait to be confirmed from one of them (choose “Confirm a " +
+            "waiting device” there) and then rejoin as a secondary.\n" +
             " • If NO existing identity is found, this device simply becomes primary again.\n\n" +
             "Your account's key and your OTHER devices are NOT changed. Contacts do not have to " +
             "re-verify you. Use this if this device wrongly thinks it is a separate identity."
         );
         dialog.add_response("cancel", "Cancel");
-        dialog.add_response("join", "Discard & join");
+        dialog.add_response("join", "Discard and join");
         dialog.set_response_appearance("join", Adw.ResponseAppearance.DESTRUCTIVE);
         dialog.default_response = "cancel";
         dialog.close_response = "cancel";
@@ -210,15 +210,16 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
         inner.append(title);
 
         var subtitle = new Gtk.Label(revoked
-            ? ("Another device revoked this one's access (§11.8: its sealed device-state tracker copy " +
-                "no longer decrypts). It cannot send or receive messages as this account while disabled. " +
-                "If this was not you, treat this device as compromised. If it was, Associate again from " +
-                "one of your remaining devices to rejoin, or start an account reset if you have no other " +
-                "working device left.")
+            ? ("Another device removed this one's access. It cannot send or receive messages as this " +
+                "account while disabled. If this was not you, treat this device as compromised. If it " +
+                "was, choose “Pair this device” below, then on one of your remaining devices open its " +
+                "device list and choose “Confirm a waiting device” to rejoin — or start an Account reset " +
+                "if you have no other working device left.")
             : ("This account already has an identity on another device. This device cannot send messages " +
-                "until it is confirmed. Confirm it from one of your existing devices to join — your prior " +
-                "messages, groups and contacts' trust are preserved. Only start an account reset if you " +
-                "have no working device left.")
+                "until it is confirmed. Choose “Pair this device” below to show its code, then on one of " +
+                "your existing devices open its device list and choose “Confirm a waiting device” — your " +
+                "prior messages, groups and contacts' trust are preserved. Only start an Account reset if " +
+                "you have no working device left.")
         ) {
             halign = Gtk.Align.START,
             wrap = true
@@ -230,7 +231,7 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
 
         // §10.6.2 (single tested direction): this new device PRESENTS its code;
         // an existing authorized device enters it via "Confirm a device…".
-        var show_code_button = new Gtk.Button.with_label("Show this device's code");
+        var show_code_button = new Gtk.Button.with_label("Pair this device");
         show_code_button.add_css_class("suggested-action");
         show_code_button.clicked.connect(() => {
             // §11.8 queued enrollment request: persist a signed request to our
@@ -247,7 +248,7 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
         });
         button_box.append(show_code_button);
 
-        var new_identity_button = new Gtk.Button.with_label("Account reset…");
+        var new_identity_button = new Gtk.Button.with_label("Account reset");
         new_identity_button.add_css_class("destructive-action");
         new_identity_button.clicked.connect(() => confirm_account_reset(account, box));
         button_box.append(new_identity_button);
