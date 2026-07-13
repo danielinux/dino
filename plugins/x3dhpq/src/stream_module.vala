@@ -1349,31 +1349,34 @@ public class StreamModule : XmppStreamModule {
 
     // §D2: at pairing confirmation, append a DIK-signed ADD for the newcomer and
     // publish. Replaces the AddDevice audit-entry publish on the pairing path.
+    // Unmarshal the locally-cached trust manifest for `bare`, or null if none/undecodable.
+    private Protocol.TrustManifest? load_local_manifest(string bare) {
+        string? cached = db.get_trust_manifest_payload(account, bare);
+        if (cached == null) return null;
+        try {
+            return Protocol.TrustManifest.unmarshal(bytes_to_uint8_array(bytes_from_base64((!) cached)));
+        } catch (GLib.Error e) {
+            return null;
+        }
+    }
+
     public async bool append_device_add_to_manifest(XmppStream stream, Protocol.DeviceCertificate newcomer_dc) {
         string own_bare = account.bare_jid.to_string();
+        warning("X3DHPQ-PAIR: append_device_add_to_manifest ENTRY newcomer=%u", newcomer_dc.device_id);
 
-        // Load the current manifest: freshest from the server, else local cache.
-        Protocol.TrustManifest? m = yield fetch_trust_manifest(stream, account.bare_jid);
+        // Load the current manifest, preferring our LOCAL cached copy: we are the
+        // authoritative primary and just published it, and a fresh server fetch here can
+        // hang on a lost PEP IQ under the heavy <pair> traffic that just completed
+        // (observed: the append silently stalled on fetch_trust_manifest right after
+        // pairing_completed). Fall back to a server fetch / genesis build only if we hold
+        // no local manifest at all.
+        Protocol.TrustManifest? m = load_local_manifest(own_bare);
         if (m == null) {
-            string? cached = db.get_trust_manifest_payload(account, own_bare);
-            if (cached != null) {
-                try {
-                    m = Protocol.TrustManifest.unmarshal(bytes_to_uint8_array(bytes_from_base64((!) cached)));
-                } catch (GLib.Error e) { m = null; }
-            }
+            m = yield fetch_trust_manifest(stream, account.bare_jid);
         }
         if (m == null) {
-            // Not migrated yet — build genesis first, then reload.
             yield ensure_trust_manifest(stream);
-            m = yield fetch_trust_manifest(stream, account.bare_jid);
-            if (m == null) {
-                string? cached2 = db.get_trust_manifest_payload(account, own_bare);
-                if (cached2 != null) {
-                    try {
-                        m = Protocol.TrustManifest.unmarshal(bytes_to_uint8_array(bytes_from_base64((!) cached2)));
-                    } catch (GLib.Error e) { m = null; }
-                }
-            }
+            m = load_local_manifest(own_bare);
         }
         if (m == null) {
             warning("append_device_add_to_manifest: no manifest available for %s", own_bare);
@@ -1434,15 +1437,11 @@ public class StreamModule : XmppStreamModule {
     public async bool append_device_remove_to_manifest(XmppStream stream, uint32 target_device_id) {
         string own_bare = account.bare_jid.to_string();
 
-        // Load the current manifest: freshest from the server, else local cache.
-        Protocol.TrustManifest? m = yield fetch_trust_manifest(stream, account.bare_jid);
+        // Prefer the LOCAL cached manifest (authoritative primary; avoids a server fetch
+        // that can hang on a lost PEP IQ). Fall back to a server fetch only if absent.
+        Protocol.TrustManifest? m = load_local_manifest(own_bare);
         if (m == null) {
-            string? cached = db.get_trust_manifest_payload(account, own_bare);
-            if (cached != null) {
-                try {
-                    m = Protocol.TrustManifest.unmarshal(bytes_to_uint8_array(bytes_from_base64((!) cached)));
-                } catch (GLib.Error e) { m = null; }
-            }
+            m = yield fetch_trust_manifest(stream, account.bare_jid);
         }
         if (m == null) {
             warning("append_device_remove_to_manifest: no manifest available for %s", own_bare);
