@@ -1714,6 +1714,36 @@ public class Database : Qlite.Database {
         }
     }
 
+    // Task #58 recovery ("Join an existing identity"): DISCARD the account AIK this
+    // device currently holds (e.g. a self-promoted/forked primary) and drop back to
+    // pending-enrollment so the device re-detects and joins the account's existing
+    // identity as a secondary. KEEPS this device's DIK + device_id. A FRESH throwaway
+    // AIK is minted (replacing the discarded one) so that if resolution later finds
+    // NO existing account, promote_to_primary yields a clean new identity rather than
+    // resurrecting the discarded AIK. Marks the device NOT primary + NOT confirmed
+    // (is_pending_enrollment true) so it goes quiet and publishes nothing as primary.
+    // Caller also clears the manifest/devicelist/peer state and re-runs resolution.
+    public void demote_to_pending(Account account) {
+        if (!has_local_identity(account)) return;
+        try {
+            Bytes aik_pub_ed, aik_priv_ed, aik_pub_ml, aik_priv_ml;
+            global::X3dhpq.Crypto.generate_ed25519(out aik_pub_ed, out aik_priv_ed);
+            global::X3dhpq.Crypto.generate_mldsa65(out aik_pub_ml, out aik_priv_ml);
+            account_identity.update()
+                .with(account_identity.account_id, "=", account.id)
+                .set(account_identity.aik_pub_ed25519_base64, bytes_to_base64(aik_pub_ed))
+                .set(account_identity.aik_priv_ed25519_base64, bytes_to_base64(aik_priv_ed))
+                .set(account_identity.aik_pub_mldsa_base64, bytes_to_base64(aik_pub_ml))
+                .set(account_identity.aik_priv_mldsa_base64, bytes_to_base64(aik_priv_ml))
+                .set(account_identity.is_primary, false)
+                .set(account_identity.confirmed, false)
+                .perform();
+        } catch (GLib.Error e) {
+            warning("demote_to_pending: key generation failed for %s: %s",
+                account.bare_jid.to_string(), e.message);
+        }
+    }
+
     // Clear the cached self DeviceCertificate for the own account so
     // ensure_local_device_certificate re-issues it under the CURRENT (post-reset,
     // new) AIK instead of returning the stale old-AIK-signed cert.

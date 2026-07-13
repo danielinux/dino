@@ -87,7 +87,96 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
         reset_row.activatable_widget = reset_button;
         group.add(reset_row);
 
+        // Task #58 recovery: a device that currently holds its OWN account AIK
+        // (thinks it's primary — including one that self-promoted after a fork) has
+        // no other way to discard that identity and JOIN the account's existing
+        // manifest. The associate/pair-as-secondary flow only surfaces in the
+        // pending-enrollment banner, so offer it here whenever this device is NOT
+        // pending (i.e. it holds its own AIK). Non-destructive to the account: it
+        // discards THIS device's local identity and re-pairs as a secondary.
+        if (!plugin.db.is_pending_enrollment(account)) {
+            var join_row = new ActionRow() {
+                title = "Join an Existing Identity",
+                subtitle = "This device currently has its own x3dhpq identity. Discard it and re-join the identity your other devices already use — you'll confirm this device from one of them. Your account's key is unchanged."
+            };
+            var join_button = new Gtk.Button.with_label("Join existing…") {
+                valign = Gtk.Align.CENTER
+            };
+            join_button.clicked.connect(() => confirm_join_existing_identity(account, join_row, devices_widget));
+            join_row.add_suffix(join_button);
+            join_row.activatable_widget = join_button;
+            group.add(join_row);
+        }
+
         return group;
+    }
+
+    // Task #58: confirm discarding THIS device's local identity and re-joining the
+    // account's existing one as a secondary. Unlike account reset this does NOT
+    // touch the account's key or other devices — only this device's local state.
+    private void confirm_join_existing_identity(Account account, Gtk.Widget anchor, UI.SelfDevicesWidget? devices_widget = null) {
+        var dialog = new Adw.AlertDialog(
+            "Discard this device's identity and join the existing one?",
+            "This device currently holds its OWN x3dhpq identity (key). This will:\n\n" +
+            " • Discard THIS device's current identity/key locally. This device stops acting as " +
+            "its own identity and becomes a pending device waiting to be confirmed.\n" +
+            " • Re-detect the account's existing identity. If your other devices already have an " +
+            "identity, this device will wait to be confirmed from one of them (Associate / enter " +
+            "its code) and then rejoin as a secondary.\n" +
+            " • If NO existing identity is found, this device simply becomes primary again.\n\n" +
+            "Your account's key and your OTHER devices are NOT changed. Contacts do not have to " +
+            "re-verify you. Use this if this device wrongly thinks it is a separate identity."
+        );
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("join", "Discard & join");
+        dialog.set_response_appearance("join", Adw.ResponseAppearance.DESTRUCTIVE);
+        dialog.default_response = "cancel";
+        dialog.close_response = "cancel";
+        dialog.response.connect((id) => {
+            if (id != "join") return;
+            perform_join_existing_identity(account, devices_widget);
+        });
+        dialog.present(anchor);
+    }
+
+    // Task #58: discard the local account AIK this device holds, drop to pending,
+    // wipe the local manifest/devicelist/peer state, then re-run pending-enrollment
+    // resolution so the device re-detects the account's existing identity (staying
+    // quiet as pending if found, self-correcting to primary if none). Must NOT
+    // publish a devicelist/manifest as primary while pending.
+    private void perform_join_existing_identity(Account account, UI.SelfDevicesWidget? devices_widget) {
+        string own_bare = account.bare_jid.to_string();
+        // Discard the held AIK + drop to pending (KEEPS DIK + device_id).
+        plugin.db.demote_to_pending(account);
+        // Local state that was rooted under the discarded identity is meaningless
+        // now — clear the manifest version/blob store, the own devicelist snapshot,
+        // any own-account sibling/peer rows, revocation tombstones, and the cached
+        // self DC (so nothing stale lingers or leaks into a re-detected identity).
+        plugin.db.clear_trust_manifest(account, own_bare);
+        plugin.db.clear_own_device_list_snapshot(account);
+        plugin.db.prune_remote_devices_not_in(account, own_bare, new Gee.HashSet<int>());
+        plugin.db.clear_revoked_devices(account);
+        plugin.db.invalidate_local_device_certificate(account);
+
+        StreamModule? module = plugin.app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
+        XmppStream? stream = plugin.app.stream_interactor.get_stream(account);
+        if (module == null || stream == null) {
+            // Offline: the demote is local; resolution happens on next connect via
+            // the normal bootstrap. Reflect the pending state in the UI now.
+            if (devices_widget != null) ((!) devices_widget).refresh();
+            return;
+        }
+        // Re-run resolution: publish_current_state resolves pending FIRST (device is
+        // no longer authorized), and only publishes a devicelist/manifest if that
+        // resolution promotes it to primary (no existing account found). If an
+        // existing identity IS found the device stays pending and goes quiet —
+        // the pending-enrollment banner's Associate flow then takes over.
+        ((!) module).publish_current_state.begin((!) stream, (o, r) => {
+            ((!) module).publish_current_state.end(r);
+            if (devices_widget != null) {
+                Idle.add(() => { ((!) devices_widget).refresh(); return false; });
+            }
+        });
     }
 
     // §10.6.4: this install detected an existing account identity on first
