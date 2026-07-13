@@ -426,12 +426,24 @@ public class PairNewDeviceDialog : Gtk.Window {
                 close();
             }
         } catch (Protocol.PairingError.PROTOCOL e) {
-            // A stray/duplicate/out-of-order stanza (e.g. a carbon copy of a
-            // message we already consumed, or one for a different FSM step).
-            // The FSM checks the message type BEFORE mutating any state, so
-            // nothing was corrupted — just ignore it and keep waiting.
-            warning("X3DHPQ-PAIR: INITIATOR ignoring stray stanza type=%u from %s: %s",
-                    msg.msg_type, from_jid.to_string(), e.message);
+            // A stray/duplicate/out-of-order stanza. The FSM checks the message type
+            // BEFORE mutating state, so nothing is corrupted. Crucially, a stray
+            // EARLIER-step message almost always means the peer never received OUR
+            // last reply and is re-sending its previous step — so RE-SEND our last
+            // outbound (and re-arm the periodic resend that the cancel_pair_resend()
+            // above just stopped). Without this the handshake deadlocks: the peer
+            // retransmits its old step forever while we silently ignore it (observed
+            // live: PQ re-sends PAKE2, we sit at expected-CONFIRM and never resend PAKE3).
+            if (last_sent_msg != null && existing != null && !((!) existing).is_done()) {
+                Jid target = peer_jid ?? from_jid;
+                warning("X3DHPQ-PAIR: INITIATOR stray type=%u from %s (%s) — resending last outbound",
+                        msg.msg_type, from_jid.to_string(), e.message);
+                stream_module.send_pair_stanza(target, sid, (!) last_sent_msg);
+                arm_pair_resend();
+            } else {
+                warning("X3DHPQ-PAIR: INITIATOR ignoring stray stanza type=%u from %s: %s",
+                        msg.msg_type, from_jid.to_string(), e.message);
+            }
         } catch (GLib.Error e) {
             set_status("Failed: %s".printf(e.message));
             pairing_failed(e.message);
