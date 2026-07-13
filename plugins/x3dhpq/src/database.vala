@@ -543,12 +543,22 @@ public class Database : Qlite.Database {
                 // stale: reusing it makes the genesis manifest fold empty (the genesis DC
                 // fails to verify under the new AIK) and the published devicelist fails its
                 // own AIK-signature check. On mismatch, fall through and re-issue under the
-                // current AIK.
+                // current AIK. NB: DeviceCertificate.verify() THROWS on a bad signature
+                // (wolfSSL raises rc=-229 rather than returning false), so the check MUST be
+                // guarded — an unguarded throw here would abort the whole genesis build.
+                bool cached_ok = false;
                 Protocol.DeviceCertificate? cdc =
                     Protocol.DeviceCertificate.unmarshal(bytes_from_base64((!) cached));
-                if (cdc != null && ((!) cdc).verify(
-                        bytes_from_base64(row[account_identity.aik_pub_ed25519_base64]),
-                        bytes_from_base64(row[account_identity.aik_pub_mldsa_base64]))) {
+                if (cdc != null) {
+                    try {
+                        cached_ok = ((!) cdc).verify(
+                            bytes_from_base64(row[account_identity.aik_pub_ed25519_base64]),
+                            bytes_from_base64(row[account_identity.aik_pub_mldsa_base64]));
+                    } catch (GLib.Error e) {
+                        cached_ok = false; // stale/foreign-AIK signature — re-issue below
+                    }
+                }
+                if (cached_ok) {
                     return (!) cached;
                 }
             }
