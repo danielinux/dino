@@ -1,39 +1,39 @@
-// x3dhpq Trust Manifest (Phase 1 core).
+// x3dhpq Trust Manifest (wire v2 — compact snapshot model, SHA-512).
 //
-// The Trust Manifest is the account's authorized-device set expressed as an
-// AIK-rooted, append-only hash-DAG of delegation entries, published as a single
-// signed blob (the manifest head) that embeds all of its entries. Unlike the
-// device-audit DAG (device_dag.vala) — where every writer shares the account AIK
-// and each entry is authorized directly under that AIK — the Trust Manifest is a
-// DELEGATION graph: the genesis device is authorized under the AIK, and every
-// later entry is authorized under the DIK of an already-trusted AUTHOR device
-// (author_device_id + author_dc_hash bind the authoring device's certificate).
+// The Trust Manifest is the account's authorized-device set expressed as a
+// COMPACT SNAPSHOT of current members, published as a single signed blob (the
+// manifest head) that embeds all of its entries. The genesis device is
+// authorized under the account AIK; every other member entry is authored (and
+// signed) by the genesis/publisher device's DIK (author_device_id +
+// author_dc_hash bind the authoring device's certificate).
 //
 // This file is byte-identical to the Java x3dhpq-core TrustEntry/TrustManifest.
-// It follows the DeviceAuditEntryV2 conventions exactly: big-endian everywhere,
-// domain prefixes are raw byte arrays that INCLUDE a trailing 0x00, hybrid sigs
-// are appended as (uint16 len | sig) with Ed25519 first then ML-DSA-65, and
-// entry_hash = SHA-256(marshal). See trust-manifest-canonical.md.
+// Conventions: big-endian everywhere, domain prefixes are raw byte arrays that
+// INCLUDE a trailing 0x00, hybrid sigs are appended as (uint16 len | sig) with
+// Ed25519 first then ML-DSA-65. ALL hashes are SHA-512 (author_dc_hash,
+// prev_hash, entry_hash, manifest_hash). See trust-manifest-v2-canonical.md.
+//
+// v2 changes from v1: domain prefixes bump to v2; SHA-256 → SHA-512 (all 64-byte
+// hashes); the DAG fields (lamport u64, parent_count u32, parents[32]*) are
+// DROPPED from TrustEntry; fold is a simple snapshot walk (genesis first, then
+// ADD entries by ascending device_id), no topo-sort, no REMOVE/removal-wins.
 //
 // TrustEntry.signed_part layout (big-endian):
-//   "X3DHPQ-TrustEntry-v1\0" (21)
-//   action             uint8            1 = ADD, 2 = REMOVE
+//   "X3DHPQ-TrustEntry-v2\0" (21)
+//   action             uint8            1 = ADD (REMOVE unused in the snapshot model)
 //   device_id          uint32           the SUBJECT device id
 //   dc_len             uint16
 //   dc_bytes           dc_len bytes     DeviceCertificate.marshal() of the subject
-//   lamport            uint64
-//   parent_count       uint32
-//   parents[N]         32 bytes each    SHA-256(parent TrustEntry.marshal()), raw
-//   author_device_id   uint32           the EDITOR device id (== device_id for genesis)
-//   author_dc_hash     32 bytes         SHA-256(author's DeviceCertificate.marshal())
+//   author_device_id   uint32           the AUTHOR device id (== device_id for genesis)
+//   author_dc_hash     64 bytes         SHA-512(author's DeviceCertificate.marshal())
 //   timestamp          uint64           unix seconds (int64 cast to uint64)
 // marshal = signed_part | uint16 sigEdLen | sigEd | uint16 sigMlLen | sigMl
 //
 // TrustManifest.signed_part layout (big-endian):
-//   "X3DHPQ-TrustManifest-v1\0" (24)
+//   "X3DHPQ-TrustManifest-v2\0" (24)
 //   version            uint64
-//   prev_hash_len      uint32           ALWAYS 32
-//   prev_hash          32 bytes         SHA-256(previous manifest.marshal()); zeros at genesis
+//   prev_hash_len      uint32           ALWAYS 64
+//   prev_hash          64 bytes         SHA-512(previous manifest.marshal()); zeros at genesis
 //   aik_len            uint16
 //   aik_bytes          aik_len bytes    AccountIdentityPub.marshal() (1987)
 //   entry_count        uint32
@@ -46,29 +46,27 @@ namespace Dino.Plugins.X3dhpq.Protocol {
 
 public class TrustEntry : Object {
     public const uint8 ACTION_ADD = 1;
-    public const uint8 ACTION_REMOVE = 2;
+    public const uint8 ACTION_REMOVE = 2;   // reserved / unused in the snapshot model
 
     public uint8 action { get; set; }
     public uint32 device_id { get; set; }                 // subject
     public DeviceCertificate dc { get; set; }             // subject certificate
-    public uint64 lamport { get; set; }
-    public Gee.ArrayList<Bytes> parents { get; set; default = new Gee.ArrayList<Bytes>(); } // each 32 bytes
-    public uint32 author_device_id { get; set; }          // editor
-    public uint8[] author_dc_hash { get; set; }           // 32 bytes
+    public uint32 author_device_id { get; set; }          // author (== device_id for genesis)
+    public uint8[] author_dc_hash { get; set; }           // 64 bytes (SHA-512)
     public int64 timestamp { get; set; }
     public uint8[] signature { get; set; }
     public uint8[] mldsa_signature { get; set; }
 
-    // "X3DHPQ-TrustEntry-v1\0" — 21 bytes, trailing NUL INCLUDED. Built as a raw
+    // "X3DHPQ-TrustEntry-v2\0" — 21 bytes, trailing NUL INCLUDED. Built as a raw
     // byte literal (NOT from a Vala string, which would drop the trailing 0x00).
-    private static uint8[] v1_prefix() {
-        return { 'X','3','D','H','P','Q','-','T','r','u','s','t','E','n','t','r','y','-','v','1', 0x00 };
+    private static uint8[] v2_prefix() {
+        return { 'X','3','D','H','P','Q','-','T','r','u','s','t','E','n','t','r','y','-','v','2', 0x00 };
     }
 
     public uint8[] signed_part() {
-        uint8[] PREFIX = v1_prefix();
+        uint8[] PREFIX = v2_prefix();
         uint8[] dc_bytes = dc.marshal();
-        int size = PREFIX.length + 1 + 4 + 2 + dc_bytes.length + 8 + 4 + parents.size * 32 + 4 + 32 + 8;
+        int size = PREFIX.length + 1 + 4 + 2 + dc_bytes.length + 4 + 64 + 8;
         uint8[] buf = new uint8[size];
         int off = 0;
         Memory.copy(buf, PREFIX, PREFIX.length);
@@ -80,15 +78,9 @@ public class TrustEntry : Object {
             Memory.copy((uint8*) buf + off, dc_bytes, dc_bytes.length);
             off += dc_bytes.length;
         }
-        put_u64(buf, ref off, lamport);
-        put_u32(buf, ref off, (uint32) parents.size);
-        foreach (Bytes p in parents) {
-            Memory.copy((uint8*) buf + off, p.get_data(), 32);
-            off += 32;
-        }
         put_u32(buf, ref off, author_device_id);
-        Memory.copy((uint8*) buf + off, author_dc_hash, 32);
-        off += 32;
+        Memory.copy((uint8*) buf + off, author_dc_hash, 64);
+        off += 64;
         put_u64(buf, ref off, (uint64) timestamp);
         return buf;
     }
@@ -109,9 +101,9 @@ public class TrustEntry : Object {
 
     public uint8[] compute_hash() {
         try {
-            return bytes_to_uint8_array(global::X3dhpq.Crypto.sha256(new Bytes(marshal())));
+            return bytes_to_uint8_array(global::X3dhpq.Crypto.sha512(new Bytes(marshal())));
         } catch (GLib.Error e) {
-            return new uint8[32];
+            return new uint8[64];
         }
     }
 
@@ -119,16 +111,16 @@ public class TrustEntry : Object {
         return hex_of(compute_hash());
     }
 
-    public static bool is_v1(uint8[] b) {
-        uint8[] PREFIX = v1_prefix();
+    public static bool is_v2(uint8[] b) {
+        uint8[] PREFIX = v2_prefix();
         if (b.length < PREFIX.length) return false;
         for (int i = 0; i < PREFIX.length; i++) if (b[i] != PREFIX[i]) return false;
         return true;
     }
 
     public static TrustEntry? unmarshal(uint8[] b) {
-        uint8[] PREFIX = v1_prefix();
-        int min = PREFIX.length + 1 + 4 + 2 + 8 + 4 + 4 + 32 + 8 + 2 + 2;
+        uint8[] PREFIX = v2_prefix();
+        int min = PREFIX.length + 1 + 4 + 2 + 4 + 64 + 8 + 2 + 2;
         if (b.length < min) return null;
         int off = 0;
         for (int i = 0; i < PREFIX.length; i++) if (b[off + i] != PREFIX[i]) return null;
@@ -148,23 +140,11 @@ public class TrustEntry : Object {
         if (dc == null) return null;
         e.dc = dc;
 
-        if (off + 8 + 4 > b.length) return null;
-        e.lamport = get_u64(b, ref off);
-        int64 pc64 = (int64) get_u32(b, ref off);
-        if (pc64 < 0 || pc64 > 4096) return null;
-        int pc = (int) pc64;
-        if ((int64) off + (int64) pc * 32 + 4 + 32 + 8 + 2 + 2 > (int64) b.length) return null;
-        e.parents = new Gee.ArrayList<Bytes>();
-        for (int i = 0; i < pc; i++) {
-            uint8[] p = new uint8[32];
-            Memory.copy(p, (uint8*) b + off, 32);
-            off += 32;
-            e.parents.add(new Bytes(p));
-        }
+        if ((int64) off + 4 + 64 + 8 + 2 + 2 > (int64) b.length) return null;
         e.author_device_id = get_u32(b, ref off);
-        e.author_dc_hash = new uint8[32];
-        Memory.copy(e.author_dc_hash, (uint8*) b + off, 32);
-        off += 32;
+        e.author_dc_hash = new uint8[64];
+        Memory.copy(e.author_dc_hash, (uint8*) b + off, 64);
+        off += 64;
         e.timestamp = (int64) get_u64(b, ref off);
 
         if (off + 2 > b.length) return null;
@@ -208,17 +188,17 @@ public class TrustManifest : Object {
     public AccountIdentityPub aik { get; set; }
     public Gee.ArrayList<TrustEntry> entries { get; set; default = new Gee.ArrayList<TrustEntry>(); }
     public uint64 version { get; set; }
-    public uint8[] prev_hash { get; set; default = new uint8[32]; }  // 32 bytes, zeros at genesis
+    public uint8[] prev_hash { get; set; default = new uint8[64]; }  // 64 bytes (SHA-512), zeros at genesis
     public uint8[] signature { get; set; default = new uint8[0]; }
     public uint8[] mldsa_signature { get; set; default = new uint8[0]; }
 
-    // "X3DHPQ-TrustManifest-v1\0" — 24 bytes, trailing NUL INCLUDED.
-    private static uint8[] v1_prefix() {
-        return { 'X','3','D','H','P','Q','-','T','r','u','s','t','M','a','n','i','f','e','s','t','-','v','1', 0x00 };
+    // "X3DHPQ-TrustManifest-v2\0" — 24 bytes, trailing NUL INCLUDED.
+    private static uint8[] v2_prefix() {
+        return { 'X','3','D','H','P','Q','-','T','r','u','s','t','M','a','n','i','f','e','s','t','-','v','2', 0x00 };
     }
 
     public uint8[] signed_part() {
-        uint8[] PREFIX = v1_prefix();
+        uint8[] PREFIX = v2_prefix();
         uint8[] aik_bytes = aik.marshal();
         int ph_len = prev_hash.length;
 
@@ -276,9 +256,9 @@ public class TrustManifest : Object {
 
     public uint8[] compute_hash() {
         try {
-            return bytes_to_uint8_array(global::X3dhpq.Crypto.sha256(new Bytes(marshal())));
+            return bytes_to_uint8_array(global::X3dhpq.Crypto.sha512(new Bytes(marshal())));
         } catch (GLib.Error e) {
-            return new uint8[32];
+            return new uint8[64];
         }
     }
 
@@ -286,17 +266,16 @@ public class TrustManifest : Object {
         return hex_of(compute_hash());
     }
 
-    // §B: sign the manifest HEAD (signed_part) with the PUBLISHING device's DIK.
-    // Both hybrid halves are set; the signer must be a device present in the fold
-    // (verified separately by verify_head at the receiver). The signed input is
-    // the Phase-1 KAT-locked signed_part, so this is interop-stable.
+    // Sign the manifest HEAD (signed_part) with the PUBLISHING device's DIK. Both
+    // hybrid halves are set; the signer must be a device present in the fold
+    // (verified separately by verify_head at the receiver).
     public void sign_head(Bytes dik_priv_ed, Bytes dik_priv_mldsa) throws GLib.Error {
         uint8[] sp = signed_part();
         signature = bytes_to_uint8_array(global::X3dhpq.Crypto.ed25519_sign(dik_priv_ed, new Bytes(sp)));
         mldsa_signature = bytes_to_uint8_array(global::X3dhpq.Crypto.mldsa65_sign(dik_priv_mldsa, new Bytes(sp)));
     }
 
-    // §B: verify the head signature under a candidate device's DIK public halves.
+    // Verify the head signature under a candidate device's DIK public halves.
     // BOTH Ed25519 and ML-DSA-65 must verify over signed_part(). Never throws.
     public bool verify_head(Bytes dik_pub_ed, Bytes dik_pub_mldsa) {
         if (signature.length == 0 || mldsa_signature.length == 0) return false;
@@ -309,15 +288,15 @@ public class TrustManifest : Object {
         }
     }
 
-    public static bool is_v1(uint8[] b) {
-        uint8[] PREFIX = v1_prefix();
+    public static bool is_v2(uint8[] b) {
+        uint8[] PREFIX = v2_prefix();
         if (b.length < PREFIX.length) return false;
         for (int i = 0; i < PREFIX.length; i++) if (b[i] != PREFIX[i]) return false;
         return true;
     }
 
     public static TrustManifest? unmarshal(uint8[] b) {
-        uint8[] PREFIX = v1_prefix();
+        uint8[] PREFIX = v2_prefix();
         int min = PREFIX.length + 8 + 4 + 2 + 4 + 2 + 2;
         if (b.length < min) return null;
         int off = 0;
@@ -374,76 +353,63 @@ public class TrustManifest : Object {
     }
 
     // -------------------------------------------------------------------------
-    // Fold / walk: derive trusted \ removed = { device_id -> DeviceCertificate }.
-    // Mirrors DeviceDag.canonical_order + fold, with the DELEGATION authorization
-    // rule (author must be already trusted; entry verifies under the author's DIK).
+    // Fold (v2, snapshot): derive trusted = { device_id -> DeviceCertificate }.
+    //  1. Identify the GENESIS entry (self-authored ADD whose entry sig AND
+    //     embedded DC both verify under the account AIK). Exactly one expected;
+    //     none valid ⇒ empty fold (reject).
+    //  2. Accept remaining ADD entries, ordered by ascending device_id, whose
+    //     author is the genesis device, author_dc_hash == SHA-512(genesis DC),
+    //     the entry sig verifies under the genesis DC's DIK, and dc.device_id ==
+    //     device_id. A bad entry is dropped (that one), never fatal.
+    // No lamport/parents/topo-sort, no REMOVE/removal-wins: a revoked device is
+    // simply absent from the snapshot.
     // Keyed by device_id's base-10 string form (Gee generics prefer string keys).
     // -------------------------------------------------------------------------
 
     public Gee.HashMap<string, DeviceCertificate> fold() {
         var trusted = new Gee.HashMap<string, DeviceCertificate>();
-        var removed = new Gee.HashSet<string>();
-        var removal_node = new Gee.HashMap<string, string>();   // device_id_str -> removal entry hash
+        if (aik == null) return trusted;
 
-        // Build store: entry_hash_hex -> entry.
-        var store = new Gee.HashMap<string, TrustEntry>();
+        // 1. Identify the genesis entry (first valid one in list order).
+        TrustEntry? genesis = null;
         foreach (TrustEntry e in entries) {
-            store.set(e.hash_hex(), e);
-        }
-
-        var order = canonical_order(store);
-        if (order.size == 0) return trusted;
-
-        for (int i = 0; i < order.size; i++) {
-            TrustEntry e = order.get(i);
-            string subject_key = e.device_id.to_string();
-            string author_key = e.author_device_id.to_string();
-
-            if (i == 0) {
-                // Genesis: ADD, no parents, author==subject, sig+dc verify under AIK.
-                if (e.action != TrustEntry.ACTION_ADD) return trusted;
-                if (e.parents.size != 0) return trusted;
-                if (e.author_device_id != e.device_id) return trusted;
-                if (e.dc.device_id != e.device_id) return trusted;
-                if (!verify_entry_sig(e, new Bytes(aik.pub_ed25519), new Bytes(aik.pub_mldsa))) return trusted;
-                bool dc_ok;
-                try {
-                    dc_ok = e.dc.verify(new Bytes(aik.pub_ed25519), new Bytes(aik.pub_mldsa));
-                } catch (GLib.Error err) { return trusted; }
-                if (!dc_ok) return trusted;
-                trusted.set(subject_key, e.dc);
-                continue;
-            }
-
-            // Later entry: authorized under the author device's (trusted) DIK.
-            if (!trusted.has_key(author_key) || removed.contains(author_key)) continue;
-            DeviceCertificate author_dc = trusted.get(author_key);
-
-            uint8[] expected_author_hash;
-            try {
-                expected_author_hash = bytes_to_uint8_array(
-                    global::X3dhpq.Crypto.sha256(new Bytes(author_dc.marshal())));
-            } catch (GLib.Error err) { continue; }
-            if (!byte_eq(e.author_dc_hash, expected_author_hash)) continue;
-
-            if (!verify_entry_sig(e, author_dc.dik_pub_ed25519, author_dc.dik_pub_mldsa)) continue;
+            if (e.action != TrustEntry.ACTION_ADD) continue;
+            if (e.author_device_id != e.device_id) continue;
             if (e.dc.device_id != e.device_id) continue;
-
-            switch (e.action) {
-                case TrustEntry.ACTION_ADD:
-                    if (!can_readd(removed, removal_node, store, subject_key, e)) break;
-                    trusted.set(subject_key, e.dc);
-                    removed.remove(subject_key);
-                    break;
-                case TrustEntry.ACTION_REMOVE:
-                    trusted.unset(subject_key);
-                    removed.add(subject_key);
-                    removal_node.set(subject_key, e.hash_hex());
-                    break;
-            }
+            if (!verify_entry_sig(e, new Bytes(aik.pub_ed25519), new Bytes(aik.pub_mldsa))) continue;
+            bool dc_ok;
+            try {
+                dc_ok = e.dc.verify(new Bytes(aik.pub_ed25519), new Bytes(aik.pub_mldsa));
+            } catch (GLib.Error err) { continue; }
+            if (!dc_ok) continue;
+            genesis = e;
+            break;
         }
+        if (genesis == null) return trusted;
+        TrustEntry g = (!) genesis;
+        uint32 genesis_id = g.device_id;
+        trusted.set(genesis_id.to_string(), g.dc);
 
-        // Result already excludes removed device_ids (unset on REMOVE / not re-added).
+        uint8[] genesis_dc_hash;
+        try {
+            genesis_dc_hash = bytes_to_uint8_array(global::X3dhpq.Crypto.sha512(new Bytes(g.dc.marshal())));
+        } catch (GLib.Error err) { return trusted; }
+
+        // 2. Remaining entries ordered by ascending (unsigned) device_id.
+        var rest = new Gee.ArrayList<TrustEntry>();
+        foreach (TrustEntry e in entries) {
+            if (e == g) continue;
+            rest.add(e);
+        }
+        rest.sort((a, b) => (a.device_id < b.device_id) ? -1 : (a.device_id > b.device_id ? 1 : 0));
+        foreach (TrustEntry e in rest) {
+            if (e.action != TrustEntry.ACTION_ADD) continue;
+            if (e.author_device_id != genesis_id) continue;
+            if (e.dc.device_id != e.device_id) continue;
+            if (!byte_eq(e.author_dc_hash, genesis_dc_hash)) continue;
+            if (!verify_entry_sig(e, g.dc.dik_pub_ed25519, g.dc.dik_pub_mldsa)) continue;
+            trusted.set(e.device_id.to_string(), e.dc);
+        }
         return trusted;
     }
 
@@ -456,107 +422,6 @@ public class TrustManifest : Object {
         } catch (GLib.Error err) {
             return false;
         }
-    }
-
-    private Gee.ArrayList<TrustEntry> canonical_order(Gee.HashMap<string, TrustEntry> store) {
-        var includable = new Gee.HashSet<string>();
-        bool changed = true;
-        while (changed) {
-            changed = false;
-            foreach (var en in store.entries) {
-                if (includable.contains(en.key)) continue;
-                bool all = true;
-                foreach (Bytes p in en.value.parents) {
-                    string ph = hex_of(p.get_data());
-                    if (!store.has_key(ph) || !includable.contains(ph)) { all = false; break; }
-                }
-                if (all) { includable.add(en.key); changed = true; }
-            }
-        }
-        var indeg = new Gee.HashMap<string, int>();
-        var children = new Gee.HashMap<string, Gee.ArrayList<string>>();
-        foreach (string h in includable) indeg.set(h, 0);
-        foreach (string h in includable) {
-            TrustEntry e = store.get(h);
-            int d = 0;
-            foreach (Bytes p in e.parents) {
-                string ph = hex_of(p.get_data());
-                if (includable.contains(ph)) {
-                    d++;
-                    if (!children.has_key(ph)) children.set(ph, new Gee.ArrayList<string>());
-                    children.get(ph).add(h);
-                }
-            }
-            indeg.set(h, d);
-        }
-        var ready = new Gee.ArrayList<string>();
-        foreach (string h in includable) if (indeg.get(h) == 0) ready.add(h);
-        var order = new Gee.ArrayList<TrustEntry>();
-        while (ready.size > 0) {
-            ready.sort((a, b) => cmp_key(store.get(a), store.get(b)));
-            string h = ready.remove_at(0);
-            order.add(store.get(h));
-            if (children.has_key(h)) {
-                foreach (string c in children.get(h)) {
-                    indeg.set(c, indeg.get(c) - 1);
-                    if (indeg.get(c) == 0) ready.add(c);
-                }
-            }
-        }
-        return order;
-    }
-
-    // cmp_key: (1) lamport ascending unsigned; (2) author_device_id ascending
-    // unsigned 32-bit; (3) lowercase-hex(entry_hash) strcmp.
-    private static int cmp_key(TrustEntry a, TrustEntry b) {
-        if (a.lamport != b.lamport) return a.lamport < b.lamport ? -1 : 1;
-        if (a.author_device_id != b.author_device_id) return a.author_device_id < b.author_device_id ? -1 : 1;
-        return strcmp(a.hash_hex(), b.hash_hex());
-    }
-
-    private bool can_readd(Gee.HashSet<string> removed, Gee.HashMap<string, string> removal_node,
-                           Gee.HashMap<string, TrustEntry> store, string idk, TrustEntry add_entry) {
-        if (!removed.contains(idk)) return true;
-        string? rn = removal_node.get(idk);
-        if (rn == null) return true;
-        return is_ancestor(store, rn, add_entry);
-    }
-
-    private bool is_ancestor(Gee.HashMap<string, TrustEntry> store, string ancestor_hex, TrustEntry descendant) {
-        var seen = new Gee.HashSet<string>();
-        var stack = new Gee.ArrayList<string>();
-        foreach (Bytes p in descendant.parents) stack.add(hex_of(p.get_data()));
-        while (stack.size > 0) {
-            string h = stack.remove_at(stack.size - 1);
-            if (h == ancestor_hex) return true;
-            if (seen.contains(h)) continue;
-            seen.add(h);
-            TrustEntry? pe = store.get(h);
-            if (pe != null) foreach (Bytes pp in pe.parents) stack.add(hex_of(pp.get_data()));
-        }
-        return false;
-    }
-
-    // Heads of the current DAG (entries with no present child) — the parents for
-    // the next authored entry. Returns raw 32-byte SHA-256(marshal) hashes.
-    public Gee.ArrayList<Bytes> current_heads() {
-        var has_child = new Gee.HashSet<string>();
-        var by_hash = new Gee.HashMap<string, TrustEntry>();
-        foreach (TrustEntry e in entries) by_hash.set(e.hash_hex(), e);
-        foreach (TrustEntry e in entries) {
-            foreach (Bytes p in e.parents) has_child.add(hex_of(p.get_data()));
-        }
-        var heads = new Gee.ArrayList<Bytes>();
-        foreach (var en in by_hash.entries) {
-            if (!has_child.contains(en.key)) heads.add(new Bytes(en.value.compute_hash()));
-        }
-        return heads;
-    }
-
-    public uint64 next_lamport() {
-        uint64 m = 0;
-        foreach (TrustEntry e in entries) if (e.lamport > m) m = e.lamport;
-        return entries.size == 0 ? 0 : m + 1;
     }
 
     private static bool byte_eq(uint8[] a, uint8[] b) {

@@ -981,13 +981,14 @@ public class StreamModule : XmppStreamModule {
     // Trust Manifest (Phase 2): the LIVE trust source.
     // ==================================================================
 
-    // Local raw-bytes SHA-256 helper (returns zeros on failure — callers treat a
-    // zero hash as a non-match, which fails closed).
-    private uint8[] manifest_sha256(uint8[] data) {
+    // Local raw-bytes SHA-512 helper (Trust Manifest wire v2 — all manifest hashes
+    // are SHA-512). Returns 64 zero bytes on failure — callers treat a zero hash as
+    // a non-match, which fails closed.
+    private uint8[] manifest_sha512(uint8[] data) {
         try {
-            return bytes_to_uint8_array(global::X3dhpq.Crypto.sha256(new Bytes(data)));
+            return bytes_to_uint8_array(global::X3dhpq.Crypto.sha512(new Bytes(data)));
         } catch (GLib.Error e) {
-            return new uint8[32];
+            return new uint8[64];
         }
     }
 
@@ -997,17 +998,16 @@ public class StreamModule : XmppStreamModule {
         return true;
     }
 
-    // Build + hybrid-sign a TrustEntry under the given signer private halves.
+    // Build + hybrid-sign a TrustEntry (wire v2 — no lamport/parents) under the
+    // given signer private halves.
     private Protocol.TrustEntry build_signed_trust_entry(uint8 action, uint32 device_id,
-            Protocol.DeviceCertificate dc, uint64 lamport, Gee.ArrayList<Bytes> parents,
-            uint32 author_id, uint8[] author_dc_hash, Bytes signer_ed_priv, Bytes signer_ml_priv)
+            Protocol.DeviceCertificate dc, uint32 author_id, uint8[] author_dc_hash,
+            Bytes signer_ed_priv, Bytes signer_ml_priv)
             throws GLib.Error {
         var e = new Protocol.TrustEntry();
         e.action = action;
         e.device_id = device_id;
         e.dc = dc;
-        e.lamport = lamport;
-        e.parents = parents;
         e.author_device_id = author_id;
         e.author_dc_hash = author_dc_hash;
         e.timestamp = (int64) new DateTime.now_utc().to_unix();
@@ -1317,7 +1317,7 @@ public class StreamModule : XmppStreamModule {
                 var members = fold_members((!) local_m);
                 if (members.size > 0 && ((!) local_m).entries.size > members.size) {
                     try {
-                        uint8[] ph = manifest_sha256(((!) local_m).marshal());
+                        uint8[] ph = manifest_sha512(((!) local_m).marshal());
                         var snap = build_snapshot_manifest(members, ((!) local_m).version + 1, ph);
                         verify_and_apply_manifest(account.bare_jid, snap.marshal());
                         publish_manifest_with_retry.begin(stream, snap);
@@ -1423,7 +1423,7 @@ public class StreamModule : XmppStreamModule {
         string self_cert_b64 = db.ensure_local_device_certificate(account);
         Protocol.DeviceCertificate? self_dc = Protocol.DeviceCertificate.unmarshal(bytes_from_base64(self_cert_b64));
         if (self_dc == null) throw new IOError.FAILED("cannot decode self genesis DC");
-        uint8[] self_dc_hash = manifest_sha256(((!) self_dc).marshal());
+        uint8[] self_dc_hash = manifest_sha512(((!) self_dc).marshal());
 
         var aik_pub = new Protocol.AccountIdentityPub();
         aik_pub.pub_ed25519 = bytes_to_uint8_array(aik_pub_ed);
@@ -1436,7 +1436,7 @@ public class StreamModule : XmppStreamModule {
 
         // Genesis entry (AIK-signed): this device roots the snapshot.
         var genesis = build_signed_trust_entry(Protocol.TrustEntry.ACTION_ADD, self_id, (!) self_dc,
-            0, new Gee.ArrayList<Bytes>(), self_id, self_dc_hash, aik_priv_ed, aik_priv_ml);
+            self_id, self_dc_hash, aik_priv_ed, aik_priv_ml);
         m.entries.add(genesis);
 
         // One DIK-signed ADD per OTHER current member (DC re-issued under this device's DIK).
@@ -1447,7 +1447,7 @@ public class StreamModule : XmppStreamModule {
                 e.key, odc.dik_pub_ed25519, odc.dik_pub_x25519, odc.dik_pub_mldsa,
                 dik_priv_ed, dik_priv_ml, odc.flags);
             var add = build_signed_trust_entry(Protocol.TrustEntry.ACTION_ADD, e.key, reissued,
-                m.next_lamport(), m.current_heads(), self_id, self_dc_hash, dik_priv_ed, dik_priv_ml);
+                self_id, self_dc_hash, dik_priv_ed, dik_priv_ml);
             m.entries.add(add);
         }
 
@@ -1486,7 +1486,7 @@ public class StreamModule : XmppStreamModule {
         }
         uint64 version = force_version > 0 ? force_version
                                            : (uint64) (db.get_device_list_version(account, own_bare) + 1);
-        var m = build_snapshot_manifest(members, version, new uint8[32]);
+        var m = build_snapshot_manifest(members, version, new uint8[64]);
         verify_and_apply_manifest(account.bare_jid, m.marshal());
         publish_manifest_with_retry.begin(stream, m);
     }
@@ -1525,7 +1525,7 @@ public class StreamModule : XmppStreamModule {
         var members = (m != null) ? fold_members((!) m)
                                   : new Gee.HashMap<uint32, Protocol.DeviceCertificate>();
         uint64 base_ver = (m != null) ? ((!) m).version : 0;
-        uint8[] prev_hash = (m != null) ? manifest_sha256(((!) m).marshal()) : new uint8[32];
+        uint8[] prev_hash = (m != null) ? manifest_sha512(((!) m).marshal()) : new uint8[64];
         members.set(newcomer_dc.device_id, newcomer_dc);
         try {
             var snap = build_snapshot_manifest(members, base_ver + 1, prev_hash);
@@ -1564,7 +1564,7 @@ public class StreamModule : XmppStreamModule {
             return true;
         }
         members.unset(target_device_id);
-        uint8[] prev_hash = manifest_sha256(((!) m).marshal());
+        uint8[] prev_hash = manifest_sha512(((!) m).marshal());
         try {
             var snap = build_snapshot_manifest(members, ((!) m).version + 1, prev_hash);
             bool applied = verify_and_apply_manifest(account.bare_jid, snap.marshal());
