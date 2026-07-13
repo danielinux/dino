@@ -433,13 +433,15 @@ public class PairNewDeviceDialog : Gtk.Window {
                 completion_fired = true;
                 set_status("Done");
                 pairing_completed((!) ((!) existing).get_issued_cert());
-                // Deferred reconciliation: the cert is issued+sent and the manifest ADD is
-                // being appended/published in the BACKGROUND (publish-retry + connect
-                // reconcile). Don't hold the dialog open waiting for the losable final ACK —
-                // close after a short grace during which arm_pair_resend keeps retransmitting
-                // the issuance payload so the newcomer reliably receives it. Membership
-                // converges via the manifest, not this dialog.
-                Timeout.add_seconds(6, () => { finish_dialog(); return false; });
+                // Deferred reconciliation applies to MEMBERSHIP only (the manifest ADD is
+                // appended/published in the background). But the issuance payload — the
+                // message carrying the newcomer's cert — MUST reach the responder, so we keep
+                // arm_pair_resend retransmitting it until the ACK confirms receipt (finish_
+                // dialog fires from the is_done branch) or a generous fallback window elapses.
+                // The earlier 6s was far too short for the lossy same-account path: Dino went
+                // quiet before PQ got its cert and PQ waited forever. 30s @ 1.5s resend ≈ 20
+                // retransmits — reliable delivery — while still bounding a truly stuck close.
+                Timeout.add_seconds(30, () => { finish_dialog(); return false; });
             }
             if (((!) existing).is_done()) {
                 if (!completion_fired) {
