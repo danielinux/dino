@@ -921,10 +921,21 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             } catch (Xmpp.InvalidJidError err) { }
         }
 
+        // Include our own bare JID so this account's SIBLING devices (same AIK,
+        // different device_id) also receive the sender-chain announcement over
+        // the 1:1 channel — mirrors the 1:1 self-fanout. The inner per-device
+        // loop below still skips THIS device. Without this, siblings never get
+        // our group recv chain and silently drop our group messages.
+        {
+            bool own_present = false;
+            foreach (Jid r in recipients) { if (r.equals_bare(conversation.account.bare_jid)) { own_present = true; break; } }
+            if (!own_present) recipients.add(conversation.account.bare_jid);
+        }
+
+        int? local_device_id = db.get_local_device_id(conversation.account);
         StreamModule? module = app.stream_interactor.module_manager.get_module(conversation.account, StreamModule.IDENTITY);
         int sent = 0;
         foreach (Jid occ in recipients) {
-            if (occ.equals_bare(conversation.account.bare_jid)) continue;
             // Never hand a freshly rotated sender chain to a member we just
             // removed (epoch rotation would be pointless otherwise).
             if (exclude_bare != null && occ.equals_bare((!) exclude_bare)) continue;
@@ -937,6 +948,12 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                 continue;
             }
             foreach (int device_id in device_ids) {
+                // Skip only THIS device — a sender never announces to itself.
+                // Own-account siblings (same bare jid, different device_id) are
+                // NOT skipped: they need our recv chain.
+                if (occ.equals_bare(conversation.account.bare_jid)
+                        && local_device_id != null
+                        && device_id == (int) (!) local_device_id) continue;
                 string key = "%s/%d".printf(peer_bare, device_id);
                 Protocol.PeerBundle? bundle = db.get_remote_bundle(conversation.account, peer_bare, device_id);
                 if (bundle == null || !bundle.verify()) {
@@ -1502,18 +1519,22 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         uint8[] aik_mldsa = bytes_to_uint8_array(db.get_local_identity_bytes(conversation.account, db.account_identity.aik_pub_mldsa_base64));
         uint8[] canonical_aik = Manager.build_canonical_aik_bytes_static(aik_ed, aik_mldsa);
 
-        // MUC echoes our own groupchat messages back to us. We don't have a
-        // recv chain for ourselves (we have the send chain), so attempting
-        // to decrypt would always fail with "no recv chain". Skip silently
-        // — the local UI already shows the message from when we sent it.
+        // Compute our own account fingerprint once; reused below to attribute a
+        // sibling's group message as our own outgoing.
+        string my_fp = "";
         try {
-            string my_fp = account_fingerprint(new Bytes(aik_ed), new Bytes(aik_mldsa));
-            if (my_fp == sender_aik_fp) {
-                return false;
-            }
+            my_fp = account_fingerprint(new Bytes(aik_ed), new Bytes(aik_mldsa));
         } catch (Error e) {
-            // fall through; worst case is a "no recv chain" warning we
-            // already saw before this guard.
+            // leave my_fp empty; the guard below simply won't match.
+        }
+        // MUC echoes THIS device's own groupchat messages back to us. We don't
+        // have a recv chain for ourselves (we have the send chain), so decrypt
+        // would always fail with "no recv chain". Suppress ONLY this device's own
+        // reflection — the local UI already shows it from when we sent it. A
+        // SIBLING device (same AIK, different device_id) falls through and is
+        // decrypted normally via the recv chain announced over the 1:1 channel.
+        if (my_fp == sender_aik_fp && hdr.sender_device_id == (uint32) (!) local_device_id) {
+            return false;
         }
 
         Protocol.GroupSession? gs = db.load_group_session(conversation.account, room_jid_str, canonical_aik, (uint32)(!) local_device_id);
@@ -1533,6 +1554,17 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             db.store_group_session(conversation.account, room_jid_str, gs);
             message.body = (string) plaintext;
             message.encryption = Encryption.X3DHPQ;
+            // If this group message was authored by one of our OWN account's
+            // devices — given the Gap-2 guard above, necessarily a SIBLING, not
+            // this device — render it as our own outgoing message and attribute
+            // the authoring device ("from Device N", task #45 infra).
+            if (my_fp == sender_aik_fp) {
+                message.direction = Dino.Entities.Message.DIRECTION_SENT;
+                message.real_jid = conversation.account.bare_jid;
+                if (message.stanza_id != null) {
+                    db.store_message_source_device(conversation.account, (!) message.stanza_id, (int) hdr.sender_device_id);
+                }
+            }
             return true;
         } catch (GLib.Error e) {
             warning("x3dhpq group decrypt failed from %s in %s: %s", sender_aik_fp, room_jid_str, e.message);

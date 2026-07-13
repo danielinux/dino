@@ -24,12 +24,15 @@ public class EncryptionListEntry : Plugins.EncryptionListEntry, Object {
         return "dino-security-high-symbolic";
     }
 
-    // Attribute a 1:1 message that was authored by ANOTHER of the user's own
-    // devices (same bare JID, different x3dhpq device id) with the local device
-    // label. Recorded at decrypt time in the plugin DB, keyed by stanza id.
+    // Attribute a message (1:1 or group/MUC) that was authored by ANOTHER of the
+    // user's own devices (same bare JID, different x3dhpq device id) with the
+    // local device label. Recorded at decrypt time in the plugin DB, keyed by
+    // stanza id. The lookup is purely by stanza id and self-suppresses when the
+    // source is this device, so it works uniformly for both conversation types.
     public string? get_message_attribution(Entities.Conversation conversation, ContentItem content_item) {
         if (content_item.encryption != encryption) return null;
-        if (conversation.type_ != Conversation.Type.CHAT) return null;
+        if (conversation.type_ != Conversation.Type.CHAT
+                && conversation.type_ != Conversation.Type.GROUPCHAT) return null;
         MessageItem? message_item = content_item as MessageItem;
         if (message_item == null) return null;
         string? stanza_id = message_item.message.stanza_id;
