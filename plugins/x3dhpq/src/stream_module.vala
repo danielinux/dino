@@ -1090,10 +1090,13 @@ public class StreamModule : XmppStreamModule {
     // so peers converge, not silently leave the server behind. Backs off across attempts;
     // if all fail, the next connect's reconcile (ensure_trust_manifest) republishes.
     private async void publish_manifest_with_retry(XmppStream stream, Protocol.TrustManifest m) {
-        uint[] delays = { 0, 3000, 6000, 12000, 20000 };
+        // The manifest is a large PEP item (~19-25 KB) and the publish round-trip was
+        // measured at ~15s over this link, so the per-attempt timeout MUST exceed that
+        // (a 12s timeout gave up before the publish completed and retried forever).
+        uint[] delays = { 0, 5000, 10000, 20000, 40000 };
         for (int i = 0; i < delays.length; i++) {
             if (delays[i] > 0) yield nap(delays[i]);
-            if (yield publish_blob_with_timeout(stream, m, 12000)) {
+            if (yield publish_blob_with_timeout(stream, m, 45000)) {
                 return; // server confirmed
             }
             warning("publish_manifest_with_retry: version %llu for %s not confirmed (attempt %d) — retrying",
@@ -1120,8 +1123,9 @@ public class StreamModule : XmppStreamModule {
         });
         // Bound the fetch: request() rides send_iq (no timeout), so a lost RESPONSE would
         // hang the caller forever. On timeout resolve to null ("unknown") — callers fall
-        // back to the local cache / retry, never block.
-        Timeout.add(10000, () => {
+        // back to the local cache / retry, never block. Generous (the manifest is a large
+        // ~19-25 KB item) so a merely-slow fetch is not mistaken for absence.
+        Timeout.add(20000, () => {
             if (settled) return false;
             settled = true;
             promise.set_value(null);
