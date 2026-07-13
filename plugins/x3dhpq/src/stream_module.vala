@@ -1084,26 +1084,52 @@ public class StreamModule : XmppStreamModule {
         }
     }
 
+    private Protocol.TrustManifest? pending_publish = null;
+    private bool publish_loop_running = false;
+
     // Publish the manifest to the server (the AUTHORITATIVE shared copy) with retry until
-    // the server confirms the write (publish ACK). The caller already wrote the LOCAL cache
-    // for durability, but the shared object lives on the server: a lost ACK must be retried
-    // so peers converge, not silently leave the server behind. Backs off across attempts;
-    // if all fail, the next connect's reconcile (ensure_trust_manifest) republishes.
+    // confirmed. SINGLE-FLIGHT + LATEST-ONLY: only one publish loop ever runs, and it always
+    // targets the newest version. A newer edit/compaction/reconcile SUPERSEDES an in-flight
+    // attempt (updating the shared slot) instead of spawning a second competing loop — the
+    // old behaviour (fire-and-forget begin() per edit) piled up many concurrent loops all
+    // pushing stale versions, hammering the server and never converging. If a round fails we
+    // give up and let the next connect's reconcile retry, so we never accumulate loops.
     private async void publish_manifest_with_retry(XmppStream stream, Protocol.TrustManifest m) {
-        // The manifest is a large PEP item (~19-25 KB) and the publish round-trip was
-        // measured at ~15s over this link, so the per-attempt timeout MUST exceed that
-        // (a 12s timeout gave up before the publish completed and retried forever).
+        if (pending_publish == null || m.version > ((!) pending_publish).version) {
+            pending_publish = m;
+        }
+        if (publish_loop_running) return;   // the running loop will pick up the newest
+        publish_loop_running = true;
+
         uint[] delays = { 0, 5000, 10000, 20000, 40000 };
-        for (int i = 0; i < delays.length; i++) {
-            if (delays[i] > 0) yield nap(delays[i]);
-            if (yield publish_blob_with_timeout(stream, m, 45000)) {
-                return; // server confirmed
+        int attempt = 0;
+        while (pending_publish != null) {
+            Protocol.TrustManifest target = (!) pending_publish;
+            if (attempt > 0 && attempt < delays.length) yield nap(delays[attempt]);
+            bool ok = yield publish_blob_with_timeout(stream, target, 45000);
+            // Superseded by a newer version while we were publishing → restart on the newest.
+            if (pending_publish != null && ((!) pending_publish).version > target.version) {
+                attempt = 0;
+                continue;
+            }
+            if (ok) {
+                if (pending_publish != null && ((!) pending_publish).version == target.version) {
+                    pending_publish = null;   // latest confirmed → loop exits
+                }
+                attempt = 0;
+                continue;
+            }
+            attempt++;
+            if (attempt >= delays.length) {
+                warning("publish_manifest_with_retry: version %llu for %s NOT confirmed after retries; will reconcile on next connect",
+                    target.version, account.bare_jid.to_string());
+                pending_publish = null;   // drop; reconcile handles it later
+                break;
             }
             warning("publish_manifest_with_retry: version %llu for %s not confirmed (attempt %d) — retrying",
-                m.version, account.bare_jid.to_string(), i + 1);
+                target.version, account.bare_jid.to_string(), attempt);
         }
-        warning("publish_manifest_with_retry: version %llu for %s NOT confirmed after retries; will reconcile on next connect",
-            m.version, account.bare_jid.to_string());
+        publish_loop_running = false;
     }
 
     // §A fetch helper: fetch owner `jid`'s current manifest (own or a contact).
