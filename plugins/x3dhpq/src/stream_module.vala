@@ -1282,6 +1282,27 @@ public class StreamModule : XmppStreamModule {
         // genesis while a local manifest exists.
         if (db.get_trust_manifest_version(account, own_bare) >= 0) {
             Protocol.TrustManifest? local_m = load_local_manifest(own_bare);
+            // COMPACTION: a compact snapshot has exactly one entry per current member. If our
+            // local manifest carries MORE entries than members (accumulated history from the
+            // append-only era, or churn) and we hold AIK_priv, rebuild a fresh compact snapshot
+            // of the current fold and publish it (version+1). This bounds size without needing
+            // an edit and lets a once-bloated manifest self-heal on connect.
+            if (local_m != null && db.has_local_aik_priv(account)) {
+                var members = fold_members((!) local_m);
+                if (members.size > 0 && ((!) local_m).entries.size > members.size) {
+                    try {
+                        uint8[] ph = manifest_sha256(((!) local_m).marshal());
+                        var snap = build_snapshot_manifest(members, ((!) local_m).version + 1, ph);
+                        verify_and_apply_manifest(account.bare_jid, snap.marshal());
+                        publish_manifest_with_retry.begin(stream, snap);
+                        warning("ensure_trust_manifest: compacted manifest %d entries → %d members (version %llu)",
+                            ((!) local_m).entries.size, members.size, snap.version);
+                        return;
+                    } catch (GLib.Error e) {
+                        warning("ensure_trust_manifest: compaction failed: %s", e.message);
+                    }
+                }
+            }
             Protocol.TrustManifest? srv = yield fetch_trust_manifest(stream, account.bare_jid);
             if (srv != null && local_m != null && ((!) srv).version > ((!) local_m).version) {
                 verify_and_apply_manifest(account.bare_jid, ((!) srv).marshal());   // server ahead → adopt
