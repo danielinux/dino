@@ -52,6 +52,7 @@ public class PairNewDeviceDialog : Gtk.Window {
     // (which is frequently lost on the same-account path) — so the manifest ADD append
     // happens reliably. Guards against double-firing when the ACK later arrives.
     private bool completion_fired = false;
+    private bool dialog_closed = false;
     private Gtk.Entry? code_entry;
     private Gtk.Button? confirm_button;
 
@@ -432,6 +433,13 @@ public class PairNewDeviceDialog : Gtk.Window {
                 completion_fired = true;
                 set_status("Done");
                 pairing_completed((!) ((!) existing).get_issued_cert());
+                // Deferred reconciliation: the cert is issued+sent and the manifest ADD is
+                // being appended/published in the BACKGROUND (publish-retry + connect
+                // reconcile). Don't hold the dialog open waiting for the losable final ACK —
+                // close after a short grace during which arm_pair_resend keeps retransmitting
+                // the issuance payload so the newcomer reliably receives it. Membership
+                // converges via the manifest, not this dialog.
+                Timeout.add_seconds(6, () => { finish_dialog(); return false; });
             }
             if (((!) existing).is_done()) {
                 if (!completion_fired) {
@@ -445,8 +453,7 @@ public class PairNewDeviceDialog : Gtk.Window {
                         pairing_failed("no certificate issued");
                     }
                 }
-                disconnect_signals();
-                close();
+                finish_dialog();
             }
         } catch (Protocol.PairingError.PROTOCOL e) {
             // A stray/duplicate/out-of-order stanza. The FSM checks the message type
@@ -513,7 +520,10 @@ public class PairNewDeviceDialog : Gtk.Window {
     // inbound message (cancel_pair_resend) or when the dialog/timeout tears down.
     private void arm_pair_resend() {
         cancel_pair_resend();
-        pair_resend_id = Timeout.add_seconds(4, () => {
+        // 1.5s (was 4s): on the lossy same-account <pair> path a dropped stanza costs one
+        // resend interval, so a faster cadence materially shortens the handshake. Still slow
+        // enough not to storm (each step is answered or superseded well within a few sends).
+        pair_resend_id = Timeout.add(1500, () => {
             if (last_sent_msg == null || peer_jid == null || existing == null) {
                 pair_resend_id = 0;
                 return false;
@@ -535,6 +545,15 @@ public class PairNewDeviceDialog : Gtk.Window {
             Source.remove(pairing_timeout_id);
             pairing_timeout_id = 0;
         }
+    }
+
+    // Idempotent close: disconnect handlers/timers and dismiss the dialog exactly once
+    // (the completion grace-timer and the ACK path may both reach here).
+    private void finish_dialog() {
+        if (dialog_closed) return;
+        dialog_closed = true;
+        disconnect_signals();
+        close();
     }
 
     private void disconnect_signals() {
