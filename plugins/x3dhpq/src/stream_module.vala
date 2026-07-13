@@ -1055,6 +1055,54 @@ public class StreamModule : XmppStreamModule {
         return ok;
     }
 
+    // Async sleep (does not block the main loop).
+    private async void nap(uint ms) {
+        Timeout.add(ms, () => { nap.callback(); return false; });
+        yield;
+    }
+
+    // publish_trust_manifest_blob bounded by a timeout: returns false if the publish IQ
+    // gets no response within `timeout_ms` (rather than hanging forever on a lost ACK).
+    private async bool publish_blob_with_timeout(XmppStream stream, Protocol.TrustManifest m, uint timeout_ms) {
+        Promise<bool> promise = new Promise<bool>();
+        bool settled = false;
+        publish_trust_manifest_blob.begin(stream, m, (obj, res) => {
+            if (settled) return;
+            settled = true;
+            promise.set_value(publish_trust_manifest_blob.end(res));
+        });
+        Timeout.add(timeout_ms, () => {
+            if (settled) return false;
+            settled = true;
+            promise.set_value(false);
+            return false;
+        });
+        try {
+            return yield promise.future.wait_async();
+        } catch (GLib.Error e) {
+            return false;
+        }
+    }
+
+    // Publish the manifest to the server (the AUTHORITATIVE shared copy) with retry until
+    // the server confirms the write (publish ACK). The caller already wrote the LOCAL cache
+    // for durability, but the shared object lives on the server: a lost ACK must be retried
+    // so peers converge, not silently leave the server behind. Backs off across attempts;
+    // if all fail, the next connect's reconcile (ensure_trust_manifest) republishes.
+    private async void publish_manifest_with_retry(XmppStream stream, Protocol.TrustManifest m) {
+        uint[] delays = { 0, 3000, 6000, 12000, 20000 };
+        for (int i = 0; i < delays.length; i++) {
+            if (delays[i] > 0) yield nap(delays[i]);
+            if (yield publish_blob_with_timeout(stream, m, 12000)) {
+                return; // server confirmed
+            }
+            warning("publish_manifest_with_retry: version %llu for %s not confirmed (attempt %d) — retrying",
+                m.version, account.bare_jid.to_string(), i + 1);
+        }
+        warning("publish_manifest_with_retry: version %llu for %s NOT confirmed after retries; will reconcile on next connect",
+            m.version, account.bare_jid.to_string());
+    }
+
     // §A fetch helper: fetch owner `jid`'s current manifest (own or a contact).
     public async Protocol.TrustManifest? fetch_trust_manifest(XmppStream stream, Jid jid) {
         // Use the framework's tested Pubsub items-fetch (callback-based send_iq via
@@ -1064,8 +1112,20 @@ public class StreamModule : XmppStreamModule {
         // was never built/published) and the revoke path. request()'s listener always
         // fires on a response, delivering a null node when the item/node is absent.
         Promise<Protocol.TrustManifest?> promise = new Promise<Protocol.TrustManifest?>();
+        bool settled = false;
         stream.get_module(Pubsub.Module.IDENTITY).request(stream, jid, Protocol.NS_TRUSTMANIFEST, (stream, from, id, node) => {
+            if (settled) return;
+            settled = true;
             promise.set_value(unmarshal_manifest_node(node));
+        });
+        // Bound the fetch: request() rides send_iq (no timeout), so a lost RESPONSE would
+        // hang the caller forever. On timeout resolve to null ("unknown") — callers fall
+        // back to the local cache / retry, never block.
+        Timeout.add(10000, () => {
+            if (settled) return false;
+            settled = true;
+            promise.set_value(null);
+            return false;
         });
         try {
             return yield promise.future.wait_async();
@@ -1211,9 +1271,19 @@ public class StreamModule : XmppStreamModule {
     public async void ensure_trust_manifest(XmppStream stream) {
         string own_bare = account.bare_jid.to_string();
 
-        // Already migrated locally? (a `current` manifest is recorded) → extend by
-        // events, never rebuild genesis.
+        // If we already hold a local (cached) manifest, RECONCILE with the server (the
+        // shared source of truth) on every connect rather than trusting the cache
+        // exclusively: adopt a newer server version, or (re)publish ours when the server is
+        // missing it / behind (our last publish's ACK may have been lost). Never rebuild
+        // genesis while a local manifest exists.
         if (db.get_trust_manifest_version(account, own_bare) >= 0) {
+            Protocol.TrustManifest? local_m = load_local_manifest(own_bare);
+            Protocol.TrustManifest? srv = yield fetch_trust_manifest(stream, account.bare_jid);
+            if (srv != null && local_m != null && ((!) srv).version > ((!) local_m).version) {
+                verify_and_apply_manifest(account.bare_jid, ((!) srv).marshal());   // server ahead → adopt
+            } else if (local_m != null && (srv == null || ((!) local_m).version > ((!) srv).version)) {
+                publish_manifest_with_retry.begin(stream, (!) local_m);            // server behind → (re)push
+            }
             return;
         }
         // The server may already hold a manifest (published by a sibling): adopt it.
@@ -1342,10 +1412,10 @@ public class StreamModule : XmppStreamModule {
                                       : (uint64) (db.get_device_list_version(account, own_bare) + 1);
         m.sign_head(dik_priv_ed, dik_priv_ml);
 
-        // Persist locally first, publish best-effort (see append_device_add_to_manifest):
-        // a hung publish IQ must not drop our freshly-built genesis on the floor.
+        // Cache locally for durability, then publish to the server (source of truth) with
+        // retry until confirmed — a lost ACK must not silently leave the server behind.
         verify_and_apply_manifest(account.bare_jid, m.marshal());
-        publish_trust_manifest_blob.begin(stream, m);
+        publish_manifest_with_retry.begin(stream, m);
     }
 
     // §D2: at pairing confirmation, append a DIK-signed ADD for the newcomer and
@@ -1431,7 +1501,7 @@ public class StreamModule : XmppStreamModule {
         bool applied = verify_and_apply_manifest(account.bare_jid, ((!) m).marshal());
         warning("X3DHPQ-PAIR: append_device_add_to_manifest applied=%s version=%llu entries=%d",
                 applied.to_string(), ((!) m).version, ((!) m).entries.size);
-        publish_trust_manifest_blob.begin(stream, (!) m);
+        publish_manifest_with_retry.begin(stream, (!) m);
         return applied;
     }
 
@@ -1495,9 +1565,9 @@ public class StreamModule : XmppStreamModule {
             return false;
         }
 
-        // Persist locally first, publish best-effort (see append_device_add_to_manifest).
+        // Cache locally, then publish to the server with retry until confirmed.
         bool applied = verify_and_apply_manifest(account.bare_jid, ((!) m).marshal());
-        publish_trust_manifest_blob.begin(stream, (!) m);
+        publish_manifest_with_retry.begin(stream, (!) m);
         return applied;
     }
 
