@@ -104,8 +104,14 @@ public class ContactDetailsProvider : Plugins.ContactDetailsProvider, Object {
                     trust_row.subtitle = "Verified — identity accepted.";
                     button.visible = false;
                 } else {
-                    trust_row.subtitle = "Couldn't fetch the new keys — try again when the contact is online.";
-                    button.sensitive = true;
+                    // The stale pin was forgotten (the reset IS accepted), but the
+                    // contact's NEW identity isn't fetchable yet — usually because
+                    // the contact hasn't republished it (e.g. it is offline or has
+                    // not reconnected since resetting). It will be adopted
+                    // automatically when it arrives; the user can then verify the
+                    // new fingerprint. Not a dead end, and not a retry-the-same-way.
+                    trust_row.subtitle = "Old identity forgotten. Waiting for the contact to publish its new identity — it will be adopted automatically, then you can verify the new fingerprint.";
+                    button.visible = false;
                 }
             });
         });

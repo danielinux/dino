@@ -392,7 +392,11 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         }
         foreach (int device_id in devices) {
             if (db.get_remote_bundle(account, jid.bare_jid.to_string(), device_id) == null) {
-                StanzaNode? bundle = yield module.request_bundle((!) stream, jid, device_id);
+                // force=true: this is a deliberate, on-demand key fetch (group-send
+                // gate / accept flow), not a hot loop — the anti-flood cooldown
+                // must not suppress it, otherwise a just-verified peer reports
+                // "no usable bundle data" until the cooldown lapses.
+                StanzaNode? bundle = yield module.request_bundle((!) stream, jid, device_id, true);
                 if (bundle == null) {
                     return false;
                 }
@@ -437,6 +441,11 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         // fresh (first-contact: devicelist accepted unverified, bundle fetched,
         // new AIK stored). Safe because this is an explicit user accept.
         db.forget_peer(account, bare);
+        // The anti-flood bundle cooldown would otherwise suppress the deliberate
+        // re-fetch below (the peer's bundle was almost certainly auto-requested
+        // within the cooldown window), leaving accept_peer_aik unable to learn
+        // the new keys — the "try again when online" dead end.
+        module.clear_bundle_cooldown(jid);
         yield module.request_device_list((!) stream, jid);
         bool ok = yield ensure_get_keys_for_jid(account, jid);
         if (ok) {
@@ -747,8 +756,15 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             recipients.add(message_stanza.to.bare_jid);
         }
         // Include our own bare JID so sent carbons / archived copies contain a
-        // decryptable key for this account's devices too.
-        recipients.add(conversation.account.bare_jid);
+        // decryptable key for this account's OTHER devices (sibling sync) — UNLESS
+        // the copy we hold of our own account identity is a superseded genesis
+        // (rotated: a lost or independently-reset sibling under a DIFFERENT AIK).
+        // Per the genesis-supersedes rule that stale device is no longer a valid
+        // sibling, and including it would only block/fail the send. This device's
+        // own genesis prevails; the message still goes to the peer.
+        if (!peer_aik_needs_review(conversation.account, conversation.account.bare_jid)) {
+            recipients.add(conversation.account.bare_jid);
+        }
         return recipients;
     }
 
@@ -1082,6 +1098,158 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         }
     }
 
+    // Per-(peer/device) cooldown so a persistently-failing peer can't cause a
+    // rekey storm.
+    private HashMap<string, int64?> rekey_at = new HashMap<string, int64?>();
+    private const int64 REKEY_COOLDOWN_US = 30 * 1000000;
+
+    // Re-negotiate the pairwise session after a decrypt failure (a stale or
+    // mismatched session — typically our cached bundle predates the peer's key
+    // regeneration, e.g. after the peer reset). Drop the stale session, refetch a
+    // fresh bundle, and send a prekey "rekey" heartbeat: on the peer,
+    // prekey_overrides_orphan replaces its own stale session, so both sides
+    // converge on a fresh session and subsequent messages decrypt. Rate-limited.
+    private async void trigger_session_rekey(Account account, Jid peer_jid, int device_id) {
+        string key = "%s/%d".printf(peer_jid.bare_jid.to_string(), device_id);
+        int64 now = get_monotonic_time();
+        int64? last = rekey_at.has_key(key) ? rekey_at.get(key) : null;
+        if (last != null && now - (!) last < REKEY_COOLDOWN_US) {
+            return;
+        }
+        rekey_at.set(key, now);
+
+        XmppStream? stream = app.stream_interactor.get_stream(account);
+        StreamModule? module = app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
+        if (stream == null || module == null) {
+            return;
+        }
+        string peer_bare = peer_jid.bare_jid.to_string();
+        // Drop the stale local session and force a genuinely fresh bundle fetch
+        // (bypassing the anti-flood cooldown) before re-initiating.
+        db.delete_session(account, peer_bare, device_id);
+        module.clear_bundle_cooldown(peer_jid);
+        yield module.request_bundle((!) stream, peer_jid, device_id, true);
+
+        Protocol.PeerBundle? bundle = db.get_remote_bundle(account, peer_bare, device_id);
+        if (bundle == null || !((!) bundle).verify()) {
+            warning("x3dhpq rekey: no usable fresh bundle for %s/%d — cannot renegotiate", peer_bare, device_id);
+            return;
+        }
+        send_session_rekey(account, peer_jid, device_id, (!) bundle);
+    }
+
+    // Establish a fresh outbound session from `bundle` and send an (empty) prekey
+    // heartbeat with a PAYLOAD_TYPE_REKEY payload. Mirrors send_sender_chain_to_device
+    // but carries no announcement — its only purpose is to hand the peer a fresh
+    // prekey so it re-establishes the session.
+    private void send_session_rekey(Account account, Jid peer_bare, int device_id, Protocol.PeerBundle bundle) {
+        int? local_device_id = db.get_local_device_id(account);
+        if (local_device_id == null) return;
+        try {
+            Bytes payload_key = global::X3dhpq.Crypto.random_bytes(32);
+            Bytes payload_nonce = global::X3dhpq.Crypto.random_bytes(12);
+            Bytes payload_transport_key = bytes_from_uint8_array(
+                concat_byte_arrays(bytes_to_uint8_array(payload_key), bytes_to_uint8_array(payload_nonce)));
+            Bytes payload_ciphertext = Protocol.encrypt_payload_bytes(new Bytes(new uint8[0]), payload_transport_key);
+
+            // Always a fresh session (caller deleted the stale one).
+            Protocol.SessionBootstrap bootstrap = Protocol.initiate_session(
+                db.get_local_identity_bytes(account, db.account_identity.dik_priv_x25519_base64),
+                db.get_local_identity_bytes(account, db.account_identity.dik_pub_x25519_base64),
+                bundle);
+            Protocol.SessionState state = bootstrap.state;
+            Protocol.MessageHeader header;
+            Bytes encrypted_transport_key;
+            Protocol.encrypt_transport_key(state, payload_transport_key, out header, out encrypted_transport_key);
+            db.store_session(account, peer_bare.to_string(), device_id, state);
+
+            StanzaNode envelope = new StanzaNode.build("x3dhpq", Protocol.NS_ENVELOPE)
+                .add_self_xmlns()
+                .put_attribute("sender-device", ((!) local_device_id).to_string())
+                .put_attribute("sender-jid", account.bare_jid.to_string())
+                .put_attribute("ts", new DateTime.now_utc().format_iso8601());
+            StanzaNode key_node = new StanzaNode.build("key", Protocol.NS_ENVELOPE)
+                .put_attribute("rid", device_id.to_string())
+                .put_node(new StanzaNode.build("hdr", Protocol.NS_ENVELOPE).put_node(new StanzaNode.text(bytes_to_base64(header.marshal()))))
+                .put_node(new StanzaNode.build("emk", Protocol.NS_ENVELOPE).put_node(new StanzaNode.text(bytes_to_base64(encrypted_transport_key))));
+            StanzaNode prekey_node = new StanzaNode.build("prekey", Protocol.NS_ENVELOPE)
+                .put_attribute("ek", bytes_to_base64((!) bootstrap.prekey_ephemeral_pub))
+                .put_attribute("opk-id", bootstrap.opk_id.to_string())
+                .put_attribute("kemkey-id", bootstrap.kem_key_id.to_string())
+                .put_attribute("kem-ct", bytes_to_base64((!) bootstrap.kem_ciphertext))
+                .put_node(new StanzaNode.build("dc", Protocol.NS_ENVELOPE).put_node(new StanzaNode.text(db.ensure_local_device_certificate(account))))
+                .put_node(new StanzaNode.build("aik-ed25519", Protocol.NS_ENVELOPE).put_node(new StanzaNode.text(db.get_local_identity_string(account, db.account_identity.aik_pub_ed25519_base64))))
+                .put_node(new StanzaNode.build("aik-mldsa", Protocol.NS_ENVELOPE).put_node(new StanzaNode.text(db.get_local_identity_string(account, db.account_identity.aik_pub_mldsa_base64))));
+            key_node.put_node(prekey_node);
+            envelope.put_node(key_node);
+            envelope.put_node(new StanzaNode.build("payload", Protocol.NS_ENVELOPE)
+                .put_attribute("type", Protocol.PAYLOAD_TYPE_REKEY)
+                .put_node(new StanzaNode.text(bytes_to_base64(payload_ciphertext))));
+
+            Xmpp.MessageStanza msg = new Xmpp.MessageStanza();
+            msg.to = peer_bare;
+            msg.type_ = Xmpp.MessageStanza.TYPE_CHAT;
+            msg.stanza.put_node(envelope);
+            Xmpp.Xep.MessageProcessingHints.set_message_hint(msg, Xmpp.Xep.MessageProcessingHints.HINT_NO_STORE);
+            Xmpp.Xep.MessageProcessingHints.set_message_hint(msg, Xmpp.Xep.MessageProcessingHints.HINT_NO_COPY);
+            XmppStream? stream = app.stream_interactor.get_stream(account);
+            if (stream == null) return;
+            stream.get_module(Xmpp.MessageModule.IDENTITY).send_message.begin((!) stream, msg);
+            warning("x3dhpq: sent rekey heartbeat to %s/%d", peer_bare.to_string(), device_id);
+        } catch (Error e) {
+            warning("send_session_rekey(%s/%d) failed: %s", peer_bare.to_string(), device_id, e.message);
+        }
+    }
+
+    // Build a responder SessionState from an inbound prekey envelope (the X3DH
+    // answer to a peer's initiate_session). Returns null if any required local
+    // key material is missing or respond_session throws. Reports whether a
+    // one-time prekey was referenced, so the caller only marks it consumed AFTER
+    // the message actually decrypts. Shared by the primary no-session/orphan path
+    // and the stale-live-session retry in decrypt_message.
+    private Protocol.SessionState? respond_session_from_prekey(Conversation conversation, StanzaNode prekey_node, string sender_jid_value, int sender_device_id, out bool consumed, out int consumed_opk_id) {
+        consumed = false;
+        consumed_opk_id = 0;
+        Protocol.DeviceCertificate? peer_cert = Protocol.DeviceCertificate.unmarshal(bytes_from_base64(prekey_node.get_deep_string_content("dc")));
+        if (peer_cert == null) {
+            return null;
+        }
+        Row local_bundle = db.get_required_local_bundle(conversation.account);
+        Row? local_spk = db.get_local_signed_pre_key(conversation.account, local_bundle[db.bundle.signed_pre_key_id]);
+        Row? local_kem = db.get_local_kem_pre_key(conversation.account, prekey_node.get_attribute_int("kemkey-id"));
+        if (local_spk == null || local_kem == null) {
+            return null;
+        }
+        Row? local_opk = null;
+        int opk_id = prekey_node.get_attribute_int("opk-id");
+        if (opk_id > 0) {
+            local_opk = db.get_local_one_time_pre_key(conversation.account, opk_id);
+        }
+        try {
+            Protocol.SessionState st = Protocol.respond_session(
+                db.get_local_identity_bytes(conversation.account, db.account_identity.dik_priv_x25519_base64),
+                db.get_local_identity_bytes(conversation.account, db.account_identity.dik_pub_x25519_base64),
+                bytes_from_base64(((!) local_spk)[db.signed_pre_key.private_base64]),
+                bytes_from_base64(((!) local_spk)[db.signed_pre_key.public_base64]),
+                local_opk != null ? bytes_from_base64(((!) local_opk)[db.one_time_pre_key.private_base64]) : null,
+                bytes_from_base64(((!) local_kem)[db.kem_pre_key.private_base64]),
+                peer_cert,
+                bytes_from_base64(prekey_node.get_deep_string_content("aik-ed25519")),
+                bytes_from_base64(prekey_node.get_deep_string_content("aik-mldsa")),
+                bytes_from_base64(prekey_node.get_attribute("ek")),
+                bytes_from_base64(prekey_node.get_attribute("kem-ct"))
+            );
+            if (local_opk != null) {
+                consumed = true;
+                consumed_opk_id = opk_id;
+            }
+            return st;
+        } catch (Error e) {
+            warning("Unable to respond to x3dhpq prekey message from %s/%d: %s", sender_jid_value, sender_device_id, e.message);
+            return null;
+        }
+    }
+
     private void build_group_encrypted_message(Entities.Message message, Xmpp.MessageStanza message_stanza, Conversation conversation) throws Error {
         int? local_device_id = db.get_local_device_id(conversation.account);
         if (local_device_id == null || message_stanza.body == null) {
@@ -1311,49 +1479,29 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             && (state.chain_recv_key == null
                 || bytes_to_uint8_array((!) state.chain_recv_key).length == 0);
 
+        // Did we build state_to_commit as a FRESH responder (respond_session) vs
+        // reuse the cached session? Drives the one-shot stale-live-session retry
+        // in the catch below.
+        bool responded_from_prekey = false;
+
         if (state == null || prekey_overrides_orphan) {
             if (prekey_node == null) {
-                return false;
-            }
-
-            Protocol.DeviceCertificate? peer_cert = Protocol.DeviceCertificate.unmarshal(bytes_from_base64(prekey_node.get_deep_string_content("dc")));
-            if (peer_cert == null) {
-                return false;
-            }
-            Row local_bundle = db.get_required_local_bundle(conversation.account);
-            Row? local_spk = db.get_local_signed_pre_key(conversation.account, local_bundle[db.bundle.signed_pre_key_id]);
-            Row? local_kem = db.get_local_kem_pre_key(conversation.account, prekey_node.get_attribute_int("kemkey-id"));
-            if (local_spk == null || local_kem == null) {
-                return false;
-            }
-            Row? local_opk = null;
-            int opk_id = prekey_node.get_attribute_int("opk-id");
-            if (opk_id > 0) {
-                local_opk = db.get_local_one_time_pre_key(conversation.account, opk_id);
-            }
-
-            try {
-                state_to_commit = Protocol.respond_session(
-                    db.get_local_identity_bytes(conversation.account, db.account_identity.dik_priv_x25519_base64),
-                    db.get_local_identity_bytes(conversation.account, db.account_identity.dik_pub_x25519_base64),
-                    bytes_from_base64(((!) local_spk)[db.signed_pre_key.private_base64]),
-                    bytes_from_base64(((!) local_spk)[db.signed_pre_key.public_base64]),
-                    local_opk != null ? bytes_from_base64(((!) local_opk)[db.one_time_pre_key.private_base64]) : null,
-                    bytes_from_base64(((!) local_kem)[db.kem_pre_key.private_base64]),
-                    peer_cert,
-                    bytes_from_base64(prekey_node.get_deep_string_content("aik-ed25519")),
-                    bytes_from_base64(prekey_node.get_deep_string_content("aik-mldsa")),
-                    bytes_from_base64(prekey_node.get_attribute("ek")),
-                    bytes_from_base64(prekey_node.get_attribute("kem-ct"))
-                );
-                if (local_opk != null) {
-                    consume_one_time_prekey = true;
-                    consumed_opk_id = opk_id;
+                // No session and no prekey to build one from — we cannot decrypt
+                // this at all (the peer holds a live session and isn't sending us
+                // prekeys). Ask it to re-initiate so we converge, instead of
+                // leaving the message stuck as "[x3dhpq encrypted]".
+                try {
+                    trigger_session_rekey.begin(conversation.account, new Jid(sender_jid_value), sender_device_id);
+                } catch (InvalidJidError je) {
                 }
-            } catch (Error e) {
-                warning("Unable to respond to x3dhpq prekey message from %s/%d: %s", sender_jid_value, sender_device_id, e.message);
                 return false;
             }
+            state_to_commit = respond_session_from_prekey(conversation, (!) prekey_node,
+                sender_jid_value, sender_device_id, out consume_one_time_prekey, out consumed_opk_id);
+            if (state_to_commit == null) {
+                return false;
+            }
+            responded_from_prekey = true;
         } else {
             state_to_commit = Protocol.SessionState.deserialize((!) state.serialize());
             if (state_to_commit == null) {
@@ -1362,6 +1510,12 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             }
         }
 
+        // Decrypt-and-handle, with one retry: if we used the cached session but
+        // it fails to decrypt an envelope that CARRIES a fresh prekey, the peer
+        // re-initiated (e.g. after a reset/forget). Rebuild as responder from that
+        // prekey and retry once — converges in a single round trip instead of
+        // requiring a mutual rekey exchange.
+        for (int attempt = 0; attempt < 2; attempt++) {
         try {
             StanzaNode? hdr_node = ((!) key_node).get_subnode("hdr", Protocol.NS_ENVELOPE);
             StanzaNode? emk_node = ((!) key_node).get_subnode("emk", Protocol.NS_ENVELOPE);
@@ -1378,6 +1532,18 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             StanzaNode? typed_payload = envelope.get_subnode("payload", Protocol.NS_ENVELOPE);
             if (typed_payload != null) {
                 string? ptype = typed_payload.get_attribute("type");
+                if (ptype == Protocol.PAYLOAD_TYPE_REKEY) {
+                    // Session re-negotiation heartbeat: the prekey in this message
+                    // already (re)established the session above (prekey_overrides_orphan
+                    // replaced any stale/orphan one). Nothing to display — just persist
+                    // the fresh session so subsequent traffic uses matching keys.
+                    db.store_session(conversation.account, sender_jid_value, sender_device_id, (!) state_to_commit);
+                    if (consume_one_time_prekey) {
+                        db.mark_local_one_time_pre_key_consumed(conversation.account, consumed_opk_id);
+                    }
+                    warning("x3dhpq: re-established session with %s/%d via rekey heartbeat", sender_jid_value, sender_device_id);
+                    return false;
+                }
                 if (ptype == Protocol.PAYLOAD_TYPE_SENDER_CHAIN || ptype == Protocol.PAYLOAD_TYPE_GROUP_SYNC) {
                     // Decrypt and route the sender chain announcement (and, for a
                     // group-sync payload, the bundled membership journal).
@@ -1450,9 +1616,35 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             }
             return true;
         } catch (Error e) {
+            // First failure with a cached session but a fresh prekey present:
+            // the peer re-initiated (reset/forget). Rebuild as responder from the
+            // prekey and retry the decrypt once before giving up — no side effects
+            // ran yet (the failure is at transport-key/payload decrypt, before any
+            // store), so re-running is safe.
+            if (attempt == 0 && !responded_from_prekey && prekey_node != null) {
+                Protocol.SessionState? rebuilt = respond_session_from_prekey(conversation, (!) prekey_node,
+                    sender_jid_value, sender_device_id, out consume_one_time_prekey, out consumed_opk_id);
+                if (rebuilt != null) {
+                    state_to_commit = rebuilt;
+                    responded_from_prekey = true;
+                    continue;
+                }
+            }
             warning("Unable to decrypt x3dhpq message from %s/%d: %s", sender_jid_value, sender_device_id, e.message);
+            // Stale/mismatched session (e.g. our cached bundle predated the peer's
+            // key regeneration after a reset). Auto-renegotiate rather than staying
+            // wedged: drop the session, refetch a fresh bundle, and hand the peer a
+            // fresh prekey so both sides converge. Rate-limited inside. The message
+            // that just failed is lost (resend/retransmit picks it up).
+            try {
+                trigger_session_rekey.begin(conversation.account, new Jid(sender_jid_value), sender_device_id);
+            } catch (InvalidJidError je) {
+                // sender_jid_value came off the wire; ignore if unparseable.
+            }
             return false;
         }
+        }
+        return false;
     }
 
     private void on_sender_chain_announcement(Dino.Entities.Account account, Protocol.SenderChainAnnouncement ann) {

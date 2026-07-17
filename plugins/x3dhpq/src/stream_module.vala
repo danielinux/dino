@@ -241,7 +241,11 @@ public class StreamModule : XmppStreamModule {
         if (own_devices.size == 0) {
             db.promote_to_primary(account);
         }
-        // else: stays pending — no publish, no state change.
+        // else: stays pending — no publish, no state change. A device stuck here
+        // against stale/unadoptable own-account state (e.g. after a lost-device
+        // wipe) recovers via the explicit "Generate a new identity" button on the
+        // pairing screen (never automatically — auto-genesis on a timer would
+        // destroy a legitimately-pairing second device left waiting on-screen).
     }
 
     // §11.8: fetch (or accept an already-delivered `node`, for the live +notify
@@ -758,15 +762,31 @@ public class StreamModule : XmppStreamModule {
         }
     }
 
-    public async StanzaNode? request_bundle(XmppStream stream, Jid jid, int device_id) {
+    // Drop the bundle-fetch cooldown for a peer so the next request_bundle for
+    // any of its devices fetches immediately. Called when the user explicitly
+    // re-verifies / forgets a peer (accept_peer_aik) so the deliberate re-fetch
+    // is not silently suppressed by the anti-flood cooldown.
+    public void clear_bundle_cooldown(Jid jid) {
+        string prefix = jid.bare_jid.to_string() + "/";
+        var to_remove = new Gee.ArrayList<string>();
+        foreach (string k in bundle_request_at.keys) {
+            if (k.has_prefix(prefix)) to_remove.add(k);
+        }
+        foreach (string k in to_remove) bundle_request_at.unset(k);
+    }
+
+    public async StanzaNode? request_bundle(XmppStream stream, Jid jid, int device_id, bool force = false) {
         // Rate-limit repeat fetches of the same bundle. A caller loop that keeps
         // seeing get_remote_bundle()==null or verify()==false would otherwise
         // re-request every pass, jamming the send queue (see bundle_request_at).
+        // `force` bypasses the cooldown for deliberate, one-shot fetches.
         string cooldown_key = "%s/%d".printf(jid.bare_jid.to_string(), device_id);
         int64 now = get_monotonic_time();
-        int64? last = bundle_request_at.has_key(cooldown_key) ? bundle_request_at.get(cooldown_key) : null;
-        if (last != null && now - (!) last < BUNDLE_REQUEST_COOLDOWN_US) {
-            return null;
+        if (!force) {
+            int64? last = bundle_request_at.has_key(cooldown_key) ? bundle_request_at.get(cooldown_key) : null;
+            if (last != null && now - (!) last < BUNDLE_REQUEST_COOLDOWN_US) {
+                return null;
+            }
         }
         bundle_request_at.set(cooldown_key, now);
         StanzaNode pubsub = new StanzaNode.build("pubsub", Pubsub.NS_URI).add_self_xmlns()
@@ -1398,6 +1418,53 @@ public class StreamModule : XmppStreamModule {
         }
     }
 
+    // Local-only half of a self-genesis (§8.6 back-to-genesis / §12): wipe every
+    // scrap of stale own-identity state and mint a FRESH AIK/genesis on THIS
+    // device, keeping the DIK + device_id. Safe offline — the network publish
+    // half is perform_self_genesis(). Shared verbatim by the UI "Reset identity"
+    // action, the pairing-screen "Generate a new identity" button, and the
+    // automatic deadlock recovery in resolve_pending_primary. Mirrors the DB
+    // sequence documented in EncryptionPreferencesEntry.perform_account_reset.
+    public void reset_local_identity_for_genesis() {
+        string own_bare = account.bare_jid.to_string();
+        // Wipe own-account sibling rows learned under the OLD identity (§10.6.5),
+        // the cached device-audit DAG (§11.7), the own-devicelist snapshot (§8.6
+        // shrink-guard exception), and the old revocation tombstones — all
+        // meaningless once the AIK changes and otherwise resurrected as phantoms.
+        db.prune_remote_devices_not_in(account, own_bare, new Gee.HashSet<int>());
+        db.clear_device_audit_entries(account);
+        db.clear_own_device_list_snapshot(account);
+        db.clear_revoked_devices(account);
+        // Mint the new AIK (keeping DIK + device_id), invalidate the cached self
+        // DC so it re-issues under the new AIK, and clear the manifest store so
+        // the fresh version=1 genesis is a new lineage, not a rollback.
+        db.reset_account_identity_new_aik(account);
+        db.invalidate_local_device_certificate(account);
+        db.clear_trust_manifest(account, own_bare);
+    }
+
+    // Full self-genesis: reset the local identity, PURGE every stale own PEP node
+    // still signed by the now-dead AIK (devtracker/devicelist/trustmanifest/pair)
+    // so nothing lingers to be re-verified under the new one, then root a fresh
+    // version=1 genesis under the new AIK and republish the derived devicelist +
+    // bundle. This is the "anyone with account credentials can re-trigger a
+    // genesis; newest prevails" path (§12.3) — used explicitly by the UI reset /
+    // "Generate a new identity" actions and automatically by resolve_pending_primary
+    // when this device is deadlocked pending against unadoptable own-account state
+    // (e.g. after a lost-device wipe: fresh local AIK vs stale server nodes it can
+    // never verify). No recursion risk: reset_account_identity_new_aik marks this
+    // device confirmed/primary, so the publish_current_state below finds
+    // is_authorized() true and skips resolve_pending_primary.
+    public async void perform_self_genesis(XmppStream stream) {
+        reset_local_identity_for_genesis();
+        yield purge_own_node(stream, Protocol.NS_DEVTRACKER);
+        yield purge_own_node(stream, Protocol.NS_DEVICELIST);
+        yield purge_own_node(stream, Protocol.NS_TRUSTMANIFEST);
+        yield purge_own_node(stream, Protocol.NS_PAIR);
+        yield publish_reset_genesis_manifest(stream);
+        yield publish_current_state(stream);
+    }
+
     // Build a COMPACT, AIK-anchored snapshot manifest asserting exactly the CURRENT `members`
     // (device_id → DC). We do NOT track history: each published manifest is a fresh snapshot
     // of the current membership (size bounded by the number of devices, NOT by how many
@@ -1815,14 +1882,28 @@ public class StreamModule : XmppStreamModule {
             .put_node(new StanzaNode.build("ik", Protocol.NS_BUNDLE).put_node(new StanzaNode.text(get_local_identity_value(db.account_identity.dik_pub_x25519_base64))))
             .put_node(new StanzaNode.build("dik-mldsa", Protocol.NS_BUNDLE).put_node(new StanzaNode.text(get_local_identity_value(db.account_identity.dik_pub_mldsa_base64))));
 
-        int signed_pre_key_id = ((!) bundle_row)[db.bundle.signed_pre_key_id];
-        string? signed_pre_key_public = ((!) bundle_row)[db.bundle.signed_pre_key_public_base64];
-        string? signed_pre_key_sig = ((!) bundle_row)[db.bundle.signed_pre_key_signature_ed25519_base64];
-        if (signed_pre_key_public != null && signed_pre_key_sig != null) {
-            bundle_node.put_node(new StanzaNode.build("spk", Protocol.NS_BUNDLE)
-                .put_attribute("id", signed_pre_key_id.to_string())
-                .put_node(new StanzaNode.build("key", Protocol.NS_BUNDLE).put_node(new StanzaNode.text(signed_pre_key_public)))
-                .put_node(new StanzaNode.build("sig", Protocol.NS_BUNDLE).put_node(new StanzaNode.text(signed_pre_key_sig))));
+        // Source the SPK from the authoritative signed_pre_key table, NOT the
+        // bundle row. The bundle row's SPK columns are rewritten by
+        // store_bundle_payload every time we (re)store a bundle node — including
+        // the echo of our OWN publish and any self-PEP-notify of a previously
+        // published SPK-less item — so after an account reset they can silently
+        // revert to signed_pre_key_id=-1/NULL, which made us publish an SPK-less
+        // bundle and peers report "no usable fresh bundle". Reading the live SPK
+        // here makes every publish self-consistent regardless of the row's state.
+        Row? spk_row = db.get_current_signed_pre_key(account);
+        if (spk_row != null) {
+            int signed_pre_key_id = ((!) spk_row)[db.signed_pre_key.key_id];
+            string? signed_pre_key_public = ((!) spk_row)[db.signed_pre_key.public_base64];
+            string? signed_pre_key_sig = ((!) spk_row)[db.signed_pre_key.signature_ed25519_base64];
+            if (signed_pre_key_public != null && signed_pre_key_sig != null) {
+                bundle_node.put_node(new StanzaNode.build("spk", Protocol.NS_BUNDLE)
+                    .put_attribute("id", signed_pre_key_id.to_string())
+                    .put_node(new StanzaNode.build("key", Protocol.NS_BUNDLE).put_node(new StanzaNode.text(signed_pre_key_public)))
+                    .put_node(new StanzaNode.build("sig", Protocol.NS_BUNDLE).put_node(new StanzaNode.text(signed_pre_key_sig))));
+            }
+        } else {
+            warning("publish_bundle: no signed pre-key for %s — publishing an SPK-less bundle (peers cannot establish sessions)",
+                account.bare_jid.to_string());
         }
 
         StanzaNode kemkeys = new StanzaNode.build("kemkeys", Protocol.NS_BUNDLE);
@@ -2123,23 +2204,29 @@ public class StreamModule : XmppStreamModule {
 
         // Reconstruct the SignedPart (§8.3) and verify BOTH AIK signatures (§7.7).
         uint8[] sp = Protocol.DeviceListSigned.signed_part((uint64) version, issued_at, entries);
+        bool ok = false;
         try {
             Bytes ed_sig = bytes_from_base64((!) sig_b64);
             Bytes ml_sig = bytes_from_base64((!) mldsa_b64);
-            bool ok = global::X3dhpq.Crypto.ed25519_verify(aik_ed, new Bytes(sp), ed_sig)
-                   && global::X3dhpq.Crypto.mldsa65_verify(aik_mldsa, new Bytes(sp), ml_sig);
-            if (!ok) {
-                warning("x3dhpq devicelist from %s rejected: AIK signature does not verify", bare);
-                // §10.6.5: a signed list that fails to verify against the AIK we
-                // already have pinned for this peer looks like a silent identity
-                // reconstruction (new AIK, same JID) — never auto-accept it, and
-                // flag it for the existing "Review"/"Accept new identity" UX
-                // (contact_details_provider.vala) instead of silently dropping it.
-                db.flag_peer_devicelist_fork(account, bare);
-                return false;
-            }
+            ok = global::X3dhpq.Crypto.ed25519_verify(aik_ed, new Bytes(sp), ed_sig)
+              && global::X3dhpq.Crypto.mldsa65_verify(aik_mldsa, new Bytes(sp), ml_sig);
         } catch (GLib.Error e) {
-            warning("x3dhpq devicelist from %s rejected: signature decode/verify error: %s", bare, e.message);
+            // wolfSSL raises SIG_VERIFY_E (rc=-229) on a well-formed-but-mismatched
+            // signature instead of returning false. A mismatch against the AIK we
+            // have pinned is exactly the identity-reset/fork case below, so treat
+            // any verify error as "does not verify" rather than dropping it here —
+            // otherwise the re-verify UX is never triggered and a peer that reset
+            // its account becomes permanently invisible.
+            ok = false;
+        }
+        if (!ok) {
+            warning("x3dhpq devicelist from %s rejected: AIK signature does not verify — possible identity reset (new AIK, same JID); flagged for re-verify", bare);
+            // §10.6.5: a signed list that fails to verify against the AIK we
+            // already have pinned for this peer looks like a silent identity
+            // reconstruction (new AIK, same JID) — never auto-accept it, and
+            // flag it for the existing "Review"/"Accept new identity" UX
+            // (contact_details_provider.vala) instead of silently dropping it.
+            db.flag_peer_devicelist_fork(account, bare);
             return false;
         }
 

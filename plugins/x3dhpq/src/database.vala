@@ -661,7 +661,21 @@ public class Database : Qlite.Database {
                     .value(signed_pre_key.published, false)
                     .value(signed_pre_key.created_at, (long) new DateTime.now_utc().to_unix())
                     .perform();
+            }
 
+            // ALWAYS sync the bundle row to the CURRENT active SPK + identity —
+            // not only when we just minted the very first SPK. An account reset
+            // (reset_account_identity_new_aik) keeps the existing SPK, so on the
+            // next call count_signed_pre_keys != 0 and the old code skipped this,
+            // leaving the bundle row with signed_pre_key_id=-1 and NULL SPK. That
+            // made publish_bundle omit <spk>, so peers fetched an SPK-less bundle
+            // and reported "no usable fresh bundle" (get_remote_bundle returns
+            // null without SPK). Refreshing the AIK/DIK columns here also ensures
+            // a post-reset bundle advertises the NEW identity. The DC column is
+            // left untouched (ensure_local_device_certificate, called above, owns
+            // it) so we never clobber it.
+            Row? spk_row = get_current_signed_pre_key(account);
+            if (spk_row != null) {
                 bundle.upsert()
                     .value(bundle.account_id, account.id, true)
                     .value(bundle.bare_jid, account.bare_jid.to_string(), true)
@@ -671,11 +685,10 @@ public class Database : Qlite.Database {
                     .value(bundle.identity_pub_ed25519_base64, row[account_identity.dik_pub_ed25519_base64])
                     .value(bundle.identity_pub_x25519_base64, row[account_identity.dik_pub_x25519_base64])
                     .value(bundle.identity_pub_mldsa_base64, row[account_identity.dik_pub_mldsa_base64])
-                    .value(bundle.signed_pre_key_id, key_id)
-                    .value(bundle.signed_pre_key_public_base64, bytes_to_base64(spk_pub))
-                    .value(bundle.signed_pre_key_signature_ed25519_base64, bytes_to_base64(spk_sig_ed25519))
-                    .value(bundle.signed_pre_key_signature_mldsa_base64, bytes_to_base64(spk_sig_mldsa))
-                    .value(bundle.device_certificate_base64, cert)
+                    .value(bundle.signed_pre_key_id, ((!) spk_row)[signed_pre_key.key_id])
+                    .value(bundle.signed_pre_key_public_base64, ((!) spk_row)[signed_pre_key.public_base64])
+                    .value(bundle.signed_pre_key_signature_ed25519_base64, ((!) spk_row)[signed_pre_key.signature_ed25519_base64])
+                    .value(bundle.signed_pre_key_signature_mldsa_base64, ((!) spk_row)[signed_pre_key.signature_mldsa_base64])
                     .value(bundle.updated_at, (long) new DateTime.now_utc().to_unix())
                     .perform();
             }
@@ -767,6 +780,17 @@ public class Database : Qlite.Database {
         return signed_pre_key.select()
             .with(signed_pre_key.account_id, "=", account.id)
             .with(signed_pre_key.key_id, "=", key_id)
+            .single().row().inner;
+    }
+
+    // The current (most-recently-generated) signed pre-key, or null if none.
+    // Used to keep the published bundle row in sync with the active SPK across
+    // account resets, which keep the SPK but leave the bundle row's SPK columns
+    // stale/empty (see ensure_local_prekeys).
+    public Row? get_current_signed_pre_key(Account account) {
+        return signed_pre_key.select()
+            .with(signed_pre_key.account_id, "=", account.id)
+            .order_by(signed_pre_key.key_id, "DESC")
             .single().row().inner;
     }
 
@@ -1401,6 +1425,13 @@ public class Database : Qlite.Database {
             .with(pairwise_session.account_id, "=", account.id)
             .with(pairwise_session.bare_jid, "=", bare_jid)
             .perform();
+        // Drop the peer's Trust Manifest too. Once a manifest exists,
+        // parse_device_list treats it as the live trust source and returns only
+        // the already-known device ids WITHOUT processing a freshly fetched
+        // devicelist (§C Phase 2). A stale manifest surviving a forget leaves the
+        // re-learn seeing an empty device set forever (accept_peer_aik's
+        // "couldn't fetch the new keys" dead end after an identity reset).
+        clear_trust_manifest(account, bare_jid);
     }
 
     // Mark the peer's CURRENTLY-OBSERVED AIK as user-verified (re-pinned). Clears
@@ -1443,6 +1474,9 @@ public class Database : Qlite.Database {
             .with(pairwise_session.account_id, "=", account.id)
             .with(pairwise_session.bare_jid, "=", bare_jid)
             .perform();
+        // Clear the stale manifest so parse_device_list stops short-circuiting on
+        // it and re-processes the peer's fresh devicelist (see forget_peer).
+        clear_trust_manifest(account, bare_jid);
     }
 
     public void store_remote_device(Account account, string bare_jid, int device_id, string? certificate_base64 = null, long added_at = 0, uint8 flags = 1, bool active = true) {

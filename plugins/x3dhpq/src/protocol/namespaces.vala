@@ -22,6 +22,12 @@ public const string PAYLOAD_TYPE_SENDER_CHAIN = "sender-chain";
 //   uint16 version(=1) | uint32 ann_len | <ann bytes> | uint32 n_entries |
 //   { uint32 entry_len | <MemberAuditEntry.marshal()> } * n_entries
 public const string PAYLOAD_TYPE_GROUP_SYNC = "group-sync";
+// A session re-negotiation heartbeat: an (otherwise empty) message carrying a
+// fresh prekey so the recipient re-establishes the pairwise session. Sent when a
+// message fails to decrypt (stale/mismatched session, e.g. after a peer reset
+// left our cached bundle stale) so the key is renegotiated instead of the
+// conversation staying wedged. Carries no visible body.
+public const string PAYLOAD_TYPE_REKEY = "rekey";
 
 public string[] get_disco_features() {
     return {

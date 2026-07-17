@@ -301,115 +301,29 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
     // identity: mint_fresh_identity() always succeeds locally regardless of
     // whether the (best-effort, network-dependent) RotateAIK signal does.
     private void perform_account_reset(Account account, UI.SelfDevicesWidget? devices_widget) {
-        Bytes? old_aik_priv_ed = null;
-        Bytes? old_aik_priv_mldsa = null;
-        if (plugin.db.has_local_identity(account)) {
-            try {
-                string old_priv_ed_b64 = plugin.db.get_local_identity_string(account, plugin.db.account_identity.aik_priv_ed25519_base64);
-                string old_priv_ml_b64 = plugin.db.get_local_identity_string(account, plugin.db.account_identity.aik_priv_mldsa_base64);
-                if (old_priv_ed_b64 != "" && old_priv_ml_b64 != "") {
-                    old_aik_priv_ed = bytes_from_base64(old_priv_ed_b64);
-                    old_aik_priv_mldsa = bytes_from_base64(old_priv_ml_b64);
-                }
-            } catch (GLib.Error e) {
-                // Missing/corrupt old key material: skip the old-sig RotateAIK
-                // step below (§12: "where the old AIK_priv is still held") —
-                // the reset itself still proceeds.
-                old_aik_priv_ed = null;
-                old_aik_priv_mldsa = null;
-            }
-        }
-
-        // Wipe any own-account sibling rows learned under the OLD identity
-        // (pending or confirmed) — they are meaningless once the AIK changes; a
-        // stale row here would otherwise resurrect a phantom "sibling" in the
-        // devices-list UI, or leak into the fresh devicelist union, under the
-        // new identity. Also drop the locally-cached device-audit DAG (§11.7)
-        // so it re-bootstraps under the new AIK instead of permanently failing
-        // to resolve against entries signed by the now-revoked old one.
-        plugin.db.prune_remote_devices_not_in(account, account.bare_jid.to_string(), new Gee.HashSet<int>());
-        plugin.db.clear_device_audit_entries(account);
-        // §8.6 exception "back to genesis": drop the OWN devicelist snapshot so the
-        // shrink guard treats the fresh single-device list as a first publish rather
-        // than an (illegal) unrevoked shrink of the OLD identity's list.
-        plugin.db.clear_own_device_list_snapshot(account);
-        // Fresh AIK/genesis: the new identity's device set starts empty, so old
-        // revocation tombstones (device ids of the prior identity's devices) no
-        // longer apply and would otherwise linger forever.
-        plugin.db.clear_revoked_devices(account);
-        // Trust Manifest Phase 2 account reset (task #55, RESET-only, STRICT):
-        // mint a NEW AIK while KEEPING this device's DIK + device_id, invalidate the
-        // cached self DC so it re-issues under the new AIK, and clear the manifest
-        // version/blob store so the fresh version=1 genesis is accepted as a new AIK
-        // lineage (not a rollback of the old one — the receiver branches on AIK
-        // mismatch BEFORE the version guard).
-        plugin.db.reset_account_identity_new_aik(account);
-        plugin.db.invalidate_local_device_certificate(account);
-        plugin.db.clear_trust_manifest(account, account.bare_jid.to_string());
-
         StreamModule? module = plugin.app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
         XmppStream? stream = plugin.app.stream_interactor.get_stream(account);
         if (module == null || stream == null) {
-            // Offline: the new identity is minted locally; the devicelist publish +
-            // self-genesis happen on next connect via the normal bootstrap path. The
-            // local device set is already fresh, so reflect it in the UI now.
+            // Offline: mint the new identity locally now; the PEP-node purge +
+            // devicelist/bundle publish + self-genesis manifest happen on next
+            // connect via the normal bootstrap path. The local device set is
+            // already fresh, so reflect it in the UI immediately.
+            if (module != null) ((!) module).reset_local_identity_for_genesis();
+            else plugin.db.reset_account_identity_new_aik(account);   // no module: at least mint locally
             if (devices_widget != null) ((!) devices_widget).refresh();
             return;
         }
-
-        // Peers chain-detect the account reconstruction from the AIK change on the
-        // devicelist / Trust Manifest genesis itself (§8.5/§10.6.5/§12.3); there is
-        // no separate account-audit signal to emit on reset.
-
-        // Publishes the fresh, self-signed devicelist under the new AIK —
-        // containing ONLY this device, every prior device having just been
-        // pruned above — so contacts observe the reconstruction event
-        // (§10.6.5), plus a fresh bundle so PQXDH can proceed with the new
-        // identity.
-        // Genesis reset (§8.6 back-to-genesis / §12): PURGE the server's own PEP nodes
-        // first so no item signed by the now-revoked AIK lingers (those fail verification
-        // under the new AIK and re-seed stale/forked devices). Then republish the fresh
-        // devicelist + bundle and re-record the self-genesis AddDevice(self)@0 under the
-        // new AIK, and finally refresh the UI. Chained so each step observes the prior.
-        // §1338 node purge: overwrite/retract every stale PEP node signed by the
-        // now-dead AIK so nothing lingers to be re-verified under the new one —
-        // devtracker:0, devicelist:0, trustmanifest:0 and pair:0 (and the bundle,
-        // republished by publish_current_state). Then root the FRESH, self-only
-        // Trust Manifest genesis (version=1) under the new AIK, republish the
-        // derived devicelist cache + bundle, and refresh the UI. Chained so each
-        // step observes the prior.
-        StreamModule m = (!) module;
-        XmppStream s = (!) stream;
-        m.purge_own_node.begin(s, Protocol.NS_DEVTRACKER, (o0, r0) => {
-            m.purge_own_node.end(r0);
-            m.purge_own_node.begin(s, Protocol.NS_DEVICELIST, (o1, r1) => {
-                m.purge_own_node.end(r1);
-                m.purge_own_node.begin(s, Protocol.NS_TRUSTMANIFEST, (ot, rt) => {
-                    m.purge_own_node.end(rt);
-                    // Also purge the pairing rendezvous node: stale <pair-hello>/
-                    // <enroll-request> items there (from prior devices/attempts,
-                    // possibly signed by the now-revoked AIK) otherwise linger and
-                    // mislead the next pairing's rendezvous.
-                    m.purge_own_node.begin(s, Protocol.NS_PAIR, (op, rp) => {
-                        m.purge_own_node.end(rp);
-                        // Root the fresh self-only manifest genesis (version=1)
-                        // under the new AIK BEFORE publish_current_state, so
-                        // ensure_trust_manifest (inside it) sees a current manifest
-                        // and stays a no-op instead of computing a different version.
-                        m.publish_reset_genesis_manifest.begin(s, (og, rg) => {
-                            m.publish_reset_genesis_manifest.end(rg);
-                            m.publish_current_state.begin(s, (o3, r3) => {
-                                m.publish_current_state.end(r3);
-                                // Fresh genesis + self device published;
-                                // refresh the devices list (main-loop hop).
-                                if (devices_widget != null) {
-                                    Idle.add(() => { ((!) devices_widget).refresh(); return false; });
-                                }
-                            });
-                        });
-                    });
-                });
-            });
+        // Online: full self-genesis (local reset + PEP purge + fresh version=1
+        // genesis under the new AIK + republish devicelist/bundle). This is the
+        // exact same path the pairing-screen "Generate a new identity" button and
+        // the automatic lost-device recovery in resolve_pending_primary use.
+        ((!) module).perform_self_genesis.begin((!) stream, (o, r) => {
+            ((!) module).perform_self_genesis.end(r);
+            // Fresh genesis + self device published; refresh the devices list
+            // on the main loop.
+            if (devices_widget != null) {
+                Idle.add(() => { ((!) devices_widget).refresh(); return false; });
+            }
         });
     }
 

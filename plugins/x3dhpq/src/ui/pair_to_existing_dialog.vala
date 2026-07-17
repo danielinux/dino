@@ -99,6 +99,43 @@ public class PairToExistingDialog : Adw.Window {
         close();
     }
 
+    // ── Private — actions ──────────────────────────────────────────────────────
+
+    // "Generate a new identity" (§12.3): the user has no other working device to
+    // confirm this one (e.g. a lost or reset phone). Mint a fresh account
+    // identity on THIS device and publish it as a version=1 genesis that
+    // supersedes any stale server-side identity, instead of waiting to be paired.
+    // Destructive (every contact must re-verify), so confirm first. Reuses
+    // StreamModule.perform_self_genesis — the exact path used by the preferences
+    // "Reset account identity" action and the automatic deadlock recovery in
+    // resolve_pending_primary.
+    private void on_generate_new_identity() {
+        var confirm = new Adw.AlertDialog(
+            "Generate a new identity?",
+            ("This creates a brand-new post-quantum identity for %s on this device and makes it the account's only device. Use this only if you have no other working device to confirm this one (for example, you lost or reset your other device).\n\n" +
+             "Every contact will have to re-verify you.").printf(account.bare_jid.to_string()));
+        confirm.add_response("cancel", "Cancel");
+        confirm.add_response("generate", "Generate new identity");
+        confirm.set_response_appearance("generate", Adw.ResponseAppearance.DESTRUCTIVE);
+        confirm.set_default_response("cancel");
+        confirm.set_close_response("cancel");
+        confirm.choose.begin(this, null, (obj, res) => {
+            if (confirm.choose.end(res) != "generate") return;
+            cleanup_handlers();   // abandon any in-flight pairing FSM first
+            if (active_stream != null) {
+                stream_module.perform_self_genesis.begin((!) active_stream, (o, r) => {
+                    stream_module.perform_self_genesis.end(r);
+                    close();
+                });
+            } else {
+                // Offline: mint locally now; the purge + publish happen on the
+                // next connect via the normal bootstrap path.
+                stream_module.reset_local_identity_for_genesis();
+                close();
+            }
+        });
+    }
+
     // ── Private — UI construction ──────────────────────────────────────────────
 
     private void build_ui() {
@@ -127,6 +164,23 @@ public class PairToExistingDialog : Adw.Window {
                 margin_bottom = 6
             };
             content.append(instruction);
+
+            // Lost-device alternative to pairing (§12.3): rather than wait for an
+            // existing device to confirm this one, mint a brand-new identity
+            // outright and supersede any stale server-side identity ("anyone with
+            // credentials can re-trigger a genesis; newest prevails"). Destructive
+            // — every contact must re-verify — so it is styled red and gated
+            // behind a confirmation.
+            var genesis_button = new Gtk.Button.with_label("Generate a new identity") {
+                halign        = Gtk.Align.FILL,
+                margin_start  = 12,
+                margin_end    = 12,
+                margin_top    = 6,
+                margin_bottom = 6
+            };
+            genesis_button.add_css_class("destructive-action");
+            genesis_button.clicked.connect(on_generate_new_identity);
+            content.append(genesis_button);
         } else {
             // Instruction label.
             var instruction = new Gtk.Label(

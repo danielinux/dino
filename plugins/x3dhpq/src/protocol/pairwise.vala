@@ -169,13 +169,17 @@ public class PeerBundle : Object {
             if (!spk_ok) {
                 return false;
             }
-            // Verify the hybrid DIK signature on every KEM pre-key (spec §9.1).
-            // The KEM pre-key is the sole carrier of post-quantum (HNDL)
-            // confidentiality, so an unsigned or forged one is rejected; both
-            // Ed25519 and ML-DSA-65 MUST verify against the DC's DIK.
+            // Verify the hybrid DIK signature on every KEM pre-key that carries
+            // one (spec §9.1). Transitional stance: a KEM pre-key WITHOUT
+            // signatures is a legacy bundle (published before KEM signing, or by
+            // a peer that hasn't regenerated keys) — accept it rather than reject,
+            // so sessions still establish across mixed-version deployments. A KEM
+            // pre-key WITH signatures that fail to verify is a forgery and is
+            // rejected. Re-tighten to "signatures required" once all clients
+            // publish signed bundles.
             foreach (PublicPreKey kem in kem_pre_keys) {
                 if (kem.signature_ed25519_base64 == null || kem.signature_mldsa_base64 == null) {
-                    return false;
+                    continue;
                 }
                 Bytes kem_pub = bytes_from_base64(kem.public_base64);
                 if (!global::X3dhpq.Crypto.ed25519_verify(
