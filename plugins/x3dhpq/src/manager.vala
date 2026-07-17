@@ -456,6 +456,35 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         return ok;
     }
 
+    // A private channel is x3dhpq-encrypted iff it has a membership journal/DAG.
+    // The CREATOR sets Encryption.X3DHPQ when creating the room, but an INVITED
+    // member only learns the room is encrypted once it ingests the journal (via a
+    // group-sync payload or MAM). Until then its conversation keeps the default
+    // (no) encryption, so the composer sends PLAINTEXT into an encrypted channel.
+    // Once we hold journal state for a room, default its conversation to x3dhpq.
+    // Only ever flips an unencrypted conversation on — never overrides a different
+    // encryption the user may have chosen.
+    public void default_group_to_x3dhpq(Account account, string room_jid_str) {
+        if (!db.has_membership_journal(account, room_jid_str)
+                && !db.has_membership_dag_entries(account, room_jid_str)) {
+            return;
+        }
+        Jid room_jid;
+        try {
+            room_jid = new Jid(room_jid_str);
+        } catch (Xmpp.InvalidJidError e) {
+            return;
+        }
+        Conversation? conversation = app.stream_interactor.get_module(ConversationManager.IDENTITY)
+            .get_conversation(room_jid.bare_jid, account, Conversation.Type.GROUPCHAT);
+        if (conversation == null) {
+            return;
+        }
+        if (conversation.encryption == Encryption.NONE) {
+            conversation.encryption = Encryption.X3DHPQ;
+        }
+    }
+
     public async void prefetch_for_conversation(Conversation conversation) {
         if (conversation.type_ == Conversation.Type.GROUPCHAT_PM) {
             return;
@@ -467,6 +496,9 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         }
 
         if (conversation.type_ == Conversation.Type.GROUPCHAT) {
+            // If this room is x3dhpq-backed (has a journal), make sure the
+            // conversation defaults to x3dhpq before the user can type plaintext.
+            default_group_to_x3dhpq(conversation.account, conversation.counterpart.bare_jid.to_string());
             Gee.List<Jid>? members = app.stream_interactor.get_module(MucManager.IDENTITY).get_offline_members(conversation.counterpart, conversation.account);
             if (members == null) {
                 return;
@@ -587,6 +619,9 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             return;
         }
         db.store_membership_journal_entry(account, room_jid.bare_jid.to_string(), entry);
+        // Now that this room is known x3dhpq-encrypted, default the joiner's
+        // conversation to x3dhpq so it never sends plaintext into the channel.
+        default_group_to_x3dhpq(account, room_jid.bare_jid.to_string());
     }
 
     // Ingest a raw MemberAuditEntry (bytes) delivered inside a group-sync payload
@@ -605,6 +640,7 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         // the AIK resolver, so ingest here just dedups by content hash.
         if (Protocol.JournalEntryV2.is_v2(entry_bytes)) {
             ingest_and_store_v2(account, room_jid_str, entry_bytes);
+            default_group_to_x3dhpq(account, room_jid_str);
             return;
         }
         on_membership_entry_received(account, room_jid, null, Base64.encode(entry_bytes));
