@@ -25,6 +25,7 @@ class MembershipDagTest : Gee.TestCase {
         add_test("admin_can_add_after_promotion", test_admin_promotion);
         add_test("non_admin_rejected", test_non_admin_rejected);
         add_test("concurrent_remove_beats_promote", test_remove_beats_promote);
+        add_test("remove_member_ban_blocks_readd", test_ban_blocks_readd);
         add_test("mutual_admin_removal_one_survives", test_mutual_removal);
         add_test("convergence_independent_of_order", test_convergence);
         add_test("snapshot_payload_roundtrip", test_snapshot_payload_roundtrip);
@@ -226,6 +227,23 @@ class MembershipDagTest : Gee.TestCase {
             // Removal wins: x neither member nor admin (promote didn't observe the removal).
             fail_if(st.members.contains(x.fp_hex), "removal must win over concurrent promote (member)");
             fail_if(st.admins.contains(x.fp_hex), "removal must win over concurrent promote (admin)");
+        } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    private void test_ban_blocks_readd() {
+        try {
+            Id owner = make_id(); Id m = make_id();
+            var g = sign(owner, 0, heads(null), (uint8) MemberAuditActionV2.ADD_ADMIN, mp(owner.fp), 1000);
+            var add = sign(owner, 1, heads(g.compute_hash()), (uint8) MemberAuditActionV2.ADD_MEMBER, mp(m.fp), 1001);
+            var ban = sign(owner, 2, heads(add.compute_hash()), (uint8) MemberAuditActionV2.REMOVE_MEMBER,
+                JournalEntryV2.build_remove_payload(m.fp, 0, true), 1002);
+            var readd = sign(owner, 3, heads(ban.compute_hash()), (uint8) MemberAuditActionV2.ADD_MEMBER, mp(m.fp), 1003);
+            var dag = new MembershipDag();
+            foreach (var e in new JournalEntryV2[]{g, add, ban, readd}) dag.ingest(e.marshal());
+            DagState st = dag.recompute(resolver());
+            fail_if(st.members.contains(m.fp_hex), "banned member must not be re-added");
+            fail_if(st.admins.contains(m.fp_hex), "banned member must not be admin");
+            fail_if_not(st.banned.contains(m.fp_hex), "ban flag must be folded into banned set");
         } catch (Error e) { fail_if_reached(e.message); }
     }
 

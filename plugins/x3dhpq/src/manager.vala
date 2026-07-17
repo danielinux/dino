@@ -11,28 +11,46 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     private Database db;
     private HashMap<Entities.Message, Conversation> pending_messages = new HashMap<Entities.Message, Conversation>(Entities.Message.hash_func, Entities.Message.equals_func);
 
-    // WS2: per-room multi-admin membership DAG (v2). Kept in memory and
-    // (re)populated from the group-sync bundle; NOT persisted (see report). A
-    // room is "v2-active" once its DAG holds at least one entry (a v2 genesis or
-    // a v1->v2 bridge Snapshot). Keyed by "<account_id>\0<room_bare_jid>".
+    // WS2: per-room multi-admin membership DAG (v2). Hydrated lazily from the
+    // persisted raw-entry table on first use, then kept hot in memory. A room is
+    // "v2-active" once its DAG holds at least one entry (a v2 genesis or a
+    // v1->v2 bridge Snapshot). Keyed by "<account_id>\0<room_bare_jid>".
     private HashMap<string, Protocol.MembershipDag> dags = new HashMap<string, Protocol.MembershipDag>();
 
     private static string dag_key(Account account, string room_jid_str) {
         return "%d %s".printf(account.id, room_jid_str);
     }
-    private Protocol.MembershipDag get_or_create_dag(Account account, string room_jid_str) {
+    private Protocol.MembershipDag? hydrate_dag(Account account, string room_jid_str, bool create_empty) {
         string k = dag_key(account, room_jid_str);
         Protocol.MembershipDag? d = dags.get(k);
-        if (d == null) { d = new Protocol.MembershipDag(); dags.set(k, d); }
+        if (d != null) return d;
+        if (!create_empty && !db.has_membership_dag_entries(account, room_jid_str)) return null;
+        d = new Protocol.MembershipDag();
+        foreach (Bytes b in db.list_membership_dag_entry_blobs(account, room_jid_str)) {
+            d.ingest(bytes_to_uint8_array(b));
+        }
+        dags.set(k, d);
         return d;
     }
+    private Protocol.MembershipDag get_or_create_dag(Account account, string room_jid_str) {
+        return (!) hydrate_dag(account, room_jid_str, true);
+    }
     private Protocol.MembershipDag? get_dag(Account account, string room_jid_str) {
-        return dags.get(dag_key(account, room_jid_str));
+        return hydrate_dag(account, room_jid_str, false);
     }
     // A room has switched to the v2 multi-admin engine once we hold any v2 entry.
     private bool is_v2_active(Account account, string room_jid_str) {
         Protocol.MembershipDag? d = get_dag(account, room_jid_str);
         return d != null && d.size > 0;
+    }
+
+    private bool ingest_and_store_v2(Account account, string room_jid_str, uint8[] entry_bytes) {
+        Protocol.MembershipDag dag = get_or_create_dag(account, room_jid_str);
+        bool inserted = dag.ingest(entry_bytes);
+        if (inserted) {
+            db.store_membership_dag_entry_blob(account, room_jid_str, entry_bytes);
+        }
+        return inserted;
     }
 
     public Manager(Dino.Application app, Database db) {
@@ -577,7 +595,7 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         // verification for v2 happens in the fold (MembershipDag.recompute) via
         // the AIK resolver, so ingest here just dedups by content hash.
         if (Protocol.JournalEntryV2.is_v2(entry_bytes)) {
-            get_or_create_dag(account, room_jid_str).ingest(entry_bytes);
+            ingest_and_store_v2(account, room_jid_str, entry_bytes);
             return;
         }
         on_membership_entry_received(account, room_jid, null, Base64.encode(entry_bytes));
@@ -621,9 +639,10 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         foreach (Protocol.MemberAuditEntry e in db.list_membership_journal_entries(account, room_jid_str)) {
             list.add(new Bytes(e.marshal()));
         }
-        Protocol.MembershipDag? dag = get_dag(account, room_jid_str);
-        if (dag != null) {
-            foreach (Bytes b in dag.all_marshaled()) list.add(b);
+        if (is_v2_active(account, room_jid_str)) {
+            foreach (Bytes b in db.list_membership_dag_entry_blobs(account, room_jid_str)) {
+                list.add(b);
+            }
         }
         return list;
     }
@@ -790,7 +809,8 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         // GROUPCHAT path: use sender-chain group encryption.
         if (conversation.type_ == Conversation.Type.GROUPCHAT) {
             string room_jid_str = conversation.counterpart.bare_jid.to_string();
-            if (!db.has_membership_journal(conversation.account, room_jid_str)) {
+            if (!db.has_membership_journal(conversation.account, room_jid_str)
+                    && !db.has_membership_dag_entries(conversation.account, room_jid_str)) {
                 // No membership journal — room is not yet x3dhpq-enabled. Refuse.
                 warning("x3dhpq group send refused for %s: no membership journal", room_jid_str);
                 message.marked = Message.Marked.WONTSEND;
@@ -1217,8 +1237,14 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         }
         string? payload = entry.get_string_content();
         if (payload != null && payload.strip() != "") {
-            // The room JID is the conversation counterpart for a groupchat.
-            on_membership_entry_received(conversation.account, conversation.counterpart.bare_jid, null, payload);
+            try {
+                uint8[] entry_bytes = Base64.decode(payload);
+                on_membership_entry_bytes(conversation.account,
+                    conversation.counterpart.bare_jid.to_string(), entry_bytes);
+            } catch (Error e) {
+                warning("journal-entry: bad base64 from %s: %s",
+                    conversation.counterpart.bare_jid.to_string(), e.message);
+            }
         }
         return true;
     }
@@ -1597,7 +1623,8 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             return false;
         }
         string room_jid_str = room_jid.bare_jid.to_string();
-        if (db.has_membership_journal(account, room_jid_str)) {
+        if (db.has_membership_journal(account, room_jid_str)
+                || db.has_membership_dag_entries(account, room_jid_str)) {
             return true;
         }
         db.ensure_local_identity(account);
@@ -1658,7 +1685,9 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     // is a reliable local fact, unlike MucManager.is_private_room()'s offline
     // disco cache — see the interface doc.
     public bool is_secret_pq_group(Dino.Entities.Account account, Jid room_jid) {
-        return db.has_membership_journal(account, room_jid.bare_jid.to_string());
+        string room_jid_str = room_jid.bare_jid.to_string();
+        return db.has_membership_journal(account, room_jid_str)
+            || db.has_membership_dag_entries(account, room_jid_str);
     }
 
     // Map the persisted peer AIK trust_state to the UI-facing enum.
@@ -1819,7 +1848,8 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             return false;
         }
         string room_jid_str = room_jid.bare_jid.to_string();
-        if (!db.has_membership_journal(account, room_jid_str)) {
+        if (!db.has_membership_journal(account, room_jid_str)
+                && !db.has_membership_dag_entries(account, room_jid_str)) {
             // Room was never x3dhpq-bootstrapped; nothing to remove from.
             return false;
         }
@@ -1967,8 +1997,12 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     // importing the v1 final member set with the local owner as the sole admin,
     // then switch the room to the v2 engine. Only the v1 owner may bridge. No-op
     // if the room is already v2-active. Returns false if we are not the owner.
-    private bool ensure_v2_bridged(Account account, string room_jid_str) {
+    private async bool ensure_v2_bridged(Account account, Jid room_jid) {
+        string room_jid_str = room_jid.bare_jid.to_string();
         if (is_v2_active(account, room_jid_str)) return true;
+        XmppStream? stream = app.stream_interactor.get_stream(account);
+        StreamModule? module = app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
+        if (stream == null || module == null) return false;
         uint8[] my_ed, my_ml, my_canon, my_fp;
         if (!local_aik(account, out my_ed, out my_ml, out my_canon, out my_fp)) return false;
         uint8[]? owner_fp = first_stored_owner_fp(account, room_jid_str);
@@ -1991,7 +2025,11 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         Protocol.JournalEntryV2? entry = build_signed_v2(account, room_jid_str,
             (uint8) Protocol.MemberAuditActionV2.SNAPSHOT, payload);
         if (entry == null) return false;
-        get_or_create_dag(account, room_jid_str).ingest(entry.marshal());
+        uint8[] entry_bytes = entry.marshal();
+        if (!yield module.publish_membership_blob((!) stream, room_jid.bare_jid, entry.hash_hex(), entry_bytes)) {
+            return false;
+        }
+        ingest_and_store_v2(account, room_jid_str, entry_bytes);
         return true;
     }
 
@@ -1999,11 +2037,18 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     // updated fold), persist, and broadcast the whole journal (v1+v2) + fresh
     // sender chain over the group-sync bundle. exclude_bare is dropped from the
     // broadcast (used when the entry removes/bans that member).
-    private bool emit_v2(Account account, Jid room_jid, uint8 action, uint8[] payload, Jid? exclude_bare) {
+    private async bool emit_v2(Account account, Jid room_jid, uint8 action, uint8[] payload, Jid? exclude_bare) {
         string room_jid_str = room_jid.bare_jid.to_string();
+        XmppStream? stream = app.stream_interactor.get_stream(account);
+        StreamModule? module = app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
+        if (stream == null || module == null) return false;
         Protocol.JournalEntryV2? entry = build_signed_v2(account, room_jid_str, action, payload);
         if (entry == null) return false;
-        get_or_create_dag(account, room_jid_str).ingest(entry.marshal());
+        uint8[] entry_bytes = entry.marshal();
+        if (!yield module.publish_membership_blob((!) stream, room_jid.bare_jid, entry.hash_hex(), entry_bytes)) {
+            return false;
+        }
+        ingest_and_store_v2(account, room_jid_str, entry_bytes);
         announce_group_to_members(account, room_jid, exclude_bare);
         return true;
     }
@@ -2018,7 +2063,7 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             return false;
         }
         uint8[] payload = Protocol.JournalEntryV2.build_member_payload(fp, 0);
-        return emit_v2(account, room_jid, (uint8) Protocol.MemberAuditActionV2.ADD_MEMBER, payload, null);
+        return yield emit_v2(account, room_jid, (uint8) Protocol.MemberAuditActionV2.ADD_MEMBER, payload, null);
     }
 
     private async bool v2_remove_member(Account account, Jid room_jid, Jid member_jid, bool ban) {
@@ -2027,7 +2072,7 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             return false;
         }
         uint8[] payload = Protocol.JournalEntryV2.build_remove_payload(fp, 0, ban);
-        return emit_v2(account, room_jid, (uint8) Protocol.MemberAuditActionV2.REMOVE_MEMBER,
+        return yield emit_v2(account, room_jid, (uint8) Protocol.MemberAuditActionV2.REMOVE_MEMBER,
             payload, member_jid.bare_jid);
     }
 
@@ -2038,7 +2083,7 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     public async bool group_add_admin(Dino.Entities.Account account, Jid room_jid, Jid member_jid) {
         string room_jid_str = room_jid.bare_jid.to_string();
         if (!yield ensure_private_group_bootstrapped(account, room_jid)) return false;
-        if (!ensure_v2_bridged(account, room_jid_str)) {
+        if (!yield ensure_v2_bridged(account, room_jid)) {
             warning("x3dhpq make-admin refused in %s: only the owner can enable multi-admin", room_jid_str);
             return false;
         }
@@ -2046,7 +2091,7 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         uint8[] fp;
         if (!db.get_peer_aik_fingerprint_raw(account, member_jid.bare_jid.to_string(), out fp)) return false;
         uint8[] payload = Protocol.JournalEntryV2.build_member_payload(fp, 0);
-        return emit_v2(account, room_jid, (uint8) Protocol.MemberAuditActionV2.ADD_ADMIN, payload, null);
+        return yield emit_v2(account, room_jid, (uint8) Protocol.MemberAuditActionV2.ADD_ADMIN, payload, null);
     }
 
     // Demote an admin back to plain member (action=8). The owner is undemotable
@@ -2054,26 +2099,31 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     public async bool group_remove_admin(Dino.Entities.Account account, Jid room_jid, Jid member_jid) {
         string room_jid_str = room_jid.bare_jid.to_string();
         if (!yield ensure_private_group_bootstrapped(account, room_jid)) return false;
-        if (!ensure_v2_bridged(account, room_jid_str)) {
+        if (!yield ensure_v2_bridged(account, room_jid)) {
             warning("x3dhpq remove-admin refused in %s: only the owner can enable multi-admin", room_jid_str);
             return false;
         }
         uint8[] fp;
         if (!db.get_peer_aik_fingerprint_raw(account, member_jid.bare_jid.to_string(), out fp)) return false;
         uint8[] payload = Protocol.JournalEntryV2.build_member_payload(fp, 0);
-        return emit_v2(account, room_jid, (uint8) Protocol.MemberAuditActionV2.REMOVE_ADMIN, payload, null);
+        return yield emit_v2(account, room_jid, (uint8) Protocol.MemberAuditActionV2.REMOVE_ADMIN, payload, null);
     }
 
     // Ban (RemoveMember + ban flag). A banned AIK is never re-added without an
-    // explicit causal path. On a still-v1 room this falls back to a plain v1
-    // removal (no ban semantics) — the ban flag is only expressible in v2.
+    // explicit causal path. On a still-v1 room, bridge to v2 first so the ban
+    // semantics are preserved instead of degrading to a plain v1 removal.
     public async bool group_ban_member(Dino.Entities.Account account, Jid room_jid, Jid member_jid) {
         string room_jid_str = room_jid.bare_jid.to_string();
-        if (!db.has_membership_journal(account, room_jid_str)) return false;
+        if (!db.has_membership_journal(account, room_jid_str)
+                && !db.has_membership_dag_entries(account, room_jid_str)) return false;
         if (is_v2_active(account, room_jid_str)) {
             return yield v2_remove_member(account, room_jid, member_jid, true);
         }
-        return yield remove_private_group_member(account, room_jid, member_jid);
+        if (!yield ensure_v2_bridged(account, room_jid)) {
+            warning("x3dhpq ban refused in %s: only the owner can bridge v1 to v2", room_jid_str);
+            return false;
+        }
+        return yield v2_remove_member(account, room_jid, member_jid, true);
     }
 
     // Whether the LOCAL account may perform admin/member ops in this room, per

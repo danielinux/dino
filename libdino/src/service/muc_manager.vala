@@ -19,6 +19,7 @@ public class MucManager : StreamInteractionModule, Object {
     public signal void bookmarks_updated(Account account, Set<Conference> conferences);
     public signal void conference_added(Account account, Conference conference);
     public signal void conference_removed(Account account, Jid jid);
+    public signal void default_muc_server_changed(Account account, Jid muc_server);
 
     private StreamInteractor stream_interactor;
     private HashMap<Account, HashSet<Jid>> mucs_joined = new HashMap<Account, HashSet<Jid>>(Account.hash_func, Account.equals_func);
@@ -59,6 +60,36 @@ public class MucManager : StreamInteractionModule, Object {
         stream_interactor.get_module(MessageProcessor.IDENTITY).build_message_stanza.connect(on_build_message_stanza);
     }
 
+    // Run entity_info.has_feature() but give up after `seconds`, returning false.
+    // Guards against a peer/service that never answers the underlying disco#info
+    // IQ (which has no protocol-level timeout of its own). The late response, if
+    // any, is ignored — its handler still populates the feature cache.
+    private async bool has_feature_bounded(EntityInfo entity_info, Account account, Jid jid, string feature, uint seconds) {
+        bool resumed = false;
+        bool result = false;
+        uint timeout_id = 0;
+        SourceFunc resume = has_feature_bounded.callback;
+
+        entity_info.has_feature.begin(account, jid, feature, (obj, res) => {
+            bool r = entity_info.has_feature.end(res);
+            if (resumed) return;
+            resumed = true;
+            result = r;
+            if (timeout_id != 0) Source.remove(timeout_id);
+            resume();
+        });
+        timeout_id = Timeout.add_seconds(seconds, () => {
+            if (resumed) return false;
+            resumed = true;
+            timeout_id = 0;
+            warning("[%s] disco#info(%s) on %s timed out after %us", account.bare_jid.to_string(), feature, jid.to_string(), seconds);
+            resume();
+            return false;
+        });
+        yield;
+        return result;
+    }
+
     // already_autojoin: Without this flag we'd be retrieving bookmarks (to check for autojoin) from the sender on every join
     public async Muc.JoinResult? join(Account account, Jid jid, string? nick, string? password, bool already_autojoin = false, Cancellable? cancellable = null) {
         XmppStream? stream = stream_interactor.get_stream(account);
@@ -75,7 +106,21 @@ public class MucManager : StreamInteractionModule, Object {
 
         bool receive_history = true;
         EntityInfo entity_info = stream_interactor.get_module(EntityInfo.IDENTITY);
-        bool can_do_mam = yield entity_info.has_feature(account, jid, Xmpp.MessageArchiveManagement.NS_URI);
+        bool can_do_mam;
+        if (conversation != null) {
+            // Rejoining a room we've synced before: it exists, so a live MAM
+            // capability probe resolves. Keep it bounded so a flaky disco can't
+            // wedge the rejoin, and use MAM for efficient incremental catch-up.
+            can_do_mam = yield has_feature_bounded(entity_info, account, jid, Xmpp.MessageArchiveManagement.NS_URI, 8);
+        } else {
+            // Creating a room (or first-joining one) — the room may not exist yet,
+            // and a disco#info to it is an IQ with no protocol-level timeout that
+            // some MUC services never answer for a non-existent room, which would
+            // wedge creation. Don't issue a live probe: consult only the
+            // non-blocking offline caps cache, so we still use MAM when we already
+            // know the room supports it, and otherwise request inline history.
+            can_do_mam = entity_info.has_feature_offline(account, jid, Xmpp.MessageArchiveManagement.NS_URI);
+        }
         if (can_do_mam) {
             receive_history = false;
             history_since = null;
@@ -89,6 +134,11 @@ public class MucManager : StreamInteractionModule, Object {
         Muc.JoinResult? res = yield stream.get_module(Xep.Muc.Module.IDENTITY).enter(stream, jid.bare_jid, nick_, password, history_since, receive_history, null);
 
         mucs_joining[account].remove(jid);
+
+        if (res == null) {
+            warning("[%s] Failed to join MUC %s: no join result", account.bare_jid.to_string(), jid.to_string());
+            return null;
+        }
 
         if (res.nick != null) {
             // Join completed
@@ -193,12 +243,14 @@ public class MucManager : StreamInteractionModule, Object {
         }
 
         // Update nick in bookmark
-        Set<Conference>? conferences = yield bookmarks_provider[conversation.account].get_conferences(stream);
+        BookmarksProvider? provider = bookmarks_provider[conversation.account];
+        if (provider == null) return;
+        Set<Conference>? conferences = yield provider.get_conferences(stream);
         if (conferences == null) return;
         foreach (Conference conference in conferences) {
             if (conference.jid.equals(conversation.counterpart)) {
                 Conference new_conference = new Conference() { jid=conversation.counterpart, nick=new_nick, name=conference.name, password=conference.password, autojoin=conference.autojoin };
-                bookmarks_provider[conversation.account].replace_conference.begin(stream, conversation.counterpart, new_conference);
+                provider.replace_conference.begin(stream, conversation.counterpart, new_conference);
                 break;
             }
         }
@@ -322,20 +374,29 @@ public class MucManager : StreamInteractionModule, Object {
         XmppStream? stream = stream_interactor.get_stream(account);
         if (stream == null) return null;
 
-        return yield bookmarks_provider[account].get_conferences(stream);
+        // The provider is normally set up in on_stream_negotiated, but a
+        // XEP-0198 stream *resume* reconnects without re-firing that handler,
+        // leaving a live stream with no provider. Initialize on demand so
+        // callers (e.g. the Add Channel dialog) never dereference a null.
+        yield initialize_bookmarks_provider(account);
+        BookmarksProvider? provider = bookmarks_provider[account];
+        if (provider == null) return null;
+        return yield provider.get_conferences(stream);
     }
 
     public void add_bookmark(Account account, Conference conference) {
         XmppStream? stream = stream_interactor.get_stream(account);
-        if (stream != null) {
-            bookmarks_provider[account].add_conference.begin(stream, conference);
+        BookmarksProvider? provider = bookmarks_provider[account];
+        if (stream != null && provider != null) {
+            provider.add_conference.begin(stream, conference);
         }
     }
 
     public void remove_bookmark(Account account, Conference conference) {
         XmppStream? stream = stream_interactor.get_stream(account);
-        if (stream != null) {
-            bookmarks_provider[account].remove_conference.begin(stream, conference);
+        BookmarksProvider? provider = bookmarks_provider[account];
+        if (stream != null && provider != null) {
+            provider.remove_conference.begin(stream, conference);
         }
     }
 
@@ -500,17 +561,42 @@ public class MucManager : StreamInteractionModule, Object {
                         item.jid.to_string().has_prefix("chat");
                 if ((i == 0 && !promising_upload_item) || (i == 1) && promising_upload_item) continue;
 
-                Gee.Set<Xep.ServiceDiscovery.Identity> identities = yield stream_interactor.get_module(EntityInfo.IDENTITY).get_identities(account, item.jid);
-                if (identities == null) return;
+                Gee.Set<Xep.ServiceDiscovery.Identity>? identities = yield stream_interactor.get_module(EntityInfo.IDENTITY).get_identities(account, item.jid);
+                if (identities == null) continue;
 
                 foreach (Xep.ServiceDiscovery.Identity identity in identities) {
                     if (identity.category == Xep.ServiceDiscovery.Identity.CATEGORY_CONFERENCE) {
-                        default_muc_server[account] = item.jid;
-                        debug("[%s] Default MUC: %s", account.bare_jid.to_string(), item.jid.to_string());
+                        set_default_muc_server(account, item.jid);
                         return;
                     }
                 }
             }
+        }
+
+        foreach (string prefix in new string[] { "conference", "muc", "chat", "groups" }) {
+            try {
+                Jid candidate = new Jid(prefix + "." + stream.remote_name.to_string());
+                Gee.Set<Xep.ServiceDiscovery.Identity>? identities =
+                    yield stream_interactor.get_module(EntityInfo.IDENTITY).get_identities(account, candidate);
+                if (identities == null) continue;
+                foreach (Xep.ServiceDiscovery.Identity identity in identities) {
+                    if (identity.category == Xep.ServiceDiscovery.Identity.CATEGORY_CONFERENCE) {
+                        set_default_muc_server(account, candidate);
+                        return;
+                    }
+                }
+            } catch (InvalidJidError e) {
+                // Ignore malformed synthesized service names.
+            }
+        }
+    }
+
+    private void set_default_muc_server(Account account, Jid muc_server) {
+        Jid? previous = default_muc_server[account];
+        default_muc_server[account] = muc_server;
+        debug("[%s] Default MUC: %s", account.bare_jid.to_string(), muc_server.to_string());
+        if (previous == null || !previous.equals(muc_server)) {
+            default_muc_server_changed(account, muc_server);
         }
     }
 
@@ -623,34 +709,38 @@ public class MucManager : StreamInteractionModule, Object {
     }
 
     private void set_autojoin(Account account, XmppStream stream, Jid jid, string? nick, string? password) {
-        bookmarks_provider[account].get_conferences.begin(stream, (_, res) => {
-            Set<Conference>? conferences = bookmarks_provider[account].get_conferences.end(res);
+        BookmarksProvider? provider = bookmarks_provider[account];
+        if (provider == null) return;
+        provider.get_conferences.begin(stream, (_, res) => {
+            Set<Conference>? conferences = provider.get_conferences.end(res);
             if (conferences == null) return;
 
             foreach (Conference conference in conferences) {
                 if (conference.jid.equals(jid)) {
                     if (!conference.autojoin) {
                         Conference new_conference = new Conference() { jid=jid, nick=nick ?? conference.nick, name=conference.name, password=password ?? conference.password, autojoin=true };
-                        bookmarks_provider[account].replace_conference.begin(stream, jid, new_conference);
+                        provider.replace_conference.begin(stream, jid, new_conference);
                     }
                     return;
                 }
             }
             Conference changed = new Xep.Bookmarks.Bookmarks1Conference(jid) { nick=nick, password=password, autojoin=true };
-            bookmarks_provider[account].add_conference.begin(stream, changed);
+            provider.add_conference.begin(stream, changed);
         });
     }
 
     private void unset_autojoin(Account account, XmppStream stream, Jid jid) {
-        bookmarks_provider[account].get_conferences.begin(stream, (_, res) => {
-            Set<Conference>? conferences = bookmarks_provider[account].get_conferences.end(res);
+        BookmarksProvider? provider = bookmarks_provider[account];
+        if (provider == null) return;
+        provider.get_conferences.begin(stream, (_, res) => {
+            Set<Conference>? conferences = provider.get_conferences.end(res);
             if (conferences == null) return;
 
             foreach (Conference conference in conferences) {
                 if (conference.jid.equals(jid)) {
                     if (conference.autojoin) {
                         Conference new_conference = new Conference() { jid=jid, nick=conference.nick, name=conference.name, password=conference.password, autojoin=false };
-                        bookmarks_provider[account].replace_conference.begin(stream, jid, new_conference);
+                        provider.replace_conference.begin(stream, jid, new_conference);
                         return;
                     }
                 }

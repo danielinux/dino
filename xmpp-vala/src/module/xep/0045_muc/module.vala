@@ -117,11 +117,27 @@ public class Module : XmppStreamModule {
 
             var promise = new Promise<JoinResult?>();
             stream.get_flag(Flag.IDENTITY).enter_futures[bare_jid] = promise;
+            // A MUC join is answered by a presence (self-reflection or error), which
+            // has no protocol-level timeout. If the service never answers (e.g. it
+            // silently drops a room-creation join), bound the wait so the caller
+            // gets a failure instead of hanging forever.
+            bool timed_out = false;
+            uint timeout_id = Timeout.add_seconds(20, () => {
+                timed_out = true;
+                if (!promise.future.ready) {
+                    warning("MUC join to %s timed out after 20s with no server response", bare_jid.to_string());
+                    stream.get_flag(Flag.IDENTITY).finish_muc_enter(bare_jid);
+                    promise.set_value(new JoinResult() { stanza_error = "remote-server-timeout" });
+                }
+                return false;
+            });
             try {
                 JoinResult? enter_result = yield promise.future.wait_async();
+                if (!timed_out) Source.remove(timeout_id);
                 stream.get_flag(Flag.IDENTITY).enter_futures.unset(bare_jid);
                 return enter_result;
             } catch (Gee.FutureError e) {
+                if (!timed_out) Source.remove(timeout_id);
                 return null;
             }
         } catch (InvalidJidError e) {

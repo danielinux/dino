@@ -302,14 +302,22 @@ public class Dino.Ui.Application : Adw.Application, Dino.Application {
     private void show_join_muc_dialog(Account? account, string jid) {
         Dialog dialog = new Dialog.with_buttons(_("Join Channel"), window, Gtk.DialogFlags.MODAL | Gtk.DialogFlags.USE_HEADER_BAR, _("Join"), ResponseType.OK, _("Cancel"), ResponseType.CANCEL);
         dialog.modal = true;
-        Button ok_button = dialog.get_widget_for_response(ResponseType.OK) as Button;
+        Button? ok_button = dialog.get_widget_for_response(ResponseType.OK) as Button;
+        if (ok_button == null) {
+            dialog.destroy();
+            return;
+        }
         ok_button.add_css_class("suggested-action");
         ConferenceDetailsFragment conference_fragment = new ConferenceDetailsFragment(stream_interactor) { ok_button=ok_button };
         conference_fragment.jid = jid;
         if (account != null)  {
             conference_fragment.account = account;
         }
-        Box content_area = dialog.get_content_area();
+        Box? content_area = dialog.get_content_area() as Box;
+        if (content_area == null) {
+            dialog.destroy();
+            return;
+        }
         content_area.append(conference_fragment);
         conference_fragment.joined.connect(() => {
             dialog.destroy();
@@ -322,4 +330,3 @@ public class Dino.Ui.Application : Adw.Application, Dino.Application {
         dialog.present();
     }
 }
-

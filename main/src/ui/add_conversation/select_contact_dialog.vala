@@ -64,7 +64,7 @@ public class SelectContactDialog : Gtk.Dialog {
         roster_list_box = roster_list.get_list_box();
         roster_list_box.row_activated.connect(() => { ok_button.clicked(); });
         select_jid_fragment = new SelectJidFragment(stream_interactor, roster_list_box, accounts);
-        select_jid_fragment.add_jid.connect((row) => {
+        select_jid_fragment.add_jid.connect(() => {
             AddContactDialog add_contact_dialog = new AddContactDialog(stream_interactor);
             add_contact_dialog.set_transient_for(this);
             add_contact_dialog.present();

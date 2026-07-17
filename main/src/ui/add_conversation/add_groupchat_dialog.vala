@@ -33,6 +33,7 @@ protected class AddGroupchatDialog : Gtk.Dialog {
     // persistent, x3dhpq-encrypted "Secret Post-Quantum Group". The JID is
     // auto-generated on the account's MUC service and encryption is always on.
     private bool secret_pq_mode = false;
+    private bool create_in_progress = false;
 
     public AddGroupchatDialog(StreamInteractor stream_interactor, string? title = null, bool private_group_default = true, bool secret_pq_mode = false) {
         Object(use_header_bar : 1);
@@ -50,13 +51,28 @@ protected class AddGroupchatDialog : Gtk.Dialog {
         }
 
         cancel_button.clicked.connect(() => { close(); });
-        ok_button.clicked.connect(() => { on_ok_button_clicked.begin(); });
+        ok_button.clicked.connect(begin_create);
+        response.connect((response_id) => {
+            if (response_id == ResponseType.OK) {
+                begin_create();
+            }
+        });
 
         jid_entry.changed.connect(on_jid_key_release);
+        alias_entry.changed.connect(() => {
+            alias_entry_changed = true;
+            check_ok();
+        });
         nick_entry.changed.connect(check_ok);
         account_combobox.changed.connect(check_ok);
         if (secret_pq_mode) {
             account_combobox.changed.connect(update_secret_server_gate);
+            stream_interactor.get_module(MucManager.IDENTITY).default_muc_server_changed.connect((account, muc_server) => {
+                Account? selected = account_combobox.selected;
+                if (selected != null && selected.equals(account)) {
+                    update_secret_server_gate();
+                }
+            });
             update_secret_server_gate();
         }
     }
@@ -83,25 +99,14 @@ protected class AddGroupchatDialog : Gtk.Dialog {
         alias_entry.grab_focus();
     }
 
-    // Server capability gate: only offer creation if the selected account has a
-    // discovered MUC (XEP-0045) conference service. Dino discovers a
-    // CATEGORY_CONFERENCE service (advertising http://jabber.org/protocol/muc)
-    // and exposes it via MucManager.default_muc_server; a null entry means the
-    // server does not offer group chats, so we disable creation and explain why.
+    // Dino's regular MUC discovery can miss servers that expose the group
+    // service as groups.<domain>. For the x3dhpq branch, prefer that service
+    // name instead of blocking creation on a stale discovery cache.
     private void update_secret_server_gate() {
         if (!secret_pq_mode) return;
-        Account? account = account_combobox.selected;
-        bool muc_available = account != null &&
-                stream_interactor.get_module(MucManager.IDENTITY).default_muc_server[account] != null;
-        if (muc_available) {
-            secret_header_subtitle.label = _("End-to-end post-quantum encrypted and invite-only. Only you, the creator, can add or remove members.");
-            secret_header_subtitle.remove_css_class("error");
-            alias_entry.sensitive = true;
-        } else {
-            secret_header_subtitle.label = _("Your server doesn’t allow group chats, so a secret group can’t be created on this account.");
-            secret_header_subtitle.add_css_class("error");
-            alias_entry.sensitive = false;
-        }
+        secret_header_subtitle.label = _("End-to-end post-quantum encrypted and invite-only. Only you, the creator, can add or remove members.");
+        secret_header_subtitle.remove_css_class("error");
+        alias_entry.sensitive = true;
         check_ok();
     }
 
@@ -123,15 +128,16 @@ protected class AddGroupchatDialog : Gtk.Dialog {
 
     private void check_ok() {
         if (secret_pq_mode) {
-            // JID is auto-generated on the account's MUC service; the only
-            // requirement is that such a service exists.
+            // JID is auto-generated on the account's group service; the only UI
+            // requirements are a selected account and a user-facing group name.
             Account? account = account_combobox.selected;
-            ok_button.sensitive = account != null &&
-                    stream_interactor.get_module(MucManager.IDENTITY).default_muc_server[account] != null;
+            ok_button.sensitive = account != null && alias_entry.text.strip() != "";
             return;
         }
         if (jid_entry.text.strip() == "") {
-            ok_button.sensitive = stream_interactor.get_module(MucManager.IDENTITY).default_muc_server[account_combobox.selected] != null;
+            Account? account = account_combobox.selected;
+            ok_button.sensitive = account != null &&
+                    stream_interactor.get_module(MucManager.IDENTITY).default_muc_server[account] != null;
             return;
         }
         try {
@@ -142,14 +148,27 @@ protected class AddGroupchatDialog : Gtk.Dialog {
         }
     }
 
+    private void begin_create() {
+        if (create_in_progress) return;
+        create_in_progress = true;
+        ok_button.sensitive = false;
+        ok_button.label = secret_pq_mode ? _("Creating…") : _("Creating");
+        on_ok_button_clicked.begin();
+    }
+
     private async void on_ok_button_clicked() {
         try {
-            Account account = account_combobox.selected;
+            Account? selected = account_combobox.selected;
+            if (selected == null) {
+                warning("Failed to create groupchat: no account selected");
+                return;
+            }
+            Account account = selected;
             Jid room_jid = yield get_target_room_jid(account);
 
             Conference conference = new Conference();
             conference.jid = room_jid;
-            conference.nick = nick_entry.text != "" ? nick_entry.text : null;
+            conference.nick = get_group_nick(account);
             conference.password = password_entry.text != "" ? password_entry.text : null;
             conference.name = alias_entry.text != "" ? alias_entry.text : room_jid.localpart;
 
@@ -157,6 +176,7 @@ protected class AddGroupchatDialog : Gtk.Dialog {
             if (should_join) {
                 Muc.JoinResult? join_result = yield stream_interactor.get_module(MucManager.IDENTITY).join(account, room_jid, conference.nick, conference.password);
                 if (join_result == null || join_result.nick == null) {
+                    warning("Failed to create groupchat %s: join returned no occupant nick", room_jid.to_string());
                     return;
                 }
                 if (join_result.newly_created && private_group_switch.active) {
@@ -184,16 +204,39 @@ protected class AddGroupchatDialog : Gtk.Dialog {
             close();
         } catch (Error e) {
             warning("Failed to create groupchat: %s", e.message);
+        } finally {
+            create_in_progress = false;
+            ok_button.label = secret_pq_mode ? _("Create Secret Group") : _("Create");
+            check_ok();
         }
+    }
+
+    private string get_group_nick(Account account) {
+        if (!secret_pq_mode && nick_entry.text.strip() != "") {
+            return nick_entry.text.strip();
+        }
+        if (account.alias != null && account.alias.strip() != "") {
+            return account.alias.strip();
+        }
+        return account.localpart;
     }
 
     private async Jid get_target_room_jid(Account account) throws Error {
         if (jid_entry.text.strip() != "") {
             return new Jid(jid_entry.text);
         }
+        // Use the cached, already-discovered conference service if we have one
+        // (e.g. conference.<domain>). We deliberately read the cache synchronously
+        // rather than triggering discovery here: server disco is unbounded and can
+        // hang on an unresponsive component, which would freeze creation. For a
+        // secret group, synthesize groups.<domain> when nothing is cached — the
+        // server accepts room creation on that service directly.
         Jid? muc_service = stream_interactor.get_module(MucManager.IDENTITY).default_muc_server[account];
         if (muc_service == null) {
-            throw new IOError.FAILED("MUC service not available");
+            if (!secret_pq_mode) {
+                throw new IOError.FAILED("MUC service not available");
+            }
+            muc_service = new Jid("groups." + account.domainpart);
         }
         return new Jid("%08x@".printf(Random.next_int()) + muc_service.to_string());
     }

@@ -278,6 +278,23 @@ public class Database : Qlite.Database {
         }
     }
 
+    // WS2 multi-admin membership DAG persistence. Stores the exact
+    // JournalEntryV2.marshal() bytes as base64 so group-sync rebroadcast and
+    // restart hydration preserve the original wire framing byte-for-byte.
+    public class MembershipDagTable : Table {
+        public Column<int> account_id = new Column.Integer("account_id") { not_null = true };
+        public Column<string> room_jid = new Column.NonNullText("room_jid");
+        public Column<string> entry_hash_hex = new Column.NonNullText("entry_hash_hex");
+        public Column<string> entry_blob_base64 = new Column.NonNullText("entry_blob_base64");
+        public Column<long> created_at = new Column.Long("created_at") { not_null = true };
+
+        internal MembershipDagTable(Database db) {
+            base(db, "membership_dag");
+            init({ account_id, room_jid, entry_hash_hex, entry_blob_base64, created_at });
+            unique({ account_id, room_jid, entry_hash_hex });
+        }
+    }
+
     // §11.7 device-audit DAG (device_dag.vala): local persisted store of every
     // known DeviceAuditEntryV2 for the account, keyed by its own content hash
     // so re-ingesting the same entry (e.g. re-deriving the genesis Snapshot on
@@ -456,6 +473,7 @@ public class Database : Qlite.Database {
     public PairwiseSessionTable pairwise_session { get; private set; }
     public GroupSessionTable group_session { get; private set; }
     public MembershipJournalTable membership_journal { get; private set; }
+    public MembershipDagTable membership_dag { get; private set; }
     public DeviceAuditTable device_audit { get; private set; }
     public AuditEntryTable audit_entry { get; private set; }
     public RecoveryBlobTable recovery_blob { get; private set; }
@@ -479,6 +497,7 @@ public class Database : Qlite.Database {
         pairwise_session = new PairwiseSessionTable(this);
         group_session = new GroupSessionTable(this);
         membership_journal = new MembershipJournalTable(this);
+        membership_dag = new MembershipDagTable(this);
         device_audit = new DeviceAuditTable(this);
         audit_entry = new AuditEntryTable(this);
         recovery_blob = new RecoveryBlobTable(this);
@@ -487,7 +506,7 @@ public class Database : Qlite.Database {
         device_nickname = new DeviceNicknameTable(this);
         revoked_device = new RevokedDeviceTable(this);
         message_device = new MessageDeviceTable(this);
-        init({ account_identity, peer_account_identity, peer_device, device_list, trust_manifest, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, group_session, membership_journal, device_audit, audit_entry, recovery_blob, pairing_session, pending_enrollment_request, device_nickname, revoked_device, message_device });
+        init({ account_identity, peer_account_identity, peer_device, device_list, trust_manifest, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, group_session, membership_journal, membership_dag, device_audit, audit_entry, recovery_blob, pairing_session, pending_enrollment_request, device_nickname, revoked_device, message_device });
     }
 
     public Row? get_local_identity(int account_id) {
@@ -2101,6 +2120,13 @@ public class Database : Qlite.Database {
             .count() > 0;
     }
 
+    public bool has_membership_dag_entries(Account account, string room_jid) {
+        return membership_dag.select()
+            .with(membership_dag.account_id, "=", account.id)
+            .with(membership_dag.room_jid, "=", room_jid)
+            .count() > 0;
+    }
+
     // Returns all stored journal entries for the given room ordered by seq.
     // Caller is responsible for re-applying them to in-memory GroupSession.
     public Gee.List<Protocol.MemberAuditEntry> list_membership_journal_entries(
@@ -2164,6 +2190,38 @@ public class Database : Qlite.Database {
             // reloaded+re-marshalled entry reproduces the exact signed_part.
             .value(membership_journal.created_at, (long) entry.timestamp)
             .perform();
+    }
+
+    public void store_membership_dag_entry_blob(Account account, string room_jid, uint8[] entry_blob) {
+        try {
+            string entry_hash_hex = bytes_to_hex_string(bytes_to_uint8_array(
+                global::X3dhpq.Crypto.sha256(new Bytes(entry_blob))));
+            membership_dag.upsert()
+                .value(membership_dag.account_id, account.id, true)
+                .value(membership_dag.room_jid, room_jid, true)
+                .value(membership_dag.entry_hash_hex, entry_hash_hex, true)
+                .value(membership_dag.entry_blob_base64, Base64.encode(entry_blob))
+                .value(membership_dag.created_at, (long) new DateTime.now_utc().to_unix())
+                .perform();
+        } catch (Error err) {
+            warning("store_membership_dag_entry_blob failed for %s: %s", room_jid, err.message);
+        }
+    }
+
+    public Gee.List<Bytes> list_membership_dag_entry_blobs(Account account, string room_jid) {
+        var out_entries = new Gee.ArrayList<Bytes>();
+        var rows = membership_dag.select()
+            .with(membership_dag.account_id, "=", account.id)
+            .with(membership_dag.room_jid, "=", room_jid)
+            .order_by(membership_dag.created_at, "ASC");
+        foreach (Row r in rows) {
+            try {
+                out_entries.add(bytes_from_base64(r[membership_dag.entry_blob_base64]));
+            } catch (Error err) {
+                continue;
+            }
+        }
+        return out_entries;
     }
 
     // §11.7 device-audit DAG persistence (device_dag.vala). Upsert-by-natural-key

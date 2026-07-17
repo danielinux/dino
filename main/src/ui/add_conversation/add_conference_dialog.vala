@@ -19,6 +19,10 @@ public class AddConferenceDialog : Gtk.Dialog {
     private ListBox conference_list_box;
 
     private StreamInteractor stream_interactor;
+    private ulong cancel_clicked_handler_id = 0;
+    private ulong ok_clicked_handler_id = 0;
+    private ulong select_done_handler_id = 0;
+    private ulong details_done_handler_id = 0;
 
     public AddConferenceDialog(StreamInteractor stream_interactor) {
         Object(use_header_bar : 1);
@@ -28,11 +32,13 @@ public class AddConferenceDialog : Gtk.Dialog {
         this.default_height = 550;
         this.stream_interactor = stream_interactor;
 
+        setup_headerbar();
         stack.visible = true;
         stack.vhomogeneous = false;
-        get_content_area().append(stack);
-
-        setup_headerbar();
+        Box? content_area = get_content_area() as Box;
+        if (content_area != null) {
+            content_area.append(stack);
+        }
         setup_jid_add_view();
         setup_conference_details_view();
         show_jid_add_view();
@@ -40,14 +46,15 @@ public class AddConferenceDialog : Gtk.Dialog {
 
     private void show_jid_add_view() {
         cancel_button.set_label(_("Cancel"));
-        cancel_button.clicked.disconnect(show_jid_add_view);
-        cancel_button.clicked.connect(on_cancel);
+        disconnect_cancel_clicked_handler();
+        cancel_clicked_handler_id = cancel_button.clicked.connect(() => on_cancel());
         ok_button.label = _("Next");
         ok_button.sensitive = select_fragment.done;
-        ok_button.clicked.connect(on_next_button_clicked);
+        disconnect_ok_clicked_handler();
+        ok_clicked_handler_id = ok_button.clicked.connect(() => on_next_button_clicked());
         details_fragment.fragment_active = false;
-        details_fragment.notify["done"].disconnect(set_ok_sensitive_from_details);
-        select_fragment.notify["done"].connect(set_ok_sensitive_from_select);
+        set_details_done_handler(false);
+        set_select_done_handler(true);
 
         stack.transition_type = StackTransitionType.SLIDE_RIGHT;
         stack.set_visible_child_name("select");
@@ -55,26 +62,61 @@ public class AddConferenceDialog : Gtk.Dialog {
 
     private void show_conference_details_view() {
         cancel_button.set_icon_name("dino-go-previous-symbolic");
-        cancel_button.clicked.disconnect(on_cancel);
-        cancel_button.clicked.connect(show_jid_add_view);
+        disconnect_cancel_clicked_handler();
+        cancel_clicked_handler_id = cancel_button.clicked.connect(() => show_jid_add_view());
         ok_button.label = _("Join");
         ok_button.sensitive = details_fragment.done;
-        ok_button.clicked.disconnect(on_next_button_clicked);
+        disconnect_ok_clicked_handler();
         details_fragment.fragment_active = true;
-        select_fragment.notify["done"].disconnect(set_ok_sensitive_from_select);
-        details_fragment.notify["done"].connect(set_ok_sensitive_from_details);
+        set_select_done_handler(false);
+        set_details_done_handler(true);
 
         stack.transition_type = StackTransitionType.SLIDE_LEFT;
         stack.set_visible_child_name("details");
         animate_window_resize(details_fragment);
     }
 
+    private void disconnect_cancel_clicked_handler() {
+        if (cancel_clicked_handler_id != 0) {
+            cancel_button.disconnect(cancel_clicked_handler_id);
+            cancel_clicked_handler_id = 0;
+        }
+    }
+
+    private void disconnect_ok_clicked_handler() {
+        if (ok_clicked_handler_id != 0) {
+            ok_button.disconnect(ok_clicked_handler_id);
+            ok_clicked_handler_id = 0;
+        }
+    }
+
+    private void set_select_done_handler(bool enabled) {
+        if (select_done_handler_id != 0) {
+            select_fragment.disconnect(select_done_handler_id);
+            select_done_handler_id = 0;
+        }
+        if (enabled) {
+            select_done_handler_id = select_fragment.notify["done"].connect(set_ok_sensitive_from_select);
+        }
+    }
+
+    private void set_details_done_handler(bool enabled) {
+        if (details_done_handler_id != 0) {
+            details_fragment.disconnect(details_done_handler_id);
+            details_done_handler_id = 0;
+        }
+        if (enabled) {
+            details_done_handler_id = details_fragment.notify["done"].connect(set_ok_sensitive_from_details);
+        }
+    }
+
     private void setup_headerbar() {
         ok_button = new Button() { can_focus=true };
         ok_button.add_css_class("suggested-action");
 
-        HeaderBar header_bar = get_header_bar() as HeaderBar;
+        HeaderBar header_bar = new HeaderBar();
         header_bar.show_title_buttons = false;
+        set_titlebar(header_bar);
 
         header_bar.pack_start(cancel_button);
         header_bar.pack_end(ok_button);
@@ -86,7 +128,7 @@ public class AddConferenceDialog : Gtk.Dialog {
         conference_list_box.row_activated.connect(() => { ok_button.clicked(); });
 
         select_fragment = new SelectJidFragment(stream_interactor, conference_list_box, stream_interactor.get_accounts());
-        select_fragment.add_jid.connect((row) => {
+        select_fragment.add_jid.connect(() => {
             AddGroupchatDialog dialog = new AddGroupchatDialog(stream_interactor, _("New Private Channel"), true);
             dialog.set_transient_for(this);
             dialog.present();
@@ -123,8 +165,11 @@ public class AddConferenceDialog : Gtk.Dialog {
     private void on_next_button_clicked() {
         details_fragment.clear();
 
-        ListRow? row = conference_list_box.get_selected_row() != null ? conference_list_box.get_selected_row().get_child() as ListRow : null;
-        ConferenceListRow? conference_row = conference_list_box.get_selected_row() != null ? conference_list_box.get_selected_row().get_child() as ConferenceListRow : null;
+        ListBoxRow? selected = conference_list_box.get_selected_row();
+        if (selected == null || selected.get_child() == null) return;
+
+        ListRow? row = selected.get_child() as ListRow;
+        ConferenceListRow? conference_row = selected.get_child() as ConferenceListRow;
         if (conference_row != null) {
             details_fragment.account = conference_row.account;
             details_fragment.jid = conference_row.bookmark.jid.to_string();
@@ -134,6 +179,8 @@ public class AddConferenceDialog : Gtk.Dialog {
         } else if (row != null) {
             details_fragment.account = row.account;
             details_fragment.jid = row.jid.to_string();
+        } else {
+            return;
         }
         show_conference_details_view();
     }

@@ -14,9 +14,10 @@ protected class ConferenceDetailsFragment : Box {
 
     public bool done { get; private set; }
 
-    public Account account {
+    public Account? account {
         owned get { return account_combobox.selected; }
         set {
+            if (value == null) return;
             accounts_label.label = value.bare_jid.to_string();
             account_combobox.selected = value;
             if (nick == null && value.alias != null) {
@@ -104,8 +105,13 @@ protected class ConferenceDetailsFragment : Box {
         nick_button.clicked.connect(() => { set_active_stack(nick_stack); });
         password_button.clicked.connect(() => { set_active_stack(password_stack); });
 
-        account_combobox.changed.connect(() => { accounts_label.label = account_combobox.selected.bare_jid.to_string(); });
-        accounts_label.label = account_combobox.selected.bare_jid.to_string();
+        account_combobox.changed.connect(() => {
+            Account? selected = account_combobox.selected;
+            accounts_label.label = selected != null ? selected.bare_jid.to_string() : "";
+            check_if_done();
+        });
+        Account? selected = account_combobox.selected;
+        accounts_label.label = selected != null ? selected.bare_jid.to_string() : "";
 //        jid_entry.key_release_event.connect(on_jid_key_release_event);
 //        nick_entry.key_release_event.connect(on_nick_key_release_event);
 //        password_entry.key_release_event.connect(on_password_key_release_event);
@@ -146,45 +152,54 @@ protected class ConferenceDetailsFragment : Box {
         string label_text = "";
         try {
             Jid parsed_jid = new Jid(jid);
-            Muc.JoinResult? join_result = yield stream_interactor.get_module(MucManager.IDENTITY).join(account, parsed_jid, nick, password);
+            Account? selected = account;
+            if (selected == null) {
+                label_text = _("No account selected");
+            } else {
+                Muc.JoinResult? join_result = yield stream_interactor.get_module(MucManager.IDENTITY).join(selected, parsed_jid, nick, password);
 
-            ok_button.label = _("Join");
-            ok_button.sensitive = true;
-            if (join_result == null || join_result.nick != null) {
-                Conversation conversation = stream_interactor.get_module(ConversationManager.IDENTITY).create_conversation(parsed_jid, account, Conversation.Type.GROUPCHAT);
-                Application app = GLib.Application.get_default() as Application;
-                app.controller.select_conversation(conversation);
-                joined();
-                return;
-            }
-
-            if (join_result.muc_error != null) {
-                switch (join_result.muc_error) {
-                    case Muc.MucEnterError.PASSWORD_REQUIRED:
-                        label_text = _("Password required to enter room");
-                        password_text_label.visible = true;
-                        password_stack.visible = true;
-                        break;
-                    case Muc.MucEnterError.BANNED:
-                        label_text = _("Banned from joining or creating conference"); break;
-                    case Muc.MucEnterError.ROOM_DOESNT_EXIST:
-                        label_text = _("Room does not exist"); break;
-                    case Muc.MucEnterError.CREATION_RESTRICTED:
-                        label_text = _("Not allowed to create room"); break;
-                    case Muc.MucEnterError.NOT_IN_MEMBER_LIST:
-                        label_text = _("Members-only room"); break;
-                    case Muc.MucEnterError.USE_RESERVED_ROOMNICK:
-                    case Muc.MucEnterError.NICK_CONFLICT:
-                        label_text = _("Choose a different nick"); break;
-                    case Muc.MucEnterError.OCCUPANT_LIMIT_REACHED:
-                        label_text = _("Too many occupants in room"); break;
+                if (join_result != null && join_result.nick != null) {
+                    Conversation conversation = stream_interactor.get_module(ConversationManager.IDENTITY).create_conversation(parsed_jid, selected, Conversation.Type.GROUPCHAT);
+                    Application? app = GLib.Application.get_default() as Application;
+                    if (app != null) {
+                        app.controller.select_conversation(conversation);
+                    }
+                    joined();
+                    return;
                 }
-            } else if (join_result.stanza_error != null) {
-                label_text = _("Could not connect to %s").printf((new Jid(jid)).domainpart);
+
+                if (join_result == null) {
+                    label_text = _("Could not connect to %s").printf(parsed_jid.domainpart);
+                } else if (join_result.muc_error != null) {
+                    switch (join_result.muc_error) {
+                        case Muc.MucEnterError.PASSWORD_REQUIRED:
+                            label_text = _("Password required to enter room");
+                            password_text_label.visible = true;
+                            password_stack.visible = true;
+                            break;
+                        case Muc.MucEnterError.BANNED:
+                            label_text = _("Banned from joining or creating conference"); break;
+                        case Muc.MucEnterError.ROOM_DOESNT_EXIST:
+                            label_text = _("Room does not exist"); break;
+                        case Muc.MucEnterError.CREATION_RESTRICTED:
+                            label_text = _("Not allowed to create room"); break;
+                        case Muc.MucEnterError.NOT_IN_MEMBER_LIST:
+                            label_text = _("Members-only room"); break;
+                        case Muc.MucEnterError.USE_RESERVED_ROOMNICK:
+                        case Muc.MucEnterError.NICK_CONFLICT:
+                            label_text = _("Choose a different nick"); break;
+                        case Muc.MucEnterError.OCCUPANT_LIMIT_REACHED:
+                            label_text = _("Too many occupants in room"); break;
+                    }
+                } else if (join_result.stanza_error != null) {
+                    label_text = _("Could not connect to %s").printf((new Jid(jid)).domainpart);
+                }
             }
         } catch (InvalidJidError e) {
             label_text = _("Invalid address");
         }
+        ok_button.label = _("Join");
+        ok_button.sensitive = true;
         notification_label.label = label_text;
         notification_revealer.set_reveal_child(true);
     }
@@ -192,7 +207,7 @@ protected class ConferenceDetailsFragment : Box {
     private void check_if_done() {
         try {
             Jid parsed_jid = new Jid(jid);
-            done = parsed_jid.localpart != null && parsed_jid.resourcepart == null && nick != null;
+            done = account != null && parsed_jid.localpart != null && parsed_jid.resourcepart == null && nick != null;
         } catch (InvalidJidError e) {
             done = false;
         }

@@ -39,6 +39,13 @@ public class StreamModule : XmppStreamModule {
         .set_max_items("1")
         .set_access_model(Pubsub.ACCESS_MODEL_OPEN);
     private HashMap<Jid, Future<ArrayList<int>>> active_devicelist_requests = new HashMap<Jid, Future<ArrayList<int>>>(Jid.hash_func, Jid.equals_func);
+    // Per-(bare_jid/device_id) cooldown on bundle fetches. Callers re-request a
+    // bundle whenever the stored one is missing or fails verify(); without a
+    // cooldown a permanently-unverifiable bundle (e.g. a legacy bundle lacking
+    // the new hybrid KEM signatures) re-fetches in a tight loop and floods the
+    // stream-management send queue. Cap it to one fetch per key per window.
+    private HashMap<string, int64?> bundle_request_at = new HashMap<string, int64?>();
+    private const int64 BUNDLE_REQUEST_COOLDOWN_US = 60 * 1000000;
 
     // pair stanza step counters keyed by base64(sid)
     private HashMap<string, uint> pair_step_counters = new HashMap<string, uint>();
@@ -752,6 +759,16 @@ public class StreamModule : XmppStreamModule {
     }
 
     public async StanzaNode? request_bundle(XmppStream stream, Jid jid, int device_id) {
+        // Rate-limit repeat fetches of the same bundle. A caller loop that keeps
+        // seeing get_remote_bundle()==null or verify()==false would otherwise
+        // re-request every pass, jamming the send queue (see bundle_request_at).
+        string cooldown_key = "%s/%d".printf(jid.bare_jid.to_string(), device_id);
+        int64 now = get_monotonic_time();
+        int64? last = bundle_request_at.has_key(cooldown_key) ? bundle_request_at.get(cooldown_key) : null;
+        if (last != null && now - (!) last < BUNDLE_REQUEST_COOLDOWN_US) {
+            return null;
+        }
+        bundle_request_at.set(cooldown_key, now);
         StanzaNode pubsub = new StanzaNode.build("pubsub", Pubsub.NS_URI).add_self_xmlns()
             .put_node(new StanzaNode.build("items", Pubsub.NS_URI)
                 .put_attribute("node", Protocol.NS_BUNDLE)
@@ -2494,13 +2511,19 @@ public class StreamModule : XmppStreamModule {
         return true;
     }
 
+    // Publish an already-marshaled v1/v2 membership journal blob over the MUC
+    // journal transport without re-framing or re-marshalling it. The receiver's
+    // dispatcher keys off the blob prefix and preserves the same bytes locally.
+    public async bool publish_membership_blob(XmppStream stream, Jid room_jid, string item_id, uint8[] blob) {
+        return yield publish_membership_entry(stream, room_jid, item_id, Base64.encode(blob));
+    }
+
     // Publish an owner-generated (or server-generated) membership audit entry
     // to a room's group:0 PEP node. This is a thin wire-publisher that mirrors
     // the same path used by publish_audit_entry_for_action except it accepts a
     // fully built MemberAuditEntry so callers can persist the same object locally.
     public async bool publish_membership_audit_entry(XmppStream stream, Jid room_jid, Protocol.MemberAuditEntry entry) {
-        string b64 = Base64.encode(entry.marshal());
-        return yield publish_membership_entry(stream, room_jid, entry.seq.to_string(), b64);
+        return yield publish_membership_blob(stream, room_jid, entry.seq.to_string(), entry.marshal());
     }
 
     // ── New public API ─────────────────────────────────────────────────────────

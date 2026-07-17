@@ -83,6 +83,7 @@ test_sources = [
     'tests/groupsession.vala',
     'tests/membership_journal.vala',
     'tests/membership_dag.vala',
+    'tests/membership_dag_persistence.vala',
     'tests/device_dag.vala',
     'tests/trust_manifest.vala',
     'tests/device_tracker.vala',
