@@ -643,13 +643,7 @@ public class StreamModule : XmppStreamModule {
                 if (peer_bundle == null) {
                     continue;   // bundle not fetched yet — best-effort, seal what we can
                 }
-                bool verified;
-                try {
-                    verified = ((!) peer_bundle).verify();
-                } catch (GLib.Error e) {
-                    verified = false;
-                }
-                if (!verified) continue;
+                if (!((!) peer_bundle).verify()) continue;
 
                 try {
                     Protocol.SessionBootstrap bootstrap = Protocol.initiate_session(my_dik_priv_x, my_dik_pub_x, (!) peer_bundle);
@@ -1816,9 +1810,19 @@ public class StreamModule : XmppStreamModule {
 
         StanzaNode kemkeys = new StanzaNode.build("kemkeys", Protocol.NS_BUNDLE);
         foreach (Row row in db.get_local_kem_pre_keys(account)) {
-            kemkeys.put_node(new StanzaNode.build("kemkey", Protocol.NS_BUNDLE)
+            // Structured like <spk>: <key> + hybrid <sig>/<mldsa-sig> (spec §9.1).
+            StanzaNode kemkey = new StanzaNode.build("kemkey", Protocol.NS_BUNDLE)
                 .put_attribute("id", row[db.kem_pre_key.key_id].to_string())
-                .put_node(new StanzaNode.text(row[db.kem_pre_key.public_base64])));
+                .put_node(new StanzaNode.build("key", Protocol.NS_BUNDLE).put_node(new StanzaNode.text(row[db.kem_pre_key.public_base64])));
+            string? kem_sig_ed = row[db.kem_pre_key.signature_ed25519_base64];
+            string? kem_sig_mldsa = row[db.kem_pre_key.signature_mldsa_base64];
+            if (kem_sig_ed != null) {
+                kemkey.put_node(new StanzaNode.build("sig", Protocol.NS_BUNDLE).put_node(new StanzaNode.text(kem_sig_ed)));
+            }
+            if (kem_sig_mldsa != null) {
+                kemkey.put_node(new StanzaNode.build("mldsa-sig", Protocol.NS_BUNDLE).put_node(new StanzaNode.text(kem_sig_mldsa)));
+            }
+            kemkeys.put_node(kemkey);
         }
         bundle_node.put_node(kemkeys);
 

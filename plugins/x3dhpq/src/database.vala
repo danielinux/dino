@@ -5,7 +5,7 @@ using Xmpp;
 namespace Dino.Plugins.X3dhpq {
 
 public class Database : Qlite.Database {
-    private const int VERSION = 15;
+    private const int VERSION = 17;
 
     public class AccountIdentityTable : Table {
         public Column<int> id = new Column.Integer("id") { primary_key = true, auto_increment = true };
@@ -200,10 +200,14 @@ public class Database : Qlite.Database {
         public Column<bool> published = new Column.BoolInt("published") { default = "0" };
         public Column<bool> consumed = new Column.BoolInt("consumed") { default = "0" };
         public Column<long> created_at = new Column.Long("created_at") { not_null = true };
+        // Hybrid DIK signature over public_base64 (spec §9.1). Nullable so pre-v17
+        // rows migrate; new rows are always signed at generation.
+        public Column<string?> signature_ed25519_base64 = new Column.Text("signature_ed25519_base64") { min_version = 17 };
+        public Column<string?> signature_mldsa_base64 = new Column.Text("signature_mldsa_base64") { min_version = 17 };
 
         internal KemPreKeyTable(Database db) {
             base(db, "kem_pre_key");
-            init({ account_id, key_id, public_base64, private_base64, published, consumed, created_at });
+            init({ account_id, key_id, public_base64, private_base64, published, consumed, created_at, signature_ed25519_base64, signature_mldsa_base64 });
             unique({ account_id, key_id });
         }
     }
@@ -661,11 +665,18 @@ public class Database : Qlite.Database {
                 Bytes kem_pub;
                 Bytes kem_priv;
                 global::X3dhpq.Crypto.generate_mlkem768(out kem_pub, out kem_priv);
+                // Hybrid DIK signature over the KEM public key (spec §9.1): the
+                // KEM pre-key carries post-quantum (HNDL) confidentiality, so it
+                // is signed with both the DIK Ed25519 and ML-DSA-65 keys.
+                Bytes kem_sig_ed25519 = global::X3dhpq.Crypto.ed25519_sign(bytes_from_base64(row[account_identity.dik_priv_ed25519_base64]), kem_pub);
+                Bytes kem_sig_mldsa = global::X3dhpq.Crypto.mldsa65_sign(bytes_from_base64(row[account_identity.dik_priv_mldsa_base64]), kem_pub);
                 kem_pre_key.insert()
                     .value(kem_pre_key.account_id, account.id)
                     .value(kem_pre_key.key_id, next_key_id(kem_pre_key, kem_pre_key.account_id, kem_pre_key.key_id, account.id))
                     .value(kem_pre_key.public_base64, bytes_to_base64(kem_pub))
                     .value(kem_pre_key.private_base64, bytes_to_base64(kem_priv))
+                    .value(kem_pre_key.signature_ed25519_base64, bytes_to_base64(kem_sig_ed25519))
+                    .value(kem_pre_key.signature_mldsa_base64, bytes_to_base64(kem_sig_mldsa))
                     .value(kem_pre_key.published, false)
                     .value(kem_pre_key.consumed, false)
                     .value(kem_pre_key.created_at, (long) new DateTime.now_utc().to_unix())
@@ -886,7 +897,7 @@ public class Database : Qlite.Database {
         peer_bundle.signed_pre_key_id = (uint32) ((!) row)[bundle.signed_pre_key_id];
         peer_bundle.signed_pre_key_base64 = spk;
         peer_bundle.signed_pre_key_signature_base64 = spk_sig;
-        populate_public_prekeys(peer_bundle.kem_pre_keys, ((!) row)[bundle.kem_pre_keys_base64]);
+        populate_kem_prekeys(peer_bundle.kem_pre_keys, ((!) row)[bundle.kem_pre_keys_base64]);
         populate_public_prekeys(peer_bundle.one_time_pre_keys, ((!) row)[bundle.one_time_pre_keys_base64]);
         return peer_bundle;
     }
@@ -1519,7 +1530,7 @@ public class Database : Qlite.Database {
             .value(bundle.signed_pre_key_id, spk_id)
             .value(bundle.signed_pre_key_public_base64, spk_key)
             .value(bundle.signed_pre_key_signature_ed25519_base64, spk_sig)
-            .value(bundle.kem_pre_keys_base64, serialize_key_nodes(bundle_node.get_subnode("kemkeys", Protocol.NS_BUNDLE), "kemkey"))
+            .value(bundle.kem_pre_keys_base64, serialize_kem_key_nodes(bundle_node.get_subnode("kemkeys", Protocol.NS_BUNDLE)))
             .value(bundle.one_time_pre_keys_base64, serialize_key_nodes(bundle_node.get_subnode("opks", Protocol.NS_BUNDLE), "opk"))
             .value(bundle.device_certificate_base64, dc_node != null ? dc_node.get_string_content() : null)
             .value(bundle.bundle_payload_base64, Base64.encode(string_to_bytes(bundle_node.to_string())))
@@ -1991,6 +2002,50 @@ public class Database : Qlite.Database {
             builder.append("\n");
         }
         return builder.str;
+    }
+
+    // KEM pre-keys carry the pubkey plus a hybrid signature (§9.1), so each is
+    // encoded as "id:pub:sigEd:sigMldsa". Base64 never contains ':', so it is a
+    // safe field separator. A pre-v0.9.0 bundle that put the pubkey as <kemkey>
+    // text content (no <key> child) is tolerated so mixed-version peers interop.
+    private string? serialize_kem_key_nodes(StanzaNode? parent_node) {
+        if (parent_node == null) {
+            return null;
+        }
+        StringBuilder builder = new StringBuilder();
+        foreach (StanzaNode child in parent_node.get_subnodes("kemkey", Protocol.NS_BUNDLE)) {
+            StanzaNode? key_node = child.get_subnode("key", Protocol.NS_BUNDLE);
+            StanzaNode? sig_node = child.get_subnode("sig", Protocol.NS_BUNDLE);
+            StanzaNode? mldsa_node = child.get_subnode("mldsa-sig", Protocol.NS_BUNDLE);
+            string pub = key_node != null ? (key_node.get_string_content() ?? "") : (child.get_string_content() ?? "");
+            builder.append(child.get_attribute("id") ?? "");
+            builder.append(":");
+            builder.append(pub);
+            builder.append(":");
+            builder.append(sig_node != null ? (sig_node.get_string_content() ?? "") : "");
+            builder.append(":");
+            builder.append(mldsa_node != null ? (mldsa_node.get_string_content() ?? "") : "");
+            builder.append("\n");
+        }
+        return builder.str;
+    }
+
+    private void populate_kem_prekeys(Gee.ArrayList<Protocol.PublicPreKey> target, string? encoded) {
+        if (encoded == null || encoded == "") {
+            return;
+        }
+        foreach (string line in encoded.split("\n")) {
+            if (line == "" || !line.contains(":")) {
+                continue;
+            }
+            string[] parts = line.split(":", 4);
+            Protocol.PublicPreKey key = new Protocol.PublicPreKey();
+            key.id = (uint32) int.parse(parts[0]);
+            key.public_base64 = parts.length > 1 ? parts[1] : "";
+            key.signature_ed25519_base64 = (parts.length > 2 && parts[2] != "") ? parts[2] : null;
+            key.signature_mldsa_base64 = (parts.length > 3 && parts[3] != "") ? parts[3] : null;
+            target.add(key);
+        }
     }
 
     private void populate_public_prekeys(Gee.ArrayList<Protocol.PublicPreKey> target, string? encoded) {

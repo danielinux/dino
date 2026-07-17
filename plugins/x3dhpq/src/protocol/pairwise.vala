@@ -128,6 +128,10 @@ public class DeviceCertificate : Object {
 public class PublicPreKey : Object {
     public uint32 id { get; set; }
     public string public_base64 { get; set; }
+    // KEM pre-keys carry a hybrid DIK signature over the public key (spec §9.1);
+    // both remain null for OPKs, which are unsigned per X3DH convention.
+    public string? signature_ed25519_base64 { get; set; default = null; }
+    public string? signature_mldsa_base64 { get; set; default = null; }
 }
 
 public class PeerBundle : Object {
@@ -143,20 +147,54 @@ public class PeerBundle : Object {
     public ArrayList<PublicPreKey> kem_pre_keys { get; private set; default = new ArrayList<PublicPreKey>(); }
     public ArrayList<PublicPreKey> one_time_pre_keys { get; private set; default = new ArrayList<PublicPreKey>(); }
 
-    public bool verify() throws GLib.Error {
-        bool cert_ok = device_certificate.verify(
-            bytes_from_base64(aik_pub_ed25519_base64),
-            bytes_from_base64(aik_pub_mldsa_base64)
-        );
-        if (!cert_ok) {
+    public bool verify() {
+        // Any crypto/verification failure means "untrusted", so return false
+        // rather than throwing. wolfSSL raises SIG_VERIFY_E on a forged (but
+        // well-formed) signature, and malformed base64 also throws; either way
+        // the bundle must be rejected, not propagated as an error to callers.
+        try {
+            bool cert_ok = device_certificate.verify(
+                bytes_from_base64(aik_pub_ed25519_base64),
+                bytes_from_base64(aik_pub_mldsa_base64)
+            );
+            if (!cert_ok) {
+                return false;
+            }
+            Bytes spk_pub = bytes_from_base64(signed_pre_key_base64);
+            bool spk_ok = global::X3dhpq.Crypto.ed25519_verify(
+                device_certificate.dik_pub_ed25519,
+                spk_pub,
+                bytes_from_base64(signed_pre_key_signature_base64)
+            );
+            if (!spk_ok) {
+                return false;
+            }
+            // Verify the hybrid DIK signature on every KEM pre-key (spec §9.1).
+            // The KEM pre-key is the sole carrier of post-quantum (HNDL)
+            // confidentiality, so an unsigned or forged one is rejected; both
+            // Ed25519 and ML-DSA-65 MUST verify against the DC's DIK.
+            foreach (PublicPreKey kem in kem_pre_keys) {
+                if (kem.signature_ed25519_base64 == null || kem.signature_mldsa_base64 == null) {
+                    return false;
+                }
+                Bytes kem_pub = bytes_from_base64(kem.public_base64);
+                if (!global::X3dhpq.Crypto.ed25519_verify(
+                        device_certificate.dik_pub_ed25519,
+                        kem_pub,
+                        bytes_from_base64((!) kem.signature_ed25519_base64))) {
+                    return false;
+                }
+                if (!global::X3dhpq.Crypto.mldsa65_verify(
+                        device_certificate.dik_pub_mldsa,
+                        kem_pub,
+                        bytes_from_base64((!) kem.signature_mldsa_base64))) {
+                    return false;
+                }
+            }
+            return true;
+        } catch (GLib.Error e) {
             return false;
         }
-        Bytes spk_pub = bytes_from_base64(signed_pre_key_base64);
-        return global::X3dhpq.Crypto.ed25519_verify(
-            device_certificate.dik_pub_ed25519,
-            spk_pub,
-            bytes_from_base64(signed_pre_key_signature_base64)
-        );
     }
 }
 

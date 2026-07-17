@@ -9,6 +9,37 @@ class Pairwise : Gee.TestCase {
         base("Pairwise");
         add_test("device_certificate_roundtrip", test_device_certificate_roundtrip);
         add_test("session_roundtrip", test_session_roundtrip);
+        add_test("bundle_rejects_bad_kem_sig", test_bundle_rejects_bad_kem_sig);
+        add_test("bundle_rejects_missing_kem_sig", test_bundle_rejects_missing_kem_sig);
+    }
+
+    // A KEM pre-key signed by a foreign key (not the bundle's DIK) MUST be
+    // rejected by PeerBundle.verify() (spec §9.1).
+    private void test_bundle_rejects_bad_kem_sig() {
+        try {
+            TestIdentity bob = new TestIdentity();
+            Bytes wrong_pub_ed;
+            Bytes wrong_priv_ed;
+            Crypto.generate_ed25519(out wrong_pub_ed, out wrong_priv_ed);
+            bob.kem_signature_ed25519 = Crypto.ed25519_sign(wrong_priv_ed, bob.kem_pub);
+            PeerBundle peer_bundle = bob.to_peer_bundle();
+            fail_if(peer_bundle.verify(), "bundle with forged KEM sig must not verify");
+        } catch (Error e) {
+            fail_if_reached(e.message);
+        }
+    }
+
+    // A KEM pre-key with no signature MUST be rejected (spec §9.1).
+    private void test_bundle_rejects_missing_kem_sig() {
+        try {
+            TestIdentity bob = new TestIdentity();
+            PeerBundle peer_bundle = bob.to_peer_bundle();
+            peer_bundle.kem_pre_keys[0].signature_ed25519_base64 = null;
+            peer_bundle.kem_pre_keys[0].signature_mldsa_base64 = null;
+            fail_if(peer_bundle.verify(), "bundle with unsigned KEM pre-key must not verify");
+        } catch (Error e) {
+            fail_if_reached(e.message);
+        }
     }
 
     private void test_device_certificate_roundtrip() {
@@ -133,6 +164,8 @@ private static uint8[] join_arrays(uint8[] a, uint8[] b) {
         public Bytes spk_signature_ed25519;
         public Bytes kem_pub;
         public Bytes kem_priv;
+        public Bytes kem_signature_ed25519;
+        public Bytes kem_signature_mldsa;
         public Bytes opk_pub_x25519;
         public Bytes opk_priv_x25519;
         public uint32 opk_id = 1;
@@ -148,6 +181,8 @@ private static uint8[] join_arrays(uint8[] a, uint8[] b) {
             Crypto.generate_x25519(out spk_pub_x25519, out spk_priv_x25519);
             spk_signature_ed25519 = Crypto.ed25519_sign(dik_priv_ed25519, spk_pub_x25519);
             Crypto.generate_mlkem768(out kem_pub, out kem_priv);
+            kem_signature_ed25519 = Crypto.ed25519_sign(dik_priv_ed25519, kem_pub);
+            kem_signature_mldsa = Crypto.mldsa65_sign(dik_priv_mldsa, kem_pub);
             Crypto.generate_x25519(out opk_pub_x25519, out opk_priv_x25519);
         }
 
@@ -165,6 +200,8 @@ private static uint8[] join_arrays(uint8[] a, uint8[] b) {
             PublicPreKey kem = new PublicPreKey();
             kem.id = kem_id;
             kem.public_base64 = Pairwise.bytes_b64(kem_pub);
+            kem.signature_ed25519_base64 = Pairwise.bytes_b64(kem_signature_ed25519);
+            kem.signature_mldsa_base64 = Pairwise.bytes_b64(kem_signature_mldsa);
             bundle.kem_pre_keys.add(kem);
             PublicPreKey opk = new PublicPreKey();
             opk.id = opk_id;
