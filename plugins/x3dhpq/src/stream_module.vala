@@ -1325,6 +1325,24 @@ public class StreamModule : XmppStreamModule {
     // §D1: migration / genesis. Idempotent. Only an authorized device holding the
     // account AIK_priv builds the genesis manifest; every other device adopts what
     // that device published (via fetch/+notify). Called after publish_device_list.
+    // True iff trust manifest `m` is rooted under the SAME account AIK this device
+    // currently holds locally. Mirrors verify_and_apply_manifest's is_self AIK-pin
+    // comparison. Used to tell "our own stale genesis" (matches → self-heal) apart
+    // from "another device reset the account AIK" (differs → dead lineage, re-pair).
+    private bool own_aik_matches_manifest(Protocol.TrustManifest m) {
+        Row? row = db.get_local_identity(account.id);
+        if (row == null) return false;
+        string? ed_b64 = ((!) row)[db.account_identity.aik_pub_ed25519_base64];
+        string? ml_b64 = ((!) row)[db.account_identity.aik_pub_mldsa_base64];
+        if (ed_b64 == null || ml_b64 == null || ed_b64 == "" || ml_b64 == "") return false;
+        try {
+            return manifest_bytes_equal(m.aik.pub_ed25519, bytes_to_uint8_array(bytes_from_base64((!) ed_b64)))
+                && manifest_bytes_equal(m.aik.pub_mldsa, bytes_to_uint8_array(bytes_from_base64((!) ml_b64)));
+        } catch (GLib.Error e) {
+            return false;
+        }
+    }
+
     public async void ensure_trust_manifest(XmppStream stream) {
         string own_bare = account.bare_jid.to_string();
 
@@ -1382,6 +1400,22 @@ public class StreamModule : XmppStreamModule {
             // A device WITHOUT AIK_priv keeps last-good and waits for the primary / re-pair.
             if (!db.has_local_aik_priv(account)) {
                 warning("ensure_trust_manifest: server manifest for %s failed to apply and we hold no AIK_priv; keeping last good (awaiting primary / re-pair)", own_bare);
+                return;
+            }
+            // The "unapplicable manifest is necessarily our own broken genesis" assumption
+            // holds ONLY while the account AIK is unchanged. If the server manifest is rooted
+            // under a DIFFERENT AIK than the one we hold, ANOTHER device reset the account
+            // identity (§8.5) — verify_and_apply_manifest already rejected it STRICT ("must
+            // re-pair"). Republishing our own genesis here just fights that fork forever
+            // (bumping the version on every reconnect, as observed: v7 → v8 → v9 …). This
+            // device is on a DEAD lineage: drop to pending-enrollment so it stops fighting,
+            // goes quiet, and can re-pair into the new identity via the pending banner's
+            // "Pair this device" flow. A legitimately-fresh primary is unaffected: after its
+            // own genesis it has a LOCAL manifest and takes the reconcile branch above, not
+            // this no-local-manifest self-heal path.
+            if (!own_aik_matches_manifest((!) existing)) {
+                warning("ensure_trust_manifest: %s account AIK was reset by another device — demoting to pending to re-pair (was self-healing a dead lineage)", own_bare);
+                db.demote_to_pending(account);
                 return;
             }
             warning("ensure_trust_manifest: server manifest for %s failed to apply (broken genesis) — republishing a fresh genesis at version %llu", own_bare, ((!) existing).version + 1);

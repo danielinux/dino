@@ -173,9 +173,23 @@ public class X3dhpqPreferencesEntry : Plugins.EncryptionPreferencesEntry {
         // the pending-enrollment banner's Associate flow then takes over.
         ((!) module).publish_current_state.begin((!) stream, (o, r) => {
             ((!) module).publish_current_state.end(r);
-            if (devices_widget != null) {
-                Idle.add(() => { ((!) devices_widget).refresh(); return false; });
-            }
+            Idle.add(() => {
+                if (devices_widget != null) ((!) devices_widget).refresh();
+                // The preferences page decides banner-vs-join-button at build time and
+                // devices_widget.refresh() does NOT rebuild it, so the pending-enrollment
+                // banner's "Pair this device" button won't appear here until the page is
+                // reopened. If the join resolved to pending-enrollment (an existing account
+                // identity was found), skip that dead end: publish the §11.8 enrollment
+                // request and show this device's pairing code straight away, so the user
+                // can confirm it from an existing device without hunting for a button.
+                // If resolution instead re-promoted us to primary (no existing identity
+                // found), is_pending_enrollment is false and we correctly show nothing.
+                if (plugin.db.is_pending_enrollment(account) && devices_widget != null) {
+                    ((!) module).publish_enrollment_request.begin((!) stream);
+                    launch_show_own_code_dialog(account, (!) devices_widget);
+                }
+                return false;
+            });
         });
     }
 
