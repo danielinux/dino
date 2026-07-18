@@ -1398,8 +1398,15 @@ public class StreamModule : XmppStreamModule {
             // Without this, a once-broken manifest is rejected forever and never replaced,
             // which cascades into revoke being a no-op and fresh peers seeing no identity.
             // A device WITHOUT AIK_priv keeps last-good and waits for the primary / re-pair.
-            if (!db.has_local_aik_priv(account)) {
-                warning("ensure_trust_manifest: server manifest for %s failed to apply and we hold no AIK_priv; keeping last good (awaiting primary / re-pair)", own_bare);
+            // Only a genuinely-authorized primary self-heals/republishes here. A PENDING
+            // device must not: demote_to_pending() leaves a throwaway AIK in place, so
+            // has_local_aik_priv() stays true even while pending — gating on that alone let a
+            // just-demoted device re-enter this branch every reconnect and demote itself again
+            // (observed as an 86s demote↔demote oscillation), never settling into a stable
+            // pending state it can re-pair from. is_authorized() = confirmed primary WITH
+            // AIK_priv, which is exactly the population allowed to publish account genesis.
+            if (!db.is_authorized(account)) {
+                warning("ensure_trust_manifest: server manifest for %s failed to apply and this device is not an authorized primary (pending / no AIK_priv); keeping last good (awaiting primary / re-pair)", own_bare);
                 return;
             }
             // The "unapplicable manifest is necessarily our own broken genesis" assumption
