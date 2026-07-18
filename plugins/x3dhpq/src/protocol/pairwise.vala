@@ -431,6 +431,15 @@ public SessionBootstrap initiate_session(
     Bytes eph_priv;
     global::X3dhpq.Crypto.generate_x25519(out eph_pub, out eph_priv);
 
+    // A KEM pre-key is mandatory for PQXDH. Guard the indexed access: a bundle with
+    // an empty kem_pre_keys list (stale/incomplete, e.g. a sibling device whose
+    // bundle wasn't fully (re)published after an account reset) must NOT hard-abort
+    // the process with a Gee ArrayList index assertion. Throwing lets the caller
+    // (publish_device_tracker) warn + skip that device — otherwise the reset leaves
+    // such a bundle in x3dhpq.db and every startup re-crashes until the db is wiped.
+    if (peer_bundle.kem_pre_keys.size == 0) {
+        throw new IOError.FAILED("initiate_session: peer bundle has no KEM pre-keys");
+    }
     PublicPreKey kem_pre_key = peer_bundle.kem_pre_keys[0];
     PublicPreKey? opk = peer_bundle.one_time_pre_keys.size > 0 ? peer_bundle.one_time_pre_keys[0] : null;
 
