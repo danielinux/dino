@@ -2710,6 +2710,7 @@ public class StreamModule : XmppStreamModule {
     // access so only the account's own resources receive it via +notify; an
     // existing device on this account then initiates the pairing FSM toward us.
     public async bool publish_pair_hello(XmppStream stream, uint32 device_id, string full_jid, uint8[] sid) {
+        warning("X3DHPQ-PAIR-DBG: publishing <pair-hello> device-id=%u full-jid=%s sid=%.10s…", device_id, full_jid, base64url_encode(sid));
         StanzaNode hello = new StanzaNode.build("pair-hello", Protocol.NS_PAIR)
             .add_self_xmlns()
             .put_attribute("device-id", device_id.to_string())
@@ -2919,6 +2920,7 @@ public class StreamModule : XmppStreamModule {
             return;
         }
 
+        warning("X3DHPQ-PAIR-DBG: received <pair> from=%s sid=%.10s… type=%u", from.to_string(), sid_b64, msg.msg_type);
         pair_message_received(sid, from, msg);
     }
 

@@ -466,12 +466,15 @@ public class PairToExistingDialog : Adw.Window {
      */
     private void on_pair_message_received(uint8[] msg_sid, Xmpp.Jid from_jid, Protocol.PairingMsg msg) {
         if (active_sid == null) {
+            warning("X3DHPQ-PAIR-DBG: RESPONDER got pair msg type=%u from=%s but active_sid is null (code dialog not armed)", msg.msg_type, from_jid.to_string());
             return;
         }
         // Compare SIDs byte-by-byte.
         if (!bytes_equal(msg_sid, (!) active_sid)) {
+            warning("X3DHPQ-PAIR-DBG: RESPONDER sid mismatch type=%u from=%s (msg sid != our shown-code sid — primary used a different pairing session)", msg.msg_type, from_jid.to_string());
             return;
         }
+        warning("X3DHPQ-PAIR-DBG: RESPONDER processing pair msg type=%u from=%s", msg.msg_type, from_jid.to_string());
 
         // Lock onto the first existing device that reaches us; ignore stanzas
         // from any other resource. Several existing resources may race to
