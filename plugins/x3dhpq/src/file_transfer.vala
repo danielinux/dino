@@ -110,8 +110,11 @@ public class X3dhpqFileDecryptor : FileDecryptor, Object {
         // Only claim aesgcm downloads inside x3dhpq conversations, so we don't
         // fight the OMEMO decryptor (which matches any aesgcm URL) when both
         // plugins are loaded; the crypto is identical either way.
-        if (conversation.encryption != Encryption.X3DHPQ) return false;
-        return this.url_regex.match(http_file_receive.url) || (receive_data as X3dhpqHttpFileReceiveData) != null;
+        bool enc_ok = conversation.encryption == Encryption.X3DHPQ;
+        bool url_ok = this.url_regex.match(http_file_receive.url) || (receive_data as X3dhpqHttpFileReceiveData) != null;
+        warning("X3DHPQ-FILE-DBG: can_decrypt_file enc_ok=%s (enc=%d) url_ok=%s url=%.60s", enc_ok.to_string(), (int) conversation.encryption, url_ok.to_string(), http_file_receive.url);
+        if (!enc_ok) return false;
+        return url_ok;
     }
 
     public async InputStream decrypt_file(InputStream encrypted_stream, Conversation conversation, FileTransfer file_transfer, FileReceiveData receive_data) throws FileReceiveError {

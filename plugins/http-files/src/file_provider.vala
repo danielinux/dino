@@ -37,13 +37,16 @@ public class FileProvider : Dino.FileProvider, Object {
         }
 
         public override async bool run(Entities.Message message, Xmpp.MessageStanza stanza, Conversation conversation) {
+            bool dbg = message.body != null && message.body.has_prefix("aesgcm://");
             if (Xep.StatelessFileSharing.get_file_shares(stanza) != null || Xep.StatelessFileSharing.get_source_attachments(stanza) != null) {
+                if (dbg) warning("X3DHPQ-FILE-DBG: FileProvider bailing — SFS present on stanza; body=%s", message.body);
                 return false;
             }
 
             string? oob_url = Xmpp.Xep.OutOfBandData.get_url_from_message(stanza);
             bool normal_file = oob_url != null && oob_url == message.body && FileProvider.http_url_regex.match(message.body);
-            bool omemo_file = FileProvider.omemo_url_regex.match(message.body);
+            bool omemo_file = message.body != null && FileProvider.omemo_url_regex.match(message.body);
+            if (dbg) warning("X3DHPQ-FILE-DBG: FileProvider run body_prefix=%.60s omemo_file=%s normal_file=%s enc=%d", message.body, omemo_file.to_string(), normal_file.to_string(), (int) conversation.encryption);
             if (normal_file || omemo_file) {
                 outer.on_file_message(message, conversation);
                 return true;
