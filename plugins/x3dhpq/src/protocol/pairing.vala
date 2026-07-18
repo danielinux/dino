@@ -701,6 +701,16 @@ public class PairingNew : GLib.Object {
         return current_step == PairingStep.DONE;
     }
 
+    // True when the FSM has a SELF-DRIVEN step pending — it must emit another stanza
+    // without waiting for an inbound message. The SENT_CONFIRM step sends our DIK
+    // PAYLOAD this way (see step()): after replying to the existing device's CONFIRM
+    // the caller must drive step(null), or the existing device never receives our DIK,
+    // cannot issue our DeviceCertificate, and times out. Callers loop:
+    // while (awaiting_self_step()) send(step(null)).
+    public bool awaiting_self_step() {
+        return current_step == PairingStep.SENT_CONFIRM;
+    }
+
     public PairingResult? get_result() {
         return result;
     }

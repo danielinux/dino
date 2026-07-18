@@ -534,6 +534,25 @@ public class PairToExistingDialog : Adw.Window {
             stream_module.send_pair_stanza(from_jid, (!) active_sid, (!) response);
         }
 
+        // Drive any SELF-DRIVEN steps (no inbound message needed). After replying to
+        // CONFIRM the responder is at SENT_CONFIRM, whose step emits our DIK PAYLOAD;
+        // without driving it here the existing device never receives our DIK, can't
+        // issue our DeviceCertificate, and times out (observed: handshake stalls right
+        // after processing the CONFIRM). Loop in case more self-steps are ever added.
+        while (!((!) new_fsm).is_done() && ((!) new_fsm).awaiting_self_step()) {
+            Protocol.PairingMsg? self_resp = null;
+            try {
+                self_resp = ((!) new_fsm).step(null);
+            } catch (GLib.Error e) {
+                warning("X3DHPQ-PAIR-DBG: RESPONDER self-step failed: %s", e.message);
+                break;
+            }
+            if (self_resp != null) {
+                warning("X3DHPQ-PAIR-DBG: RESPONDER self-driving step, sending type=%u to %s", ((!) self_resp).msg_type, from_jid.to_string());
+                stream_module.send_pair_stanza(from_jid, (!) active_sid, (!) self_resp);
+            }
+        }
+
         // Check completion.
         if (((!) new_fsm).is_done()) {
             Protocol.PairingResult? result = ((!) new_fsm).get_result();
