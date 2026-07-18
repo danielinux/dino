@@ -58,6 +58,18 @@ public class GroupSession : Object {
 
     public SenderChain? send_chain { get; private set; }
 
+    // Rolling checkpoint of our send chain that announce_sender_chain() exports
+    // INSTEAD of the live (latest) ratchet position. A member that lacks a recv
+    // chain (new device, was offline) can therefore only decrypt back to the
+    // checkpoint, not to the epoch start. maybe_advance_checkpoint() slides it
+    // forward at most once per max-age window (24h, set by the caller), so the
+    // window of past messages exposed by re-sharing — the option-1 forward-
+    // secrecy cost — is bounded to ~24h instead of the whole (possibly unbounded)
+    // epoch. send_ckpt_key is the chain_key snapshot AT send_ckpt_index.
+    private uint8[] send_ckpt_key = new uint8[0];
+    private uint32 send_ckpt_index = 0;
+    private int64 send_ckpt_time = 0;   // unix seconds; 0 = not yet initialised
+
     public static GroupSession new_session(
         string room_jid,
         uint8[] my_aik_pub_bytes,
@@ -69,6 +81,9 @@ public class GroupSession : Object {
         gs.my_device_id = my_device_id;
         gs.epoch = 0;
         gs.send_chain = SenderChain.new_random(0);
+        gs.send_ckpt_key = gs.send_chain.chain_key.copy();
+        gs.send_ckpt_index = 0;
+        gs.send_ckpt_time = 0;
         return gs;
     }
 
@@ -109,17 +124,53 @@ public class GroupSession : Object {
     private void rotate_epoch() throws GLib.Error {
         epoch++;
         send_chain = SenderChain.new_random(epoch);
+        // Fresh epoch → the checkpoint restarts at the new chain's index 0, so
+        // early members of the new epoch still get it whole; it then slides
+        // forward again via maybe_advance_checkpoint.
+        send_ckpt_key = send_chain.chain_key.copy();
+        send_ckpt_index = 0;
+        send_ckpt_time = 0;
     }
 
-    // Produce an announcement for our current send chain state.
+    // Slide the announce checkpoint forward to the CURRENT send position once the
+    // max-age window has elapsed. `now` is unix seconds; `max_age_seconds` bounds
+    // the re-shareable history / forward-secrecy window (e.g. 24h). The first call
+    // in an epoch just stamps the start time (checkpoint stays at index 0 so a
+    // member joining early in the epoch still gets it whole). Returns true iff the
+    // checkpoint actually moved (so the caller can persist).
+    public bool maybe_advance_checkpoint(int64 now, int64 max_age_seconds) {
+        if (send_chain == null) return false;
+        if (send_ckpt_time == 0) {
+            send_ckpt_time = now;
+            return false;
+        }
+        if (now - send_ckpt_time >= max_age_seconds) {
+            send_ckpt_key = send_chain.chain_key.copy();
+            send_ckpt_index = send_chain.next_index;
+            send_ckpt_time = now;
+            return true;
+        }
+        return false;
+    }
+
+    // Produce an announcement for our send chain. Exports the rolling CHECKPOINT
+    // (bounded history) rather than the live position, so a member lacking a recv
+    // chain can decrypt back only to the checkpoint (≤ max-age old), not the whole
+    // epoch. Falls back to the live position for a session persisted before
+    // checkpoints existed (no stored checkpoint key).
     public SenderChainAnnouncement announce_sender_chain() {
         SenderChainAnnouncement ann = new SenderChainAnnouncement();
         ann.sender_aik_pub_bytes = my_aik_pub_bytes.copy();
         ann.sender_device_id = my_device_id;
         ann.room_jid = room_jid;
         ann.epoch = epoch;
-        ann.chain_key = send_chain.chain_key.copy();
-        ann.next_index = send_chain.next_index;
+        if (send_ckpt_key.length == 32) {
+            ann.chain_key = send_ckpt_key.copy();
+            ann.next_index = send_ckpt_index;
+        } else {
+            ann.chain_key = ((!) send_chain).chain_key.copy();
+            ann.next_index = ((!) send_chain).next_index;
+        }
         return ann;
     }
 
@@ -145,7 +196,15 @@ public class GroupSession : Object {
             throw new IOError.FAILED("senderchain restore failed");
         }
         string rk = recv_key(fp, ann.sender_device_id, ann.epoch);
-        recv_chains[rk] = sc;
+        // Install ONCE per (sender, device, epoch). Announcements now carry a
+        // forward-MOVING checkpoint; overwriting a recv chain we already ratcheted
+        // forward with a LATER checkpoint would skip us past (and permanently lose)
+        // messages between our position and the new checkpoint. A member that
+        // already holds a chain for this epoch simply ratchets it forward / catches
+        // up via MAM instead of re-installing.
+        if (!recv_chains.has_key(rk)) {
+            recv_chains[rk] = sc;
+        }
     }
 
     // Encrypt plaintext. Returns (header, ciphertext+tag) or throws on failure.
@@ -232,7 +291,7 @@ public class GroupSession : Object {
     // Serialise to a key=value string for DB storage (sender_state column).
     public string serialize_send_state() {
         if (send_chain == null) return "";
-        return @"epoch=$(epoch)\nsend_chain=$(Base64.encode(send_chain.marshal()))\n";
+        return @"epoch=$(epoch)\nsend_chain=$(Base64.encode(send_chain.marshal()))\nckpt_index=$(send_ckpt_index)\nckpt_time=$(send_ckpt_time)\nckpt_key=$(Base64.encode(send_ckpt_key))\n";
     }
 
     // Serialise member / removed-aik maps as JSON-like text for the member_state column.
@@ -289,17 +348,38 @@ public class GroupSession : Object {
         // Parse send_state.
         uint32 parsed_epoch = 0;
         string? send_chain_b64 = null;
+        string? ckpt_key_b64 = null;
+        uint32 ckpt_index = 0;
+        int64 ckpt_time = 0;
         foreach (string line in send_state.split("\n")) {
             if (line.has_prefix("epoch=")) {
                 parsed_epoch = (uint32) int.parse(line.substring(6));
             } else if (line.has_prefix("send_chain=")) {
                 send_chain_b64 = line.substring(11);
+            } else if (line.has_prefix("ckpt_index=")) {
+                ckpt_index = (uint32) int.parse(line.substring(11));
+            } else if (line.has_prefix("ckpt_time=")) {
+                ckpt_time = int64.parse(line.substring(10));
+            } else if (line.has_prefix("ckpt_key=")) {
+                ckpt_key_b64 = line.substring(9);
             }
         }
         gs.epoch = parsed_epoch;
         if (send_chain_b64 != null && send_chain_b64 != "") {
             uint8[] sc_bytes = Base64.decode(send_chain_b64);
             gs.send_chain = SenderChain.unmarshal(sc_bytes);
+        }
+        if (ckpt_key_b64 != null && ckpt_key_b64 != "") {
+            gs.send_ckpt_key = Base64.decode(ckpt_key_b64);
+            gs.send_ckpt_index = ckpt_index;
+            gs.send_ckpt_time = ckpt_time;
+        } else if (gs.send_chain != null) {
+            // Migration (session persisted before checkpoints existed): start the
+            // checkpoint at the CURRENT live position so we never re-share more
+            // history than from now forward.
+            gs.send_ckpt_key = ((!) gs.send_chain).chain_key.copy();
+            gs.send_ckpt_index = ((!) gs.send_chain).next_index;
+            gs.send_ckpt_time = 0;
         }
 
         // Parse member_state.

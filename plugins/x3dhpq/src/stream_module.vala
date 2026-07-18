@@ -1065,14 +1065,19 @@ public class StreamModule : XmppStreamModule {
         StanzaNode node = new StanzaNode.build("trustmanifest", Protocol.NS_TRUSTMANIFEST)
             .add_self_xmlns()
             .put_node(new StanzaNode.text(b64));
-        bool ok = yield stream.get_module(Pubsub.Module.IDENTITY).publish(stream, null,
+        Pubsub.Module pubsub_mod = stream.get_module(Pubsub.Module.IDENTITY);
+        bool ok = yield pubsub_mod.publish(stream, null,
             Protocol.NS_TRUSTMANIFEST, "current", node, MANIFEST_PUBLISH_OPTIONS);
         if (ok) {
             // fire-and-forget (see publish_device_list): node already open via
             // MANIFEST_PUBLISH_OPTIONS; don't let a hung reconfigure block persistence.
             try_make_node_public.begin(stream, Protocol.NS_TRUSTMANIFEST);
         } else {
-            warning("publish_trust_manifest_blob: publish failed for %s", account.bare_jid.to_string());
+            // Surface the actual server error (item-too-large, forbidden, precondition, …)
+            // under the x3dhpq log domain — a bare "publish failed" left the cause invisible.
+            warning("publish_trust_manifest_blob: publish failed for %s (manifest v%llu, %d bytes): %s",
+                account.bare_jid.to_string(), m.version, b64.length,
+                pubsub_mod.last_publish_error ?? "no response (timeout / lost ACK)");
         }
         return ok;
     }

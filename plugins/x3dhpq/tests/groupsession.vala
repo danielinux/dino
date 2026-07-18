@@ -18,6 +18,7 @@ class GroupSessionTest : Gee.TestCase {
         add_test("groupsession_epoch_rotation_on_remove", test_groupsession_epoch_rotation_on_remove);
         add_test("groupsession_removed_member_rejected", test_groupsession_removed_member_rejected);
         add_test("groupsession_serialize_deserialize", test_groupsession_serialize_deserialize);
+        add_test("groupsession_checkpoint_bounds_history", test_groupsession_checkpoint_bounds_history);
     }
 
     private static uint8[] make_aik_bytes(uint8[] ed32, uint8[] mldsa) {
@@ -325,6 +326,68 @@ class GroupSessionTest : Gee.TestCase {
             GroupSession? gs2 = GroupSession.deserialize("room@x", aik1, 1, ss, ms);
             fail_if(gs2 == null, "deserialize returned null");
             fail_if_not_eq_int((int)((!) gs2).epoch, (int) gs.epoch, "epoch mismatch after deserialize");
+        } catch (Error e) {
+            fail_if_reached(e.message);
+        }
+    }
+
+    // The announce checkpoint bounds re-shareable history: a member that installs
+    // from an ADVANCED checkpoint can decrypt messages at/after it but not before,
+    // while a fresh session announces from index 0 (whole epoch available).
+    private void test_groupsession_checkpoint_bounds_history() {
+        try {
+            Bytes aed; Bytes apriv; Crypto.generate_ed25519(out aed, out apriv);
+            Bytes aml; Bytes amlpriv; Crypto.generate_mldsa65(out aml, out amlpriv);
+            uint8[] alice_aik = make_aik_bytes(bytes_to_arr(aed), bytes_to_arr(aml));
+            Bytes bed; Bytes bpriv; Crypto.generate_ed25519(out bed, out bpriv);
+            Bytes bml; Bytes bmlpriv; Crypto.generate_mldsa65(out bml, out bmlpriv);
+            uint8[] bob_aik = make_aik_bytes(bytes_to_arr(bed), bytes_to_arr(bml));
+
+            string room = "room@conference.example.org";
+            GroupSession alice = GroupSession.new_session(room, alice_aik, 1);
+            alice.add_member(make_member(bob_aik, 2));
+
+            // Fresh epoch: the checkpoint sits at index 0 → announce exports 0.
+            SenderChainAnnouncement a0 = alice.announce_sender_chain();
+            fail_if_not_eq_int((int) a0.next_index, 0, "fresh checkpoint must be index 0");
+
+            // Advance the send chain past a few messages.
+            for (int i = 0; i < 3; i++) {
+                GroupMessageHeader hh; uint8[] cc;
+                alice.encrypt(string_to_bytes("m"), out hh, out cc);
+            }
+
+            // Stamp the checkpoint start (t=1000), then elapse the 100s window.
+            alice.maybe_advance_checkpoint(1000, 100);
+            bool moved = alice.maybe_advance_checkpoint(1200, 100);
+            fail_if_not(moved, "checkpoint must advance once the window elapses");
+
+            // Announce now exports the advanced position (live index 3), not 0.
+            SenderChainAnnouncement a1 = alice.announce_sender_chain();
+            fail_if_not_eq_int((int) a1.next_index, 3, "checkpoint must advance to live index 3");
+
+            // A member joining now installs from the advanced checkpoint.
+            GroupSession bob = GroupSession.new_session(room, bob_aik, 2);
+            bob.add_member(make_member(alice_aik, 1));
+            bob.accept_sender_chain(a1);
+            string alice_fp = a1.aik_fingerprint();
+
+            // Post-checkpoint message (index 3) decrypts.
+            GroupMessageHeader h3; uint8[] ct3;
+            alice.encrypt(string_to_bytes("after"), out h3, out ct3);
+            uint8[] dec = bob.decrypt(alice_fp, h3, ct3);
+            fail_if_not_eq_uint8_arr(string_to_bytes("after"), dec, "post-checkpoint message must decrypt");
+
+            // Pre-checkpoint message (index 1) must NOT be decryptable.
+            GroupMessageHeader hpre = new GroupMessageHeader();
+            hpre.version = 1; hpre.epoch = a1.epoch; hpre.sender_device_id = 1; hpre.chain_index = 1;
+            bool pre_failed = false;
+            try {
+                bob.decrypt(alice_fp, hpre, new uint8[32]);
+            } catch (GLib.Error e) {
+                pre_failed = true;
+            }
+            fail_if_not(pre_failed, "pre-checkpoint message must not be decryptable");
         } catch (Error e) {
             fail_if_reached(e.message);
         }

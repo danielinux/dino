@@ -120,16 +120,16 @@ public class PairNewDeviceDialog : Gtk.Window {
         // share the primary key any more.
         opts.share_primary = false;
         opts.new_device_flags = 0;
-        // §E2: the confirmer signs the newcomer's DC under its OWN DIK. Load this
-        // device's DIK private halves so the FSM issues the DC as a delegation.
-        if (identity_row != null) {
-            try {
-                opts.dik_priv_ed25519 = bytes_to_uint8_array(bytes_from_base64(((!) identity_row)[db.account_identity.dik_priv_ed25519_base64]));
-                opts.dik_priv_mldsa   = bytes_to_uint8_array(bytes_from_base64(((!) identity_row)[db.account_identity.dik_priv_mldsa_base64]));
-            } catch (GLib.Error e) {
-                warning("PairNewDeviceDialog: failed to load local DIK priv for DC issuance: %s", e.message);
-            }
-        }
+        // Issue the newcomer's DeviceCertificate signed under the account AIK (NOT a
+        // DIK delegation): leave opts.dik_priv_* unset so the FSM's AIK-signing path
+        // (pairing.vala WAIT_DIK) runs. The newcomer stores this DC and advertises the
+        // account AIK alongside it in every outbound PQXDH / group prekey; the receiver
+        // verifies DC.verify(advertisedAik). A DIK-delegated DC does NOT verify against
+        // the AIK there — it is rejected with wolfSSL rc=-229 (SIG_VERIFY_E) and refused
+        // pre-send by the peer's local guard, stranding a freshly-paired secondary in
+        // every conversation. The account manifest is unaffected: the newcomer is still
+        // authorized via the DIK-signed ADD entry that append_device_add_to_manifest
+        // appends independently (§D2) — only the DC's own issuer signature changes here.
 
         build_ui();
         wire_signals();

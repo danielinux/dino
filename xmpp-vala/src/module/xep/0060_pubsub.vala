@@ -19,6 +19,10 @@ namespace Xmpp.Xep.Pubsub {
         private HashMap<string, RetractListenerDelegate> retract_listeners = new HashMap<string, RetractListenerDelegate>();
         private HashMap<string, DeleteListenerDelegate> delete_listeners = new HashMap<string, DeleteListenerDelegate>();
 
+        // Detail of the most recent failed publish() (the full error IQ), so a caller that
+        // only gets a bool back can log WHY it failed under its own log domain. null on success.
+        public string? last_publish_error = null;
+
         public void add_filtered_notification(XmppStream stream, string node,
                 owned ItemListenerDelegate.ResultFunc? item_listener,
                 owned RetractListenerDelegate.ResultFunc? retract_listener,
@@ -100,17 +104,31 @@ namespace Xmpp.Xep.Pubsub {
             }
 
             Iq.Stanza iq = new Iq.Stanza.set(pubsub_node);
+            last_publish_error = null;
 
             // If the node was configured differently before, reconfigure it to meet our requirements and try again
             Iq.Stanza iq_result = yield stream.get_module(Iq.Module.IDENTITY).send_iq_async(stream, iq);
             if (iq_result.is_error()) {
+                // Surface the actual error stanza — callers only get a bool back, so without
+                // this a publish failure (item-too-large, forbidden, not-acceptable, a stale
+                // node config, …) is invisible and looks like a silent hang/retry loop.
+                last_publish_error = iq_result.stanza.to_string();
+                warning("Pubsub publish to node '%s' failed: %s", node_id, (!) last_publish_error);
                 if (publish_options == null || !try_reconfiguring) return false;
-                bool precondition_not_met = iq_result.get_error().error_node.get_subnode("precondition-not-met", NS_URI_ERROR) != null;
+                ErrorStanza? err = iq_result.get_error();
+                bool precondition_not_met = err != null && err.error_node != null
+                    && err.error_node.get_subnode("precondition-not-met", NS_URI_ERROR) != null;
                 if (precondition_not_met) {
                     bool success = yield change_node_config(stream, jid, node_id, publish_options);
-                    if (!success) return false;
+                    if (!success) {
+                        warning("Pubsub publish: node '%s' precondition-not-met but reconfigure FAILED (not owner, or node config rejected)", node_id);
+                        return false;
+                    }
                     return yield publish(stream, jid, node_id, item_id, content, publish_options, false);
                 }
+                // Any other error is a genuine failure. Previously this fell through to
+                // `return true`, reporting success on failure and masking the real cause.
+                return false;
             }
 
             return true;

@@ -62,6 +62,7 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         app.stream_interactor.get_module(MessageProcessor.IDENTITY).pre_message_send.connect(on_pre_message_send);
         app.stream_interactor.get_module(MessageProcessor.IDENTITY).received_pipeline.connect(new DecryptMessageListener(this));
         app.stream_interactor.get_module(MucManager.IDENTITY).room_info_updated.connect(on_room_info_updated);
+        app.stream_interactor.get_module(MucManager.IDENTITY).private_room_occupant_updated.connect(on_private_room_occupant_updated);
     }
 
     // Subscribe to the room's X3DHPQ membership-journal PEP node when MUC info
@@ -80,6 +81,42 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         // owner/admins published before we arrived; each replayed groupchat message
         // flows through the received pipeline into try_handle_journal_entry.
         trigger_group_mam_catchup(account, muc_jid.bare_jid.to_string());
+        // We just (re)joined — push our own sender chain so existing members
+        // refresh our recv chain, and (via the checkpoint) so anyone can decrypt
+        // our recent history without waiting for our next message.
+        maybe_reannounce_group(account, muc_jid);
+    }
+
+    // A member's presence appeared/refreshed in a private channel. If it isn't
+    // us, re-broadcast our sender chain so a RETURNING member promptly gets our
+    // current checkpoint (and can then decrypt recent history via MAM) instead of
+    // waiting for our next message.
+    private void on_private_room_occupant_updated(Account account, Jid room, Jid occupant) {
+        if (occupant.equals_bare(account.bare_jid)) return;
+        maybe_reannounce_group(account, room);
+    }
+
+    // Per-room cooldown so a join burst (many occupant updates at once) coalesces
+    // into a single sender-chain re-broadcast instead of one fan-out per occupant.
+    private HashMap<string, int64?> group_reannounce_at = new HashMap<string, int64?>();
+    private const int64 GROUP_REANNOUNCE_COOLDOWN_US = 5 * 1000000;
+
+    // Re-broadcast our sender chain to a private channel, rate-limited per room.
+    // No-op for rooms we have no x3dhpq membership state for (not our channels).
+    private void maybe_reannounce_group(Account account, Jid room) {
+        string room_jid_str = room.bare_jid.to_string();
+        if (!db.has_membership_journal(account, room_jid_str)
+                && !db.has_membership_dag_entries(account, room_jid_str)) {
+            return;
+        }
+        string key = "%d/%s".printf(account.id, room_jid_str);
+        int64 now = get_monotonic_time();
+        int64? last = group_reannounce_at.has_key(key) ? group_reannounce_at.get(key) : null;
+        if (last != null && now - (!) last < GROUP_REANNOUNCE_COOLDOWN_US) {
+            return;
+        }
+        group_reannounce_at.set(key, now);
+        announce_group_to_members(account, room);
     }
 
     private void wipe_sessions_once(Account account) {
@@ -924,10 +961,24 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     // fan out duplicate announcements.
     private HashMap<string, Gee.Set<string>> announced_to = new HashMap<string, Gee.Set<string>>();
 
+    // Slide the group send-chain checkpoint forward at most once per this window
+    // (24h) so re-shared history — and the option-1 intra-epoch forward-secrecy
+    // loss — is bounded to ~24h rather than the whole (membership-driven, possibly
+    // unbounded) epoch. See GroupSession.maybe_advance_checkpoint.
+    private const int64 EPOCH_MAX_AGE_SECONDS = 24 * 3600;
+
     private void broadcast_sender_chain(Conversation conversation, Protocol.GroupSession gs,
             string room_jid_str, uint8[] aik_ed, uint8[] aik_mldsa, Jid? exclude_bare = null) {
         XmppStream? stream = app.stream_interactor.get_stream(conversation.account);
         if (stream == null) return;
+
+        // Bound the re-shareable history / forward-secrecy window: slide the send
+        // chain checkpoint forward to the current position once EPOCH_MAX_AGE has
+        // elapsed since it was last set. Persist immediately if it moved so the
+        // new window survives a restart regardless of which caller we came from.
+        if (gs.maybe_advance_checkpoint(new DateTime.now_utc().to_unix(), EPOCH_MAX_AGE_SECONDS)) {
+            db.store_group_session(conversation.account, room_jid_str, gs);
+        }
 
         Protocol.SenderChainAnnouncement ann;
         try {
@@ -1426,8 +1477,12 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             if (manager.try_handle_journal_entry(stanza, conversation)) {
                 return true;
             }
-            manager.decrypt_message(message, stanza, conversation);
-            return false;
+            // decrypt_message returns "abort pipeline?" — true only when it stashed
+            // a group message that can't be decrypted yet (no recv chain), so the
+            // unreadable message is NOT stored/deduped and can be re-decrypted once
+            // the sender chain arrives. Decrypted (or non-ours) messages return
+            // false and flow on to be stored.
+            return manager.decrypt_message(message, stanza, conversation);
         }
     }
 
@@ -1650,7 +1705,9 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                     warning("Invalid x3dhpq sender jid in group message: %s", e.message);
                 }
             }
-            return true;
+            // Decrypted → continue the pipeline so it is stored (return value is
+            // now "abort pipeline?", see DecryptMessageListener).
+            return false;
         } catch (Error e) {
             // First failure with a cached session but a fresh prekey present:
             // the peer re-initiated (reset/forget). Rebuild as responder from the
@@ -1705,11 +1762,13 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         try {
             gs.accept_sender_chain(ann);
             db.store_group_session(account, room_jid_str, gs);
-            // A sender chain was just installed. Group messages that arrived
-            // while we lacked this recv chain were dropped ("no recv chain"),
-            // so trigger a MUC MAM catch-up to have them re-delivered and now
-            // decrypt. Mirrors PQonversations
-            // GroupCryptoService.triggerMamCatchupAfterChain.
+            // A sender chain was just installed. Re-decrypt any group messages we
+            // stashed while lacking this recv chain (they were kept OUT of the
+            // store precisely so we could re-run them now — history_sync would
+            // otherwise treat a re-fetch as a server-id duplicate and never
+            // re-deliver). Then also trigger a MUC MAM catch-up for anything we
+            // never fetched at all.
+            drain_pending_group_messages(account, room_jid_str);
             trigger_group_mam_catchup(account, room_jid_str);
         } catch (GLib.Error e) {
             warning("x3dhpq accept_sender_chain failed for %s: %s", room_jid_str, e.message);
@@ -1749,6 +1808,62 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             history_sync.fetch_everything.end(res);
             group_mam_catchup_in_flight.remove(key);
         });
+    }
+
+    // ── Deferred group-history decryption ──────────────────────────────────────
+    // A group ciphertext that arrives before we hold the sender's recv chain (its
+    // checkpoint announcement hasn't landed yet — e.g. a MUC MAM catch-up on join
+    // races ahead of it) is stashed here, keyed by "account/room", and re-run
+    // through the receive pipeline once accept_sender_chain installs the chain.
+    // Bounded so a persistently-unresolvable room can't grow without limit.
+    private class PendingGroupMessage {
+        public Entities.Message message;
+        public Xmpp.MessageStanza stanza;
+        public Conversation conversation;
+        public string dedup_key;
+        public PendingGroupMessage(Entities.Message m, Xmpp.MessageStanza s, Conversation c, string k) {
+            message = m; stanza = s; conversation = c; dedup_key = k;
+        }
+    }
+    private HashMap<string, Gee.ArrayList<PendingGroupMessage>> pending_group_msgs =
+        new HashMap<string, Gee.ArrayList<PendingGroupMessage>>();
+    private const int MAX_PENDING_GROUP_MSGS_PER_ROOM = 500;
+
+    private void queue_undecryptable_group_message(Conversation conversation, Entities.Message message, Xmpp.MessageStanza stanza) {
+        string key = "%d/%s".printf(conversation.account.id, conversation.counterpart.bare_jid.to_string());
+        string dedup = message.server_id ?? (message.stanza_id ?? "");
+        Gee.ArrayList<PendingGroupMessage>? q = pending_group_msgs.has_key(key) ? pending_group_msgs.get(key) : null;
+        if (q == null) {
+            q = new Gee.ArrayList<PendingGroupMessage>();
+            pending_group_msgs.set(key, q);
+        }
+        if (dedup != "") {
+            foreach (PendingGroupMessage p in q) {
+                if (p.dedup_key == dedup) return;   // already stashed
+            }
+        }
+        if (q.size >= MAX_PENDING_GROUP_MSGS_PER_ROOM) {
+            q.remove_at(0);   // drop oldest
+        }
+        q.add(new PendingGroupMessage(message, stanza, conversation, dedup));
+    }
+
+    // Re-run every stashed group message for a room through the receive pipeline
+    // now that a sender chain was installed. Ones whose sender chain is now present
+    // decrypt and store (the archive delivers oldest-first, so the stash order
+    // ratchets in order); any still missing a chain (a different sender) are
+    // re-stashed by the normal path and wait for that sender's announcement.
+    private void drain_pending_group_messages(Account account, string room_jid_str) {
+        string key = "%d/%s".printf(account.id, room_jid_str);
+        if (!pending_group_msgs.has_key(key)) return;
+        Gee.ArrayList<PendingGroupMessage> q = pending_group_msgs.get(key);
+        pending_group_msgs.unset(key);
+        if (q.size == 0) return;
+        MessageProcessor? mp = app.stream_interactor.get_module(MessageProcessor.IDENTITY);
+        if (mp == null) return;
+        foreach (PendingGroupMessage p in q) {
+            mp.received_pipeline.run.begin(p.message, p.stanza, p.conversation);
+        }
     }
 
     private bool decrypt_group_message(Entities.Message message, Xmpp.MessageStanza stanza, Conversation conversation, StanzaNode group_env) {
@@ -1819,6 +1934,18 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                     db.store_message_source_device(conversation.account, (!) message.stanza_id, (int) hdr.sender_device_id);
                 }
             }
+            // Decrypted → let the pipeline continue and store it (return value is
+            // "abort pipeline?", see DecryptMessageListener).
+            return false;
+        } catch (Protocol.GroupSessionError.UNKNOWN_SENDER e) {
+            // We do not have this sender's recv chain YET — their sender-chain
+            // announcement (checkpoint) hasn't arrived, e.g. a MUC MAM catch-up on
+            // join raced ahead of it. Stash the message and re-decrypt it once the
+            // chain is installed, instead of storing it unreadable: Dino's
+            // history_sync dedupes by server id and would never re-deliver it. We
+            // ABORT the pipeline (return true) so it is not stored/deduped now.
+            warning("x3dhpq group decrypt deferred (no recv chain yet) from %s in %s", sender_aik_fp, room_jid_str);
+            queue_undecryptable_group_message(conversation, message, stanza);
             return true;
         } catch (GLib.Error e) {
             warning("x3dhpq group decrypt failed from %s in %s: %s", sender_aik_fp, room_jid_str, e.message);
