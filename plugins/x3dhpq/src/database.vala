@@ -5,7 +5,7 @@ using Xmpp;
 namespace Dino.Plugins.X3dhpq {
 
 public class Database : Qlite.Database {
-    private const int VERSION = 17;
+    private const int VERSION = 18;
 
     public class AccountIdentityTable : Table {
         public Column<int> id = new Column.Integer("id") { primary_key = true, auto_increment = true };
@@ -260,6 +260,25 @@ public class Database : Qlite.Database {
         }
     }
 
+    // §13.1a.1: the room owner this device has pinned for a v2 membership DAG.
+    // The pin is durable and is enforced on EVERY later fold: without it the genesis
+    // is re-derived from the current entry set each time (trust-on-first-FOLD), and
+    // since the AIK resolver is seeded from the whole local key cache, any known
+    // contact could inject a root entry that sorts ahead of the real genesis and take
+    // the room as owner. Added at schema v18.
+    public class RoomOwnerPinTable : Table {
+        public Column<int> account_id = new Column.Integer("account_id") { not_null = true };
+        public Column<string> room_jid = new Column.NonNullText("room_jid");
+        public Column<string> owner_fp_hex = new Column.NonNullText("owner_fp_hex");
+        public Column<long> created_at = new Column.Long("created_at") { not_null = true };
+
+        internal RoomOwnerPinTable(Database db) {
+            base(db, "room_owner_pin");
+            init({ account_id, room_jid, owner_fp_hex, created_at });
+            unique({ account_id, room_jid });
+        }
+    }
+
     public class MembershipJournalTable : Table {
         public Column<int> account_id = new Column.Integer("account_id") { not_null = true };
         public Column<string> room_jid = new Column.NonNullText("room_jid");
@@ -472,6 +491,7 @@ public class Database : Qlite.Database {
     public OneTimePreKeyTable one_time_pre_key { get; private set; }
     public PairwiseSessionTable pairwise_session { get; private set; }
     public GroupSessionTable group_session { get; private set; }
+    public RoomOwnerPinTable room_owner_pin { get; private set; }
     public MembershipJournalTable membership_journal { get; private set; }
     public MembershipDagTable membership_dag { get; private set; }
     public DeviceAuditTable device_audit { get; private set; }
@@ -496,6 +516,7 @@ public class Database : Qlite.Database {
         one_time_pre_key = new OneTimePreKeyTable(this);
         pairwise_session = new PairwiseSessionTable(this);
         group_session = new GroupSessionTable(this);
+        room_owner_pin = new RoomOwnerPinTable(this);
         membership_journal = new MembershipJournalTable(this);
         membership_dag = new MembershipDagTable(this);
         device_audit = new DeviceAuditTable(this);
@@ -506,7 +527,7 @@ public class Database : Qlite.Database {
         device_nickname = new DeviceNicknameTable(this);
         revoked_device = new RevokedDeviceTable(this);
         message_device = new MessageDeviceTable(this);
-        init({ account_identity, peer_account_identity, peer_device, device_list, trust_manifest, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, group_session, membership_journal, membership_dag, device_audit, audit_entry, recovery_blob, pairing_session, pending_enrollment_request, device_nickname, revoked_device, message_device });
+        init({ account_identity, peer_account_identity, peer_device, device_list, trust_manifest, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, group_session, room_owner_pin, membership_journal, membership_dag, device_audit, audit_entry, recovery_blob, pairing_session, pending_enrollment_request, device_nickname, revoked_device, message_device });
     }
 
     public Row? get_local_identity(int account_id) {
@@ -774,6 +795,63 @@ public class Database : Qlite.Database {
             rows.add((!) row);
         }
         return rows;
+    }
+
+    // §13.1a.1 room-owner pin. Returns null until a room has folded to an owner.
+    public string? get_pinned_room_owner(Account account, string room_jid) {
+        Row? row = room_owner_pin.select()
+            .with(room_owner_pin.account_id, "=", account.id)
+            .with(room_owner_pin.room_jid, "=", room_jid)
+            .single().row().inner;
+        return row == null ? null : ((!) row)[room_owner_pin.owner_fp_hex];
+    }
+
+    // Pin a room's owner. First writer wins: the pin exists precisely so a later fold
+    // cannot move the owner, so this never overwrites an existing pin.
+    public void pin_room_owner(Account account, string room_jid, string owner_fp_hex) {
+        if (get_pinned_room_owner(account, room_jid) != null) return;
+        room_owner_pin.upsert()
+            .value(room_owner_pin.account_id, account.id, true)
+            .value(room_owner_pin.room_jid, room_jid, true)
+            .value(room_owner_pin.owner_fp_hex, owner_fp_hex)
+            .value(room_owner_pin.created_at, (long) new DateTime.now_utc().to_unix())
+            .perform();
+    }
+
+    // Sign any KEM pre-key row that is missing part or all of its hybrid DIK
+    // signature (§9.1). Rows generated before the signing code existed have NULL
+    // signature columns; publishing them produces a bundle a conforming peer must
+    // reject outright, which silently takes this account off the air. The keys are
+    // ours, so the signature can be produced at any time from the stored public key.
+    public void backfill_kem_pre_key_signatures(Account account) {
+        Row? identity = account_identity.select().with(account_identity.account_id, "=", account.id).single().row().inner;
+        if (identity == null) return;
+        string? dik_priv_ed = ((!) identity)[account_identity.dik_priv_ed25519_base64];
+        string? dik_priv_ml = ((!) identity)[account_identity.dik_priv_mldsa_base64];
+        if (dik_priv_ed == null || dik_priv_ml == null) return;
+
+        foreach (Row row in get_local_kem_pre_keys(account)) {
+            string? sig_ed = row[kem_pre_key.signature_ed25519_base64];
+            string? sig_ml = row[kem_pre_key.signature_mldsa_base64];
+            if (sig_ed != null && sig_ed != "" && sig_ml != null && sig_ml != "") continue;
+            string? pub_b64 = row[kem_pre_key.public_base64];
+            if (pub_b64 == null || pub_b64 == "") continue;
+            int key_id = row[kem_pre_key.key_id];
+            try {
+                Bytes kem_pub = bytes_from_base64((!) pub_b64);
+                Bytes new_ed = global::X3dhpq.Crypto.ed25519_sign(bytes_from_base64((!) dik_priv_ed), kem_pub);
+                Bytes new_ml = global::X3dhpq.Crypto.mldsa65_sign(bytes_from_base64((!) dik_priv_ml), kem_pub);
+                kem_pre_key.update()
+                    .with(kem_pre_key.account_id, "=", account.id)
+                    .with(kem_pre_key.key_id, "=", key_id)
+                    .set(kem_pre_key.signature_ed25519_base64, bytes_to_base64(new_ed))
+                    .set(kem_pre_key.signature_mldsa_base64, bytes_to_base64(new_ml))
+                    .perform();
+            } catch (GLib.Error e) {
+                warning("x3dhpq: could not backfill signature for KEM pre-key %d: %s",
+                    key_id, e.message);
+            }
+        }
     }
 
     public Row? get_local_signed_pre_key(Account account, int key_id) {

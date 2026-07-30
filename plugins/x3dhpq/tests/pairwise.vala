@@ -10,7 +10,8 @@ class Pairwise : Gee.TestCase {
         add_test("device_certificate_roundtrip", test_device_certificate_roundtrip);
         add_test("session_roundtrip", test_session_roundtrip);
         add_test("bundle_rejects_bad_kem_sig", test_bundle_rejects_bad_kem_sig);
-        add_test("bundle_accepts_missing_kem_sig", test_bundle_accepts_missing_kem_sig);
+        add_test("bundle_rejects_missing_kem_sig", test_bundle_rejects_missing_kem_sig);
+        add_test("bundle_rejects_half_kem_sig", test_bundle_rejects_half_kem_sig);
     }
 
     // A KEM pre-key signed by a foreign key (not the bundle's DIK) MUST be
@@ -29,16 +30,36 @@ class Pairwise : Gee.TestCase {
         }
     }
 
-    // Transitional stance (§9.1): a KEM pre-key WITHOUT signatures is a legacy
-    // bundle and is accepted (so sessions establish across mixed versions); only
-    // a PRESENT-but-invalid signature is rejected (see the bad-sig test above).
-    private void test_bundle_accepts_missing_kem_sig() {
+    // §9.1 is unconditional: "a bundle offering no validly-signed KEM pre-key MUST be
+    // rejected". Tolerating an unsigned KEM pre-key is not a compatibility shim but a
+    // downgrade oracle — the KEM pre-key is the sole carrier of post-quantum (HNDL)
+    // confidentiality, so an attacker who strips the signature elements in transit gets
+    // an unverified key accepted and can substitute one whose secret they hold.
+    private void test_bundle_rejects_missing_kem_sig() {
         try {
             TestIdentity bob = new TestIdentity();
             PeerBundle peer_bundle = bob.to_peer_bundle();
             peer_bundle.kem_pre_keys[0].signature_ed25519_base64 = null;
             peer_bundle.kem_pre_keys[0].signature_mldsa_base64 = null;
-            fail_if_not(peer_bundle.verify(), "bundle with unsigned (legacy) KEM pre-key must still verify");
+            fail_if(peer_bundle.verify(), "bundle with an unsigned KEM pre-key must not verify");
+        } catch (Error e) {
+            fail_if_reached(e.message);
+        }
+    }
+
+    // Stripping only ONE half of the hybrid signature must not bypass verification of
+    // the other half — that would leave the post-quantum key authenticated by Ed25519
+    // alone, which a post-quantum active attacker can forge.
+    private void test_bundle_rejects_half_kem_sig() {
+        try {
+            TestIdentity bob = new TestIdentity();
+            PeerBundle drop_mldsa = bob.to_peer_bundle();
+            drop_mldsa.kem_pre_keys[0].signature_mldsa_base64 = null;
+            fail_if(drop_mldsa.verify(), "bundle missing the ML-DSA KEM signature must not verify");
+
+            PeerBundle drop_ed = bob.to_peer_bundle();
+            drop_ed.kem_pre_keys[0].signature_ed25519_base64 = null;
+            fail_if(drop_ed.verify(), "bundle missing the Ed25519 KEM signature must not verify");
         } catch (Error e) {
             fail_if_reached(e.message);
         }

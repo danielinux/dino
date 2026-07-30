@@ -8,6 +8,45 @@ namespace Dino.Plugins.X3dhpq.Protocol {
 
 private const int MAX_SKIPPED = 256;
 
+// A message key derived for a chain index, together with the chain mutation that
+// accepting it would imply. Nothing is applied until commit() runs, so a message whose
+// AEAD tag does not verify leaves the chain exactly as it was (§13.7).
+public class PendingMessageKey : Object {
+    public uint8[] message_key { get; private set; }
+    private SenderChain chain;
+    private bool from_skipped_table;
+    private uint32 skipped_index;
+    private uint8[]? new_chain_key;
+    private uint32 new_next_index;
+    private HashMap<uint32, Bytes>? new_skipped;
+
+    public PendingMessageKey.from_skipped(SenderChain chain, uint32 index, uint8[] mk) {
+        this.chain = chain;
+        this.message_key = mk;
+        this.from_skipped_table = true;
+        this.skipped_index = index;
+    }
+
+    public PendingMessageKey.from_ratchet(SenderChain chain, uint8[] mk, uint8[] new_ck,
+                                          uint32 new_next_index, HashMap<uint32, Bytes> new_skipped) {
+        this.chain = chain;
+        this.message_key = mk;
+        this.from_skipped_table = false;
+        this.new_chain_key = new_ck;
+        this.new_next_index = new_next_index;
+        this.new_skipped = new_skipped;
+    }
+
+    // Apply the chain mutation. Call ONLY after the ciphertext has authenticated.
+    public void commit() {
+        if (from_skipped_table) {
+            chain.consume_skipped(skipped_index);
+            return;
+        }
+        chain.apply_ratchet((!) new_chain_key, new_next_index, (!) new_skipped);
+    }
+}
+
 public class SenderChain : Object {
     public uint32 epoch { get; set; }
     public uint8[] chain_key { get; set; }   // 32 bytes
@@ -32,6 +71,19 @@ public class SenderChain : Object {
         return sc;
     }
 
+    // Commit hooks used by PendingMessageKey once a message has authenticated.
+    internal void consume_skipped(uint32 index) {
+        skipped.unset(index);
+    }
+
+    internal void apply_ratchet(uint8[] new_ck, uint32 new_next_index, HashMap<uint32, Bytes> new_skipped) {
+        foreach (var entry in new_skipped.entries) {
+            skipped[entry.key] = entry.value;
+        }
+        chain_key = new_ck;
+        next_index = new_next_index;
+    }
+
     // Returns message key; advances chain_key and next_index. index is returned via out param.
     public uint8[]? step(out uint32 index) throws GLib.Error {
         uint8[] mk = bytes_to_uint8_array(
@@ -45,26 +97,56 @@ public class SenderChain : Object {
     }
 
     // Get message key at `target`, advancing/caching skipped keys as needed.
+    //
+    // DEPRECATED for the receive path: this mutates the chain BEFORE the caller has
+    // authenticated anything. Use derive_message_key_at() + PendingMessageKey.commit()
+    // so the mutation is conditional on the AEAD tag verifying (§13.7).
     public uint8[]? message_key_at(uint32 target) throws GLib.Error {
+        PendingMessageKey? pending = derive_message_key_at(target);
+        if (pending == null) return null;
+        ((!) pending).commit();
+        return ((!) pending).message_key;
+    }
+
+    // Derive the message key for `target` WITHOUT mutating the chain. The caller
+    // authenticates the ciphertext first and only then calls commit().
+    //
+    // The chain ratchet is one-way — next_index never moves backwards — and the group
+    // message header, including chain_index, is plaintext and unauthenticated until the
+    // AEAD tag is checked. Advancing first therefore made the chain state writable by
+    // anyone able to place a group stanza in the room, member or not: repeated forged
+    // messages with rising indices walk next_index past the genuine sender's position,
+    // after which every real message from that sender is permanently rejected as
+    // "already advanced past". MAX_SKIPPED does not prevent this, because it bounds the
+    // work of a single call, not the cumulative advance across calls. Forged messages
+    // that consume cached skipped keys destroy genuine out-of-order messages the same way.
+    public PendingMessageKey? derive_message_key_at(uint32 target) throws GLib.Error {
         if (skipped.has_key(target)) {
-            Bytes mk_b = skipped[target];
-            skipped.unset(target);
-            return bytes_to_uint8_array(mk_b);
+            // Peek only — the entry is removed in commit().
+            return new PendingMessageKey.from_skipped(this, target, bytes_to_uint8_array(skipped[target]));
         }
         if (target < next_index) {
             throw new IOError.FAILED("senderchain: requested index already advanced past");
         }
-        while (next_index < target) {
-            if (skipped.size >= MAX_SKIPPED) {
+        var pending_skipped = new Gee.HashMap<uint32, Bytes>();
+        uint8[] ck = chain_key.copy();
+        uint32 index = next_index;
+        while (index < target) {
+            if (skipped.size + pending_skipped.size >= MAX_SKIPPED) {
                 throw new IOError.FAILED("senderchain: too many skipped keys");
             }
-            uint32 idx;
-            uint8[]? mk = step(out idx);
-            if (mk == null) return null;
-            skipped[idx] = new Bytes(mk);
+            uint8[] mk = bytes_to_uint8_array(
+                global::X3dhpq.Crypto.hmac_sha256(new Bytes(ck), new Bytes({ 0x01 })));
+            ck = bytes_to_uint8_array(
+                global::X3dhpq.Crypto.hmac_sha256(new Bytes(ck), new Bytes({ 0x02 })));
+            pending_skipped[index] = new Bytes(mk);
+            index++;
         }
-        uint32 idx;
-        return step(out idx);
+        uint8[] final_mk = bytes_to_uint8_array(
+            global::X3dhpq.Crypto.hmac_sha256(new Bytes(ck), new Bytes({ 0x01 })));
+        uint8[] final_ck = bytes_to_uint8_array(
+            global::X3dhpq.Crypto.hmac_sha256(new Bytes(ck), new Bytes({ 0x02 })));
+        return new PendingMessageKey.from_ratchet(this, final_mk, final_ck, index + 1, pending_skipped);
     }
 
     // Wire format matching senderchain.go Marshal.

@@ -30,6 +30,8 @@ class MembershipDagTest : Gee.TestCase {
         add_test("convergence_independent_of_order", test_convergence);
         add_test("snapshot_payload_roundtrip", test_snapshot_payload_roundtrip);
         add_test("snapshot_virtual_genesis_import", test_snapshot_genesis);
+        add_test("pinned_owner_survives_hostile_root", test_pinned_owner_survives_hostile_root);
+        add_test("unverifiable_first_entry_does_not_consume_genesis", test_unverifiable_first_entry);
     }
 
     // v1->v2 bridge Snapshot payload marshals/parses byte-for-byte.
@@ -115,6 +117,63 @@ class MembershipDagTest : Gee.TestCase {
         e.signature = bytes_to_arr(Crypto.ed25519_sign(signer.ed_priv, new Bytes(sp)));
         e.mldsa_signature = bytes_to_arr(Crypto.mldsa65_sign(signer.ml_priv, new Bytes(sp)));
         return e;
+    }
+
+    // §13.1a.1: the AIK resolver is seeded from the whole local key cache, so ANY known
+    // contact can author a well-formed root entry and — by choosing its own lamport,
+    // signer_fp and hash — sort it ahead of the real genesis. Unpinned, that stranger
+    // becomes owner (permanent admin, irremovable). The durable owner pin is what
+    // closes it.
+    private void test_pinned_owner_survives_hostile_root() {
+        try {
+            Id owner = make_id(); Id stranger = make_id(); Id victim = make_id();
+            JournalEntryV2 g = sign(owner, 5, heads(null), (uint8) MemberAuditActionV2.ADD_ADMIN, mp(owner.fp), 1000);
+            JournalEntryV2 add = sign(owner, 6, heads(g.compute_hash()), (uint8) MemberAuditActionV2.ADD_MEMBER, mp(victim.fp), 1001);
+            // Sorts first: lower lamport, no parents.
+            JournalEntryV2 hostile = sign(stranger, 0, heads(null), (uint8) MemberAuditActionV2.ADD_ADMIN, mp(stranger.fp), 999);
+
+            var dag = new MembershipDag();
+            dag.ingest(g.marshal()); dag.ingest(add.marshal()); dag.ingest(hostile.marshal());
+
+            // Unpinned (first ever fold) the hostile root wins — the TOFU window.
+            DagState unpinned = dag.recompute(resolver());
+            fail_if_not_eq_str((!) unpinned.owner_fp, stranger.fp_hex, "unpinned fold: hostile root takes ownership");
+
+            // Pinned to the real owner, the hostile root is skipped.
+            DagState pinned = dag.recompute_pinned(resolver(), owner.fp_hex);
+            fail_if_not_eq_str((!) pinned.owner_fp, owner.fp_hex, "pinned owner must survive a hostile root");
+            fail_if(pinned.admins.contains(stranger.fp_hex), "stranger must not become admin");
+            fail_if(pinned.members.contains(stranger.fp_hex), "stranger must not become member");
+            fail_if_not(pinned.members.contains(victim.fp_hex), "genuine members survive");
+        } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    // §13.1a.1: an entry that sorts first but cannot be verified (unresolvable signer)
+    // must be skipped, leaving the genesis slot open. Binding genesis to canonical index
+    // 0 instead let one such entry — free for anyone to produce — leave the room
+    // permanently ownerless, so every later entry folded as unauthorized.
+    private void test_unverifiable_first_entry() {
+        try {
+            Id owner = make_id(); Id member = make_id();
+            // Deliberately NOT registered with the resolver.
+            Id unknown = new Id();
+            Crypto.generate_ed25519(out unknown.ed_pub, out unknown.ed_priv);
+            Crypto.generate_mldsa65(out unknown.ml_pub, out unknown.ml_priv);
+            unknown.fp = bytes_to_arr(Crypto.random_bytes(20));
+            unknown.fp_hex = hex(unknown.fp);
+
+            JournalEntryV2 g = sign(owner, 5, heads(null), (uint8) MemberAuditActionV2.ADD_ADMIN, mp(owner.fp), 1000);
+            JournalEntryV2 add = sign(owner, 6, heads(g.compute_hash()), (uint8) MemberAuditActionV2.ADD_MEMBER, mp(member.fp), 1001);
+            JournalEntryV2 noise = sign(unknown, 0, heads(null), (uint8) MemberAuditActionV2.ADD_ADMIN, mp(unknown.fp), 999);
+
+            var dag = new MembershipDag();
+            dag.ingest(g.marshal()); dag.ingest(add.marshal()); dag.ingest(noise.marshal());
+
+            DagState st = dag.recompute(resolver());
+            fail_if(st.owner_fp == null, "an unverifiable entry sorting first must not block the real genesis");
+            fail_if_not_eq_str((!) st.owner_fp, owner.fp_hex, "owner must be the real genesis signer");
+            fail_if_not(st.members.contains(member.fp_hex), "later entries must still fold");
+        } catch (Error e) { fail_if_reached(e.message); }
     }
 
     private Gee.ArrayList<Bytes> heads(uint8[]? h) {

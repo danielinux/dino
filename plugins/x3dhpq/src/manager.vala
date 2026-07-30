@@ -250,11 +250,30 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     // member cannot read future group messages. The fold only includes entries
     // whose parents are all present (canonical_order), i.e. the causally-stable
     // prefix, so rotation is bound to stable state, not a movable raw index.
+    // Fold a room's membership DAG under the §13.1a.1 owner pin, pinning the owner the
+    // first time a fold produces one. Every DAG fold MUST go through here: a fold that
+    // re-derives the genesis from the current entry set is trust-on-first-FOLD, and the
+    // AIK resolver is seeded from the whole local key cache (every contact whose bundle
+    // we ever fetched), so any known contact could otherwise inject a root entry that
+    // sorts ahead of the real genesis and seize the room.
+    private Protocol.DagState recompute_dag_pinned(Account account, string room_jid_str,
+                                                   Protocol.MembershipDag dag) {
+        string? pin = db.get_pinned_room_owner(account, room_jid_str);
+        Protocol.DagState st = dag.recompute_pinned(make_aik_resolver(account), pin);
+        if (pin == null && st.owner_fp != null) {
+            db.pin_room_owner(account, room_jid_str, ((!) st.owner_fp).down());
+        } else if (pin != null && st.owner_fp == null) {
+            warning("x3dhpq: v2 fold for %s produced no genesis signed by the pinned owner %s; membership left unchanged (§13.1a.1)",
+                room_jid_str, (!) pin);
+        }
+        return st;
+    }
+
     private void rebuild_group_session_from_dag(Account account, string room_jid_str,
             Protocol.GroupSession gs) {
         Protocol.MembershipDag? dag = get_dag(account, room_jid_str);
         if (dag == null) return;
-        Protocol.DagState st = dag.recompute(make_aik_resolver(account));
+        Protocol.DagState st = recompute_dag_pinned(account, room_jid_str, dag);
 
         // Build the target set keyed by the session's display fingerprint.
         var target = new Gee.HashMap<string, Protocol.GroupMember>();
@@ -1026,8 +1045,8 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         // membership — union its members so v2-added members receive the bundle
         // over the pairwise channel even before they appear as MUC occupants.
         if (is_v2_active(conversation.account, room_jid_str)) {
-            Protocol.DagState st = ((!) get_dag(conversation.account, room_jid_str))
-                .recompute(make_aik_resolver(conversation.account));
+            Protocol.DagState st = recompute_dag_pinned(conversation.account, room_jid_str,
+                (!) get_dag(conversation.account, room_jid_str));
             active_fps.clear();
             foreach (string fph in st.members) active_fps.add(fph);
         }
@@ -1300,6 +1319,37 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         Protocol.DeviceCertificate? peer_cert = Protocol.DeviceCertificate.unmarshal(bytes_from_base64(prekey_node.get_deep_string_content("dc")));
         if (peer_cert == null) {
             return null;
+        }
+        // §9.2.1: a first-message prekey is SELF-CONTAINED — it carries the sender's DC
+        // and both AIK halves inline, all attacker-controlled. respond_session below
+        // checks that the DC verifies under the AIK carried WITH it (step 3), which
+        // only proves internal consistency: anyone can mint a fresh AIK and issue
+        // themselves a DC under it. The two checks that actually bind the material to a
+        // real identity are here.
+        //
+        // Step 2 — the certificate must belong to the device we key the session by.
+        // Without this, one device's certificate is replayable to open a session as a
+        // different device of the same account.
+        if ((int) peer_cert.device_id != sender_device_id) {
+            warning("x3dhpq: prekey DC device id %u does not match sender device %d for %s — rejecting (§9.2.1)",
+                peer_cert.device_id, sender_device_id, sender_jid_value);
+            return null;
+        }
+        // Step 4 — the carried AIK must equal the identity we have pinned for this
+        // account. A mismatch is an apparent identity reconstruction and must go
+        // through the §12.2 re-trust gate, never be silently adopted; without it a
+        // malicious relay simply presents its own AIK and impersonates the contact,
+        // because a successful PQXDH proves only that the sender chose the key
+        // material, not who they are.
+        Bytes carried_aik_ed = bytes_from_base64(prekey_node.get_deep_string_content("aik-ed25519"));
+        Bytes carried_aik_mldsa = bytes_from_base64(prekey_node.get_deep_string_content("aik-mldsa"));
+        Bytes pinned_aik_ed, pinned_aik_mldsa;
+        if (db.get_peer_aik_pubs(conversation.account, sender_jid_value, out pinned_aik_ed, out pinned_aik_mldsa)) {
+            if (pinned_aik_ed.compare(carried_aik_ed) != 0 || pinned_aik_mldsa.compare(carried_aik_mldsa) != 0) {
+                warning("x3dhpq: prekey from %s/%d carries an AIK that differs from the pinned identity — refusing to open a session (§9.2.1, §12.2)",
+                    sender_jid_value, sender_device_id);
+                return null;
+            }
         }
         Row local_bundle = db.get_required_local_bundle(conversation.account);
         Row? local_spk = db.get_local_signed_pre_key(conversation.account, local_bundle[db.bundle.signed_pre_key_id]);
@@ -1662,7 +1712,12 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                                             ann.room_jid, bytes_to_uint8_array(eb));
                                     }
                                 }
-                                on_sender_chain_announcement(conversation.account, ann);
+                                // Pass the AUTHENTICATED outer sender through: the
+                                // pairwise envelope proves who sent this, and §13.4.1
+                                // requires the announcement's self-claimed identity to
+                                // be checked against it.
+                                on_sender_chain_announcement(conversation.account, ann,
+                                    sender_jid_value, sender_device_id);
                             } else {
                                 warning("x3dhpq sender-chain unmarshal returned null from %s/%d",
                                     sender_jid_value, sender_device_id);
@@ -1740,7 +1795,63 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         return false;
     }
 
-    private void on_sender_chain_announcement(Dino.Entities.Account account, Protocol.SenderChainAnnouncement ann) {
+    // True iff a sender-chain announcement's self-claimed identity matches the
+    // (jid, device) that the authenticated pairwise session proves actually sent it
+    // (§13.4.1).
+    //
+    // The announcement is NOT signed: its authenticity comes entirely from the pairwise
+    // channel, which proves only the sending device. `SenderAIKPub` and
+    // `sender_device_id` inside it are plaintext claims chosen by whoever composed it.
+    // Checking merely that the claimed AIK is a room member is useless, because every
+    // member satisfies that for every OTHER member's fingerprint — so any member could
+    // install its own chain key under a second member's recvKey and then author group
+    // messages attributed to that member. Group messages carry no per-message sender
+    // signature (§13.3), so attribution rests entirely on which chain is installed under
+    // which key: this check is what makes in-room impersonation impossible.
+    private bool announcement_matches_outer_sender(Dino.Entities.Account account,
+                                                   Protocol.SenderChainAnnouncement ann,
+                                                   string sender_jid_value,
+                                                   int sender_device_id) {
+        if (ann.sender_device_id != (uint32) sender_device_id) {
+            warning("x3dhpq: rejecting sender-chain announcement from %s/%d — it claims device %u (§13.4.1)",
+                sender_jid_value, sender_device_id, ann.sender_device_id);
+            return false;
+        }
+        uint8[] claimed = ann.sender_aik_pub_bytes;
+        uint8[] authoritative;
+        if (sender_jid_value == account.bare_jid.to_string()) {
+            // Our own sibling devices: the authoritative AIK is this account's own.
+            uint8[] aik_ed = bytes_to_uint8_array(db.get_local_identity_bytes(account, db.account_identity.aik_pub_ed25519_base64));
+            uint8[] aik_ml = bytes_to_uint8_array(db.get_local_identity_bytes(account, db.account_identity.aik_pub_mldsa_base64));
+            authoritative = Manager.build_canonical_aik_bytes_static(aik_ed, aik_ml);
+        } else {
+            Bytes pinned_ed, pinned_ml;
+            if (!db.get_peer_aik_pubs(account, sender_jid_value, out pinned_ed, out pinned_ml)) {
+                // Nothing pinned yet: we cannot attribute this chain to anyone, and
+                // installing an unattributable chain is exactly what this rule prevents.
+                // Announcements are re-broadcast on every send, so a legitimate one is
+                // retried once the identity is known.
+                warning("x3dhpq: rejecting sender-chain announcement from %s — no pinned AIK to bind the claimed identity to (§13.4.1)",
+                    sender_jid_value);
+                return false;
+            }
+            authoritative = Manager.build_canonical_aik_bytes_static(
+                bytes_to_uint8_array(pinned_ed), bytes_to_uint8_array(pinned_ml));
+        }
+        if (claimed.length != authoritative.length
+                || Memory.cmp(claimed, authoritative, claimed.length) != 0) {
+            warning("x3dhpq: rejecting sender-chain announcement from %s/%d — the AIK it claims is not that sender's identity (impersonation attempt, §13.4.1)",
+                sender_jid_value, sender_device_id);
+            return false;
+        }
+        return true;
+    }
+
+    private void on_sender_chain_announcement(Dino.Entities.Account account, Protocol.SenderChainAnnouncement ann,
+                                              string sender_jid_value, int sender_device_id) {
+        if (!announcement_matches_outer_sender(account, ann, sender_jid_value, sender_device_id)) {
+            return;
+        }
         // Look up or create the group session for this room.
         string room_jid_str = ann.room_jid;
         int? local_device_id = db.get_local_device_id(account);
@@ -2492,7 +2603,7 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         if (!local_aik(account, out my_ed, out my_ml, out my_canon, out my_fp)) return false;
         string my_hex = Protocol.hex_of(my_fp);
         if (is_v2_active(account, room_jid_str)) {
-            Protocol.DagState st = ((!) get_dag(account, room_jid_str)).recompute(make_aik_resolver(account));
+            Protocol.DagState st = recompute_dag_pinned(account, room_jid_str, (!) get_dag(account, room_jid_str));
             return st.admins.contains(my_hex);
         }
         uint8[]? owner_fp = first_stored_owner_fp(account, room_jid_str);
@@ -2509,7 +2620,7 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         if (!is_v2_active(account, room_jid_str)) return false;
         uint8[] fp;
         if (!db.get_peer_aik_fingerprint_raw(account, member_jid.bare_jid.to_string(), out fp)) return false;
-        Protocol.DagState st = ((!) get_dag(account, room_jid_str)).recompute(make_aik_resolver(account));
+        Protocol.DagState st = recompute_dag_pinned(account, room_jid_str, (!) get_dag(account, room_jid_str));
         return st.admins.contains(Protocol.hex_of(fp));
     }
 

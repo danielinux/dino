@@ -381,9 +381,29 @@ public class MembershipDag : Object {
     }
 
     public DagState recompute(AikResolver resolver) {
+        return recompute_pinned(resolver, null);
+    }
+
+    // Fold the DAG into a member/admin state (§13.1a).
+    //
+    // `pinned_owner_fp`, when non-null, is the raw-hex fingerprint this room has
+    // already been pinned to; only an entry signed by it (or, for a Snapshot genesis,
+    // one asserting it as owner) may act as the genesis. Callers MUST persist the owner
+    // the first time a room folds to one and pass it back on every later fold — see
+    // §13.1a.1. Without the pin the genesis is trust-on-first-FOLD rather than
+    // trust-on-first-use, and the window re-opens on every recompute.
+    public DagState recompute_pinned(AikResolver resolver, string? pinned_owner_fp) {
         var st = new DagState();
         var order = canonical_order();
         var removal_node = new Gee.HashMap<string, string>();
+        // The genesis is the first entry that actually AUTHENTICATES (and matches the
+        // pin), NOT whatever sorts first. Keying it off the raw index made the genesis
+        // slot consumable: one entry that sorts first and fails to verify — which costs
+        // an attacker nothing to produce, since an unresolvable signer suffices — left
+        // the room permanently ownerless, after which every later entry (including the
+        // real genesis) folded as unauthorized against an empty admin set. That is a
+        // durable, remotely triggerable denial of service on the group.
+        bool genesis_established = false;
         for (int i = 0; i < order.size; i++) {
             JournalEntryV2 e = order.get(i);
             string signer_hex = hex_of(e.signer_fp);
@@ -393,7 +413,10 @@ public class MembershipDag : Object {
                 if (!e.verify(ed, ml)) continue;
             } catch (GLib.Error err) { continue; }
 
-            if (i == 0) {
+            if (!genesis_established) {
+                // A genesis must be a root: an entry descending from another entry
+                // cannot be the start of the room's history.
+                if (e.parents.size != 0) continue;
                 // A first-in-canonical-order Snapshot is a virtual genesis
                 // (v1->v2 bridge / MAM-prune-proof catch-up): TOFU-pin owner_fp
                 // and import its asserted member/admin/banned sets. The snapshot
@@ -402,6 +425,10 @@ public class MembershipDag : Object {
                     SnapshotPayload? sp = JournalEntryV2.parse_snapshot_payload(e.payload);
                     if (sp == null) continue;
                     string owner_hex = hex_of(sp.owner_fp);
+                    // The asserted owner is payload data the signer chose, so it is
+                    // exactly as attacker-controlled as the signer field. Only the pin
+                    // constrains it.
+                    if (pinned_owner_fp != null && pinned_owner_fp.down() != owner_hex.down()) continue;
                     var imp_members = new Gee.HashSet<string>();
                     var imp_admins = new Gee.HashSet<string>();
                     for (int mi = 0; mi < sp.member_fps.size; mi++) {
@@ -422,12 +449,22 @@ public class MembershipDag : Object {
                         st.removed.set(bh, sp.banned_epochs.get(bi));
                     }
                     st.epoch = (uint32) sp.epoch;
+                    genesis_established = true;
                     continue;
                 }
+                // A plain genesis: the signer becomes owner. The AIK resolver is seeded
+                // from the whole local key cache — every contact whose bundle we ever
+                // fetched, not just room members — so without the pin ANY known contact
+                // could author a root entry, have any member relay it (§13.1a permits
+                // relay by anyone), and sort it ahead of the real genesis by choosing
+                // its own lamport/signer_fp/hash. On the next fold that stranger is
+                // owner: permanent admin, irremovable, undemotable.
+                if (pinned_owner_fp != null && pinned_owner_fp.down() != signer_hex.down()) continue;
                 st.owner_fp = signer_hex;
                 st.admins.add(signer_hex);
                 st.members.add(signer_hex);
                 st.epoch = 0;
+                genesis_established = true;
                 continue;
             }
             st.epoch = (uint32) i;

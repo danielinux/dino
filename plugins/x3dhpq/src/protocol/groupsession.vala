@@ -254,18 +254,23 @@ public class GroupSession : Object {
         if (sc == null) {
             throw new GroupSessionError.UNKNOWN_SENDER(@"no recv chain for $rk");
         }
-        uint8[]? mk = sc.message_key_at(hdr.chain_index);
-        if (mk == null) {
-            throw new IOError.FAILED("message_key_at returned null");
+        // §13.7: derive the key WITHOUT mutating the chain, authenticate, and only then
+        // commit. The header (including chain_index) is unauthenticated until the AEAD
+        // tag verifies, so ratcheting first would let anyone able to place a group
+        // stanza in the room push this recv chain permanently past the real sender.
+        PendingMessageKey? pending = sc.derive_message_key_at(hdr.chain_index);
+        if (pending == null) {
+            throw new IOError.FAILED("derive_message_key_at returned null");
         }
         uint8[] aad_bytes = hdr.aad(room_jid);
         uint8[] nonce_bytes = hdr.aead_nonce();
         try {
             Bytes pt = global::X3dhpq.Crypto.aes256gcm_decrypt(
-                new Bytes(mk),
+                new Bytes(((!) pending).message_key),
                 new Bytes(nonce_bytes),
                 new Bytes(ciphertext),
                 new Bytes(aad_bytes));
+            ((!) pending).commit();
             return bytes_to_uint8_array(pt);
         } catch (GLib.Error e) {
             throw new GroupSessionError.AEAD_FAILURE("AEAD authentication failed");

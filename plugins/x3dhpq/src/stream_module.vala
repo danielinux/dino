@@ -1952,21 +1952,38 @@ public class StreamModule : XmppStreamModule {
                 account.bare_jid.to_string());
         }
 
+        // Backfill hybrid signatures onto any KEM pre-key row that predates the signing
+        // code, so nothing unsigned can reach the wire below. These are our OWN keys, so
+        // we can sign them at any time.
+        db.backfill_kem_pre_key_signatures(account);
+
         StanzaNode kemkeys = new StanzaNode.build("kemkeys", Protocol.NS_BUNDLE);
+        int published_kem_keys = 0;
         foreach (Row row in db.get_local_kem_pre_keys(account)) {
             // Structured like <spk>: <key> + hybrid <sig>/<mldsa-sig> (spec §9.1).
-            StanzaNode kemkey = new StanzaNode.build("kemkey", Protocol.NS_BUNDLE)
-                .put_attribute("id", row[db.kem_pre_key.key_id].to_string())
-                .put_node(new StanzaNode.build("key", Protocol.NS_BUNDLE).put_node(new StanzaNode.text(row[db.kem_pre_key.public_base64])));
             string? kem_sig_ed = row[db.kem_pre_key.signature_ed25519_base64];
             string? kem_sig_mldsa = row[db.kem_pre_key.signature_mldsa_base64];
-            if (kem_sig_ed != null) {
-                kemkey.put_node(new StanzaNode.build("sig", Protocol.NS_BUNDLE).put_node(new StanzaNode.text(kem_sig_ed)));
+            // §9.1 is unconditional: a KEM pre-key MUST carry BOTH signatures, because it
+            // is the sole carrier of post-quantum (HNDL) confidentiality. A conforming
+            // peer rejects the entire bundle over one unsigned key, so emitting one takes
+            // us off the air rather than degrading gracefully.
+            if (kem_sig_ed == null || kem_sig_ed == "" || kem_sig_mldsa == null || kem_sig_mldsa == "") {
+                warning("x3dhpq: omitting unsigned KEM pre-key %d from bundle publish (§9.1)",
+                    row[db.kem_pre_key.key_id]);
+                continue;
             }
-            if (kem_sig_mldsa != null) {
-                kemkey.put_node(new StanzaNode.build("mldsa-sig", Protocol.NS_BUNDLE).put_node(new StanzaNode.text(kem_sig_mldsa)));
-            }
+            StanzaNode kemkey = new StanzaNode.build("kemkey", Protocol.NS_BUNDLE)
+                .put_attribute("id", row[db.kem_pre_key.key_id].to_string())
+                .put_node(new StanzaNode.build("key", Protocol.NS_BUNDLE).put_node(new StanzaNode.text(row[db.kem_pre_key.public_base64])))
+                .put_node(new StanzaNode.build("sig", Protocol.NS_BUNDLE).put_node(new StanzaNode.text(kem_sig_ed)))
+                .put_node(new StanzaNode.build("mldsa-sig", Protocol.NS_BUNDLE).put_node(new StanzaNode.text(kem_sig_mldsa)));
             kemkeys.put_node(kemkey);
+            published_kem_keys++;
+        }
+        if (published_kem_keys == 0) {
+            warning("publish_bundle: no signed KEM pre-key for %s — refusing to publish a bundle that conforming peers must reject (§9.1)",
+                account.bare_jid.to_string());
+            return;
         }
         bundle_node.put_node(kemkeys);
 
