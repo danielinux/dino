@@ -1225,6 +1225,28 @@ public class StreamModule : XmppStreamModule {
     // folded device) then write the folded device set into the trust tables. On
     // any REJECT, keep the last good state (do not wipe trust). Returns true if
     // the manifest was accepted and applied.
+    // The device set from the last manifest this install ACCEPTED for an owner, folded
+    // fresh from the stored blob. Empty when nothing has been accepted yet (first
+    // contact), which is the only case where an incoming manifest may vouch for itself.
+    // Deliberately folded WITHOUT tombstones: this answers "who was trusted when we last
+    // accepted", and the caller applies tombstones on top so a device revoked since then
+    // cannot act as the vouching signer.
+    private Gee.HashMap<string, Protocol.DeviceCertificate> previously_accepted_fold(string bare) {
+        var empty = new Gee.HashMap<string, Protocol.DeviceCertificate>();
+        string? payload = db.get_trust_manifest_payload(account, bare);
+        if (payload == null || payload == "") return empty;
+        try {
+            uint8[] prev_bytes = bytes_to_uint8_array(bytes_from_base64((!) payload));
+            Protocol.TrustManifest? prev = Protocol.TrustManifest.unmarshal(prev_bytes);
+            if (prev == null) return empty;
+            return ((!) prev).fold();
+        } catch (GLib.Error e) {
+            warning("x3dhpq: could not fold the stored manifest for %s during the continuity check: %s",
+                bare, e.message);
+            return empty;
+        }
+    }
+
     private bool verify_and_apply_manifest(Jid jid, uint8[] bytes) {
         string bare = jid.bare_jid.to_string();
         bool is_self = jid.bare_jid.equals(account.bare_jid);
@@ -1302,16 +1324,40 @@ public class StreamModule : XmppStreamModule {
             }
         }
 
-        // 4. Fold. An invalid genesis ⇒ empty fold ⇒ REJECT (keep last good).
-        var folded = m.fold();
+        // 4. Fold, honouring durable revocation tombstones (§11.4). An invalid genesis
+        // ⇒ empty fold ⇒ REJECT (keep last good).
+        Gee.Set<uint32> tombstones = db.get_manifest_revoked_devices(account, bare);
+        var folded = m.fold_with_tombstones(tombstones);
         if (folded.size == 0) {
-            warning("x3dhpq: trust manifest from %s rejected — empty fold (invalid genesis)", bare);
+            warning("x3dhpq: trust manifest from %s rejected — empty fold (invalid genesis, or its genesis device is revoked)", bare);
             return false;
         }
 
-        // 5. Head signature must verify under some folded device's DIK.
+        // 5. CONTINUITY OF AUTHORITY (§11.3 step 5).
+        //
+        // The head must verify under the DIK of a device that was in the PREVIOUSLY
+        // ACCEPTED fold — not under a device in this manifest's own fold.
+        //
+        // Checking against the incoming fold is circular and was the load-bearing hole:
+        // a device holding AIK_priv (which §11.8 replicates to every authorized device)
+        // can mint itself a fresh DC under the CURRENT AIK, author a self-authored ADD
+        // TrustEntry under the CURRENT AIK, and publish a manifest with that entry
+        // first. fold() then makes it the genesis, so it IS in the incoming fold, so it
+        // verifies its own head and the check passes. The AIK never changes, so the
+        // §12.2 identity-change gate never fires either — a revoked device silently
+        // re-authorizes itself, and group membership (keyed by ACCOUNT AIK fingerprint)
+        // never notices.
+        //
+        // Anchoring on the prior fold enforces the intended rule: one already-trusted,
+        // non-revoked device may continue the chain; nothing else may start one.
+        // Legitimate genesis churn still works, because every republish is rooted by
+        // whichever trusted device published it (see build_snapshot_manifest).
+        var prior_fold = previously_accepted_fold(bare);
+        bool first_ever_manifest = prior_fold.size == 0;
         bool head_ok = false;
-        foreach (var en in folded.entries) {
+        foreach (var en in (first_ever_manifest ? folded : prior_fold).entries) {
+            uint32 did = (uint32) uint64.parse(en.key);
+            if (tombstones.contains(did)) continue;
             Protocol.DeviceCertificate dc = en.value;
             if (m.verify_head(dc.dik_pub_ed25519, dc.dik_pub_mldsa)) {
                 head_ok = true;
@@ -1319,7 +1365,17 @@ public class StreamModule : XmppStreamModule {
             }
         }
         if (!head_ok) {
-            warning("x3dhpq: trust manifest from %s rejected — head signature not by a member device", bare);
+            // No previously-trusted device vouches for this manifest: it re-roots the
+            // account's device authority. Do not adopt it and do not drop it quietly —
+            // surface it exactly like an AIK change (§12.2 STRICT) so the user must
+            // re-verify out of band. A genuine primary-device loss lands here too, and
+            // that is intended: re-rooting is recoverable but never silent.
+            warning("x3dhpq: trust manifest from %s rejected — not signed by any previously-trusted device; account device authority has been re-rooted (§11.3)", bare);
+            if (!first_ever_manifest) {
+                // Same hook the AIK-mismatch branch above uses: drives the
+                // contact_details_provider Review / Accept-new-identity flow.
+                db.flag_peer_devicelist_fork(account, bare);
+            }
             return false;
         }
 

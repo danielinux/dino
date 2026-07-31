@@ -2687,6 +2687,13 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         // can ever re-seed it — the phantom "previous master" case.
         db.store_revoked_device(account, (int) device_id);
 
+        // §11.4 manifest tombstone, scoped to this owner. Omission from the republished
+        // snapshot is not binding on a receiver — a snapshot's contents are chosen by
+        // whoever publishes it, so a device holding AIK_priv could simply republish
+        // itself back in. This is what actually keeps it out, and it is consulted by
+        // fold_with_tombstones on every subsequent manifest.
+        db.store_manifest_revoked_device(account, account.bare_jid.to_string(), device_id);
+
         // Local teardown: drop the removed device's session/bundle/prekey state.
         db.remove_peer_device(account, account.bare_jid.to_string(), (int) device_id);
 

@@ -5,7 +5,7 @@ using Xmpp;
 namespace Dino.Plugins.X3dhpq {
 
 public class Database : Qlite.Database {
-    private const int VERSION = 18;
+    private const int VERSION = 19;
 
     public class AccountIdentityTable : Table {
         public Column<int> id = new Column.Integer("id") { primary_key = true, auto_increment = true };
@@ -386,6 +386,30 @@ public class Database : Qlite.Database {
     // devicelist — including a stale, old-AIK-signed one the server still serves,
     // or a peer/pair-hello — can never RE-SEED a revoked device (the phantom
     // "previous master" case). Keyed by (account, device_id). Added at schema v13.
+    // §11.4 durable revocation tombstones, scoped per OWNER (own account or a peer).
+    //
+    // Distinct from RevokedDeviceTable below, which is the §8.6 own-account tombstone
+    // keyed only by device id. The trust manifest is a SNAPSHOT model, so a revocation
+    // is expressed only by the device being absent from the next published manifest —
+    // which is not binding on a receiver, because the publisher chooses what to include
+    // and anyone able to author a manifest can put the device straight back. This table
+    // is the receiver's own record and overrides what the snapshot asserts (see
+    // TrustManifest.fold_with_tombstones). Cleared only by an explicit user action:
+    // un-blocking the device, or re-trusting the owner's identity out of band.
+    // Added at schema v19.
+    public class ManifestRevokedDeviceTable : Table {
+        public Column<int> account_id = new Column.Integer("account_id") { not_null = true };
+        public Column<string> owner_jid = new Column.NonNullText("owner_jid");
+        public Column<int> device_id = new Column.Integer("device_id") { not_null = true };
+        public Column<long> revoked_at = new Column.Long("revoked_at") { default = "0" };
+
+        internal ManifestRevokedDeviceTable(Database db) {
+            base(db, "manifest_revoked_device");
+            init({ account_id, owner_jid, device_id, revoked_at });
+            unique({ account_id, owner_jid, device_id });
+        }
+    }
+
     public class RevokedDeviceTable : Table {
         public Column<int> account_id = new Column.Integer("account_id") { not_null = true };
         public Column<int> device_id = new Column.Integer("device_id") { not_null = true };
@@ -500,6 +524,7 @@ public class Database : Qlite.Database {
     public PairingSessionTable pairing_session { get; private set; }
     public PendingEnrollmentRequestTable pending_enrollment_request { get; private set; }
     public DeviceNicknameTable device_nickname { get; private set; }
+    public ManifestRevokedDeviceTable manifest_revoked_device { get; private set; }
     public RevokedDeviceTable revoked_device { get; private set; }
     public MessageDeviceTable message_device { get; private set; }
 
@@ -525,9 +550,10 @@ public class Database : Qlite.Database {
         pairing_session = new PairingSessionTable(this);
         pending_enrollment_request = new PendingEnrollmentRequestTable(this);
         device_nickname = new DeviceNicknameTable(this);
+        manifest_revoked_device = new ManifestRevokedDeviceTable(this);
         revoked_device = new RevokedDeviceTable(this);
         message_device = new MessageDeviceTable(this);
-        init({ account_identity, peer_account_identity, peer_device, device_list, trust_manifest, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, group_session, room_owner_pin, membership_journal, membership_dag, device_audit, audit_entry, recovery_blob, pairing_session, pending_enrollment_request, device_nickname, revoked_device, message_device });
+        init({ account_identity, peer_account_identity, peer_device, device_list, trust_manifest, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, group_session, room_owner_pin, membership_journal, membership_dag, device_audit, audit_entry, recovery_blob, pairing_session, pending_enrollment_request, device_nickname, manifest_revoked_device, revoked_device, message_device });
     }
 
     public Row? get_local_identity(int account_id) {
@@ -2417,6 +2443,46 @@ public class Database : Qlite.Database {
             result.add(row[revoked_device.device_id]);
         }
         return result;
+    }
+
+    // ---- §11.4 per-owner manifest tombstones -----------------------------------------
+
+    public void store_manifest_revoked_device(Account account, string owner_jid, uint32 device_id) {
+        manifest_revoked_device.upsert()
+            .value(manifest_revoked_device.account_id, account.id, true)
+            .value(manifest_revoked_device.owner_jid, owner_jid, true)
+            .value(manifest_revoked_device.device_id, (int) device_id, true)
+            .value(manifest_revoked_device.revoked_at, (long) new DateTime.now_utc().to_unix())
+            .perform();
+    }
+
+    public Gee.Set<uint32> get_manifest_revoked_devices(Account account, string owner_jid) {
+        var result = new Gee.HashSet<uint32>();
+        foreach (Row row in manifest_revoked_device.select()
+                .with(manifest_revoked_device.account_id, "=", account.id)
+                .with(manifest_revoked_device.owner_jid, "=", owner_jid)) {
+            result.add((uint32) row[manifest_revoked_device.device_id]);
+        }
+        return result;
+    }
+
+    // Clears ONE tombstone — the user un-blocked the device. This does not bring the
+    // device back: it only makes it eligible to be authorized again, either by a later
+    // manifest that includes it or by re-running pairing.
+    public void clear_manifest_revoked_device(Account account, string owner_jid, uint32 device_id) {
+        manifest_revoked_device.delete()
+            .with(manifest_revoked_device.account_id, "=", account.id)
+            .with(manifest_revoked_device.owner_jid, "=", owner_jid)
+            .with(manifest_revoked_device.device_id, "=", (int) device_id)
+            .perform();
+    }
+
+    // Clears every tombstone for an owner (explicit out-of-band re-trust of that identity).
+    public void clear_manifest_revoked_devices(Account account, string owner_jid) {
+        manifest_revoked_device.delete()
+            .with(manifest_revoked_device.account_id, "=", account.id)
+            .with(manifest_revoked_device.owner_jid, "=", owner_jid)
+            .perform();
     }
 
     // Cleared only on account reset (fresh AIK/genesis): the new identity's
