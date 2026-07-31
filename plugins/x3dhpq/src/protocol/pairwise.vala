@@ -633,7 +633,22 @@ public Bytes decrypt_transport_key(SessionState state, MessageHeader header, Byt
         return global::X3dhpq.Crypto.aes256gcm_decrypt(aes_key, nonce, ciphertext, new Bytes(concat_byte_arrays(bytes_to_uint8_array(state.ad), bytes_to_uint8_array(header.marshal()))));
     }
 
-    if (state.remote_dh_pub == null || Memory.cmp(bytes_to_uint8_array((!) state.remote_dh_pub), bytes_to_uint8_array(header.dh_pub), bytes_to_uint8_array(header.dh_pub).length) != 0) {
+    // Compare LENGTHS before contents. header.dh_pub is attacker-controlled and
+    // read_field permits up to 65536 bytes, while state.remote_dh_pub is a stored
+    // 32-byte X25519 key. Passing the header's length to Memory.cmp made a peer able
+    // to read up to ~64 KiB past that 32-byte allocation simply by prefixing a long
+    // field with the previously observed key — and this runs during header processing,
+    // before the AEAD tag has authenticated anything.
+    uint8[] header_dh_pub = bytes_to_uint8_array(header.dh_pub);
+    bool dh_pub_changed;
+    if (state.remote_dh_pub == null) {
+        dh_pub_changed = true;
+    } else {
+        uint8[] stored_dh_pub = bytes_to_uint8_array((!) state.remote_dh_pub);
+        dh_pub_changed = stored_dh_pub.length != header_dh_pub.length
+            || Memory.cmp(stored_dh_pub, header_dh_pub, stored_dh_pub.length) != 0;
+    }
+    if (dh_pub_changed) {
         if (state.chain_recv_key != null && header.prev_chain_len > state.recv_count) {
             // Skip (and cache) the remainder of the outgoing-epoch chain before
             // the DH ratchet below moves us to a new chain. These keys are for
@@ -700,7 +715,17 @@ public void decrypt_payload(Bytes transport_key, Bytes payload_ciphertext, out s
     Bytes key = slice_bytes(transport_key, 0, 32);
     Bytes nonce = slice_bytes(transport_key, 32, 12);
     Bytes clear = global::X3dhpq.Crypto.aes256gcm_decrypt(key, nonce, payload_ciphertext);
-    plaintext = (string) (uint8[]) bytes_to_uint8_array(clear);
+    // bytes_to_uint8_array allocates EXACTLY the plaintext length, but a Vala string is
+    // a NUL-terminated char*. Casting the bare array to string therefore handed every
+    // downstream consumer a buffer with no terminator, so reading it ran past the
+    // allocation until it happened to hit a zero byte — leaking adjacent heap contents
+    // into the message body, or crashing. The sender controls the plaintext length, so
+    // it also controls how the allocation is sized. Copy into a NUL-terminated buffer.
+    uint8[] clear_bytes = bytes_to_uint8_array(clear);
+    uint8[] terminated = new uint8[clear_bytes.length + 1];
+    Memory.copy(terminated, clear_bytes, clear_bytes.length);
+    terminated[clear_bytes.length] = 0;
+    plaintext = (string) (owned) terminated;
 }
 
 // Like decrypt_payload but returns raw bytes — used for sender-chain announcements.
