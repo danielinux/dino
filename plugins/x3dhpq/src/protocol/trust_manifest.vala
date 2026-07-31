@@ -46,7 +46,7 @@ namespace Dino.Plugins.X3dhpq.Protocol {
 
 public class TrustEntry : Object {
     public const uint8 ACTION_ADD = 1;
-    public const uint8 ACTION_REMOVE = 2;   // reserved / unused in the snapshot model
+    public const uint8 ACTION_REMOVE = 2;   // honoured by fold_with_tombstones (removal-wins)
 
     public uint8 action { get; set; }
     public uint32 device_id { get; set; }                 // subject
@@ -361,20 +361,49 @@ public class TrustManifest : Object {
     //     author is the genesis device, author_dc_hash == SHA-512(genesis DC),
     //     the entry sig verifies under the genesis DC's DIK, and dc.device_id ==
     //     device_id. A bad entry is dropped (that one), never fatal.
-    // No lamport/parents/topo-sort, no REMOVE/removal-wins: a revoked device is
-    // simply absent from the snapshot.
+    // No lamport/parents/topo-sort. Revocation is expressed by absence from the
+    // snapshot, but that is not binding on its own — see fold_with_tombstones.
     // Keyed by device_id's base-10 string form (Gee generics prefer string keys).
     // -------------------------------------------------------------------------
 
     public Gee.HashMap<string, DeviceCertificate> fold() {
+        return fold_with_tombstones(null);
+    }
+
+    // Fold honouring durable revocation tombstones.
+    //
+    // This is a snapshot model: revocation is expressed by a device being ABSENT from
+    // the next published manifest. That alone is not binding, because the publisher
+    // chooses what to include — anyone able to author a manifest can simply put a
+    // revoked device back. `tombstones` is the receiver's own durable record of device
+    // ids it has seen revoked for this owner, and it overrides what the snapshot says.
+    //
+    // The check deliberately covers the GENESIS entry as well as the loop below. The
+    // genesis is admitted unconditionally as the root of the fold, so skipping it there
+    // would let a revoked device walk straight back in by rooting the snapshot itself —
+    // exactly the move a compromised device holding AIK_priv would make.
+    //
+    // ACTION_REMOVE entries carried in the manifest are honoured too, and removal wins
+    // over any ADD for the same device id in the same snapshot, so a publisher cannot
+    // smuggle a device back by listing both.
+    public Gee.HashMap<string, DeviceCertificate> fold_with_tombstones(Gee.Set<uint32>? tombstones) {
         var trusted = new Gee.HashMap<string, DeviceCertificate>();
         if (aik == null) return trusted;
+
+        var revoked = new Gee.HashSet<uint32>();
+        if (tombstones != null) {
+            foreach (uint32 id in (!) tombstones) revoked.add(id);
+        }
+        foreach (TrustEntry e in entries) {
+            if (e.action == TrustEntry.ACTION_REMOVE) revoked.add(e.device_id);
+        }
 
         // 1. Identify the genesis entry (first valid one in list order).
         TrustEntry? genesis = null;
         foreach (TrustEntry e in entries) {
             if (e.action != TrustEntry.ACTION_ADD) continue;
             if (e.author_device_id != e.device_id) continue;
+            if (revoked.contains(e.device_id)) continue;
             if (e.dc.device_id != e.device_id) continue;
             if (!verify_entry_sig(e, new Bytes(aik.pub_ed25519), new Bytes(aik.pub_mldsa))) continue;
             bool dc_ok;
@@ -405,6 +434,7 @@ public class TrustManifest : Object {
         foreach (TrustEntry e in rest) {
             if (e.action != TrustEntry.ACTION_ADD) continue;
             if (e.author_device_id != genesis_id) continue;
+            if (revoked.contains(e.device_id)) continue;
             if (e.dc.device_id != e.device_id) continue;
             if (!byte_eq(e.author_dc_hash, genesis_dc_hash)) continue;
             if (!verify_entry_sig(e, g.dc.dik_pub_ed25519, g.dc.dik_pub_mldsa)) continue;

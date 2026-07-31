@@ -2671,9 +2671,11 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             return false;
         }
 
-        // Trust Manifest Phase 2 (§D4): revocation is a DIK-signed REMOVE entry
-        // appended to the account's trust manifest — the LIVE and only trust source.
-        // fold()'s removal-wins semantics drop the target; the derived devicelist
+        // Trust Manifest Phase 2 (§D4): revocation rebuilds the account's trust
+        // manifest — the LIVE and only trust source — without the target, and records
+        // a durable local tombstone. The snapshot's omission alone is NOT binding on a
+        // receiver (any publisher can put the device back); the tombstone consulted by
+        // fold_with_tombstones is what actually keeps it out. The derived devicelist
         // cache is republished below.
         if (!yield module.append_device_remove_to_manifest(stream, device_id)) {
             warning("x3dhpq remove_own_device: manifest REMOVE publish failed for device %u", device_id);

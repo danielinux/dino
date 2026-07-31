@@ -465,7 +465,14 @@ public class DeviceDag : Object {
             DeviceAuditEntryV2 e = order.get(i);
             string signer_hex = hex_of(e.signer_fp);
 
-            if (i == 0) {
+            // The genesis is the first entry that actually AUTHENTICATES and is a root,
+            // not whatever lands at canonical index 0. Keying it off the raw index made
+            // the genesis slot consumable: one entry sorting first that fails to resolve
+            // or verify left pinned_fp_hex null, after which EVERY later entry failed the
+            // signer check below and the fold stayed permanently empty. Producing such an
+            // entry costs an attacker nothing. Same fix as MembershipDag.recompute_pinned.
+            if (pinned_fp_hex == null) {
+                if (e.parents.size != 0) continue;
                 Bytes ed, ml;
                 if (!resolver(signer_hex, out ed, out ml)) continue;
                 bool ok;

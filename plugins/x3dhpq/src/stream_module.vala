@@ -892,9 +892,27 @@ public class StreamModule : XmppStreamModule {
         ensure_device_audit_genesis(devices);
         Gee.List<Protocol.DeviceListDevice>? dag_devices = try_derive_devices_from_dag(by_id);
         if (dag_devices != null && dag_devices.size > 0) {
-            devices = new Gee.ArrayList<Protocol.DeviceListDevice>();
-            devices.add_all(dag_devices);
-            devices.sort((a, b) => (a.device_id < b.device_id) ? -1 : (a.device_id > b.device_id ? 1 : 0));
+            // Use the DAG fold ONLY when it agrees exactly with the union, matching the
+            // Java client's guard. The device-audit DAG's genesis Snapshot is written
+            // once and never updated (ensure_device_audit_genesis returns early if any
+            // row exists), while add/revoke go through the trust manifest — so the two
+            // drift apart permanently after the first device change. Taking the fold
+            // unconditionally meant a REVOKED device was re-added to the signed
+            // devicelist (the shrink guard below only blocks shrinkage, not growth) and
+            // a newly paired sibling was silently omitted from it.
+            var dag_ids = new Gee.HashSet<uint32>();
+            foreach (Protocol.DeviceListDevice d in dag_devices) dag_ids.add(d.device_id);
+            var union_ids = new Gee.HashSet<uint32>();
+            foreach (Protocol.DeviceListDevice d in devices) union_ids.add(d.device_id);
+            bool agrees = dag_ids.size == union_ids.size && dag_ids.contains_all(union_ids);
+            if (agrees) {
+                devices = new Gee.ArrayList<Protocol.DeviceListDevice>();
+                devices.add_all(dag_devices);
+                devices.sort((a, b) => (a.device_id < b.device_id) ? -1 : (a.device_id > b.device_id ? 1 : 0));
+            } else {
+                debug("x3dhpq: device-audit DAG fold disagrees with the device union (%d vs %d); publishing the union",
+                    dag_ids.size, union_ids.size);
+            }
         }
 
         // Safety net ("no accidental/injected devicelist shrink"): a publish
@@ -1655,8 +1673,10 @@ public class StreamModule : XmppStreamModule {
         }
     }
 
-    // §D4: revoke a device by appending a DIK-signed REMOVE entry (removal-wins in
-    // fold()). Mirrors append_device_add_to_manifest. The self-revoke guard lives
+    // §D4: revoke a device by republishing the manifest without it and recording a
+    // durable tombstone (fold_with_tombstones enforces removal-wins on receivers —
+    // omission from a snapshot is not binding by itself). Mirrors
+    // append_device_add_to_manifest. The self-revoke guard lives
     // at the manager call site (remove_own_device). Returns true on publish+apply.
     public async bool append_device_remove_to_manifest(XmppStream stream, uint32 target_device_id) {
         string own_bare = account.bare_jid.to_string();
