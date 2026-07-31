@@ -29,10 +29,64 @@ namespace Xmpp.Xep.ExtensibleSaslProfile {
             stream.received_nonza.disconnect(this.received_nonza);
         }
 
+        // True iff <success> carries a SCRAM final message whose ServerSignature matches
+        // the one we derived from the challenge. Requires that a challenge round actually
+        // happened: flag.server_signature is only set when we processed a <challenge>, so a
+        // server that jumps straight to <success> to skip the proof fails here too.
+        private bool verify_scram_server_signature(Flag flag, StanzaNode success_node) {
+            if (flag.server_signature == null || flag.server_signature.length == 0) return false;
+
+            StanzaNode? additional_data = success_node.get_subnode("additional-data", NS_URI);
+            if (additional_data == null) return false;
+            string? encoded = additional_data.get_string_content();
+            if (encoded == null || encoded == "") return false;
+
+            string final_message = (string) Base64.decode(encoded);
+            uint8[]? server_signature = null;
+            foreach (string c in final_message.split(",")) {
+                string[] split = c.split("=", 2);
+                if (split.length != 2) continue;
+                if (split[0] == "v") server_signature = Base64.decode(split[1]);
+            }
+            if (server_signature == null) return false;
+            if (server_signature.length != flag.server_signature.length) return false;
+
+            // Constant-time compare: this is a MAC comparison, so do not early-exit.
+            uint8 diff = 0;
+            for (int i = 0; i < server_signature.length; i++) {
+                diff |= server_signature[i] ^ flag.server_signature[i];
+            }
+            return diff == 0;
+        }
+
         public void received_nonza(XmppStream stream, StanzaNode node) {
             if (node.ns_uri == NS_URI) {
                 if (node.name == "success") {
                     Flag flag = stream.get_flag(Flag.IDENTITY);
+
+                    // SCRAM is MUTUAL authentication: the client proves knowledge of the
+                    // password to the server, and the server proves it back with the
+                    // ServerSignature in the final message. Accepting <success> without
+                    // checking that signature discards the second half — and the SASL1
+                    // profile (sasl.vala) does check it, so this path was strictly weaker
+                    // for no reason.
+                    //
+                    // Without the check, anything able to answer for the server completes
+                    // authentication while knowing nothing about the password: it chooses
+                    // the salt, nonce and iteration count in the challenge, collects the
+                    // client's ClientProof (an offline-attackable value computed over
+                    // parameters it chose), and then just sends <success>. The client
+                    // believes it reached its own server and proceeds to hand over roster,
+                    // presence and message traffic. A server only has to ADVERTISE SASL2 to
+                    // select this path, so it was reachable at will.
+                    if (flag.mechanism == Mechanism.SCRAM_SHA_1
+                            && !verify_scram_server_signature(flag, node)) {
+                        warning("SASL2: SCRAM server signature missing or invalid — refusing to complete authentication");
+                        stream.remove_flag(flag);
+                        received_auth_failure(stream, node);
+                        return;
+                    }
+
                     flag.password = null; // Remove password from memory
                     flag.finished = true;
 

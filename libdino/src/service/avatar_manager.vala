@@ -76,9 +76,29 @@ public class AvatarManager : StreamInteractionModule, Object {
         });
     }
 
+    // An avatar id is a hex SHA-1 digest (XEP-0084 / XEP-0153) supplied by a REMOTE
+    // party as a PubSub item id or vCard photo hash, and it is used verbatim as a
+    // filename. Without this check a value containing path separators escapes the avatar
+    // folder — and store_image() WRITES attacker-supplied bytes to that path, so it is an
+    // arbitrary file write, not merely an arbitrary read. Restrict to what a real digest
+    // can contain rather than trying to strip traversal sequences.
+    private static bool is_safe_avatar_id(string? id) {
+        if (id == null || id.length < 16 || id.length > 128) return false;
+        for (int i = 0; i < id.length; i++) {
+            char c = id[i];
+            bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!hex) return false;
+        }
+        return true;
+    }
+
     public File? get_avatar_file(Account account, Jid jid_) {
         string? hash = get_avatar_hash(account, jid_);
         if (hash == null) return null;
+        if (!is_safe_avatar_id(hash)) {
+            warning("Refusing to use unsafe avatar id as a filename: %s", hash);
+            return null;
+        }
         File file = File.new_for_path(Path.build_filename(folder, hash));
         if (!file.query_exists()) {
             fetch_and_store_for_jid.begin(account, jid_);
@@ -263,6 +283,10 @@ public class AvatarManager : StreamInteractionModule, Object {
     }
 
     private async void store_image(string id, Bytes data) {
+        if (!is_safe_avatar_id(id)) {
+            warning("Refusing to store avatar under unsafe id: %s", id);
+            return;
+        }
         File file = File.new_for_path(Path.build_filename(folder, id));
         try {
             if (file.query_exists()) file.delete(); //TODO y?
@@ -275,6 +299,7 @@ public class AvatarManager : StreamInteractionModule, Object {
     }
 
     public bool has_image(string id) {
+        if (!is_safe_avatar_id(id)) return false;
         File file = File.new_for_path(Path.build_filename(folder, id));
         return file.query_exists();
     }

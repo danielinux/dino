@@ -95,6 +95,17 @@ public static string? get_sign_key(string signature, string? text) throws GLib.E
         context.op_verify(sig_data, text_data);
         VerifyResult* verify_res = context.op_verify_result();
         if (verify_res == null || verify_res.signatures == null) return null;
+        // op_verify() succeeding only means GPGME parsed the signature — a BAD signature
+        // still yields a signature entry carrying the claimed key's fingerprint. The
+        // per-signature status is what says whether it actually verified, so returning
+        // the fingerprint without checking it treats a forgery as proof of key
+        // ownership. The caller binds this fingerprint to the sender's JID and then
+        // encrypts to it, so an unchecked status is a key-substitution primitive: anyone
+        // able to send presence for a JID can point that contact's OpenPGP key at a key
+        // they hold.
+        if (verify_res.signatures.status.code != GPGError.ErrorCode.NO_ERROR) {
+            return null;
+        }
         return verify_res.signatures.fpr;
     } finally {
         global_mutex.unlock();

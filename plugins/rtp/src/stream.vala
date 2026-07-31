@@ -293,7 +293,10 @@ public class Dino.Plugins.Rtp.Stream : Xmpp.Xep.JingleRtp.Stream {
     private void prepare_local_crypto() {
         if (local_crypto != null && local_crypto.is_valid && !crypto_session.has_encrypt) {
             crypto_session.set_encryption_key(local_crypto.crypto_suite, local_crypto.key, local_crypto.salt);
-            debug("Setting up encryption with key params %s", local_crypto.key_params);
+            // NEVER log key_params: it is "inline:" + base64(SRTP master key || salt),
+            // i.e. the live session key. Anyone who can read the debug log can decrypt
+            // captured call media. Log only the negotiated suite.
+            debug("Setting up encryption with crypto suite %s", local_crypto.crypto_suite);
         }
     }
 
@@ -562,7 +565,8 @@ public class Dino.Plugins.Rtp.Stream : Xmpp.Xep.JingleRtp.Stream {
     private void prepare_remote_crypto() {
         if (remote_crypto != null && remote_crypto.is_valid && !crypto_session.has_decrypt) {
             crypto_session.set_decryption_key(remote_crypto.crypto_suite, remote_crypto.key, remote_crypto.salt);
-            debug("Setting up decryption with key params %s", remote_crypto.key_params);
+            // See the encryption side above: key_params carries the SRTP master key.
+            debug("Setting up decryption with crypto suite %s", remote_crypto.crypto_suite);
         }
     }
 
