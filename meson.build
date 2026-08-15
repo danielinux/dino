@@ -1,5 +1,28 @@
 project('Dino', 'c', 'cpp', 'vala', license: 'GPL-3.0', meson_version: '>=1.3.0')
 
+# Almost every C warning in this build comes out of valac-generated C, not out of
+# anything anyone wrote: unused `_tmpN_`/`_inner_errorN_` temporaries, `__catch0_*`
+# labels, unused `*_ref`/`*_finish` boilerplate, and — the single largest group —
+# `-Wdiscarded-qualifiers` raised inside glib's own gatomic.h, once per generated
+# get_type() via g_once_init_enter(). None of it is actionable here, and 5k lines of
+# it buries the handful of warnings that ARE real (e.g. the %llu/uint64 format bugs).
+# Silencing these takes the plugin build from ~213 warnings to ~5, all genuine.
+#
+# Deliberately NOT suppressed: -Wincompatible-pointer-types (GCC 14+ makes these
+# errors by default and they catch real VAPI drift) and -Wformat (real bugs).
+# Hand-written C keeps full warnings by opting back in per target — see
+# plugins/x3dhpq/meson.build, which builds wolfssl_helper.c separately for exactly
+# this reason.
+cc = meson.get_compiler('c')
+add_project_arguments(cc.get_supported_arguments([
+    '-Wno-unused-but-set-variable',
+    '-Wno-unused-variable',
+    '-Wno-unused-function',
+    '-Wno-unused-label',
+    '-Wno-discarded-qualifiers',
+    '-Wno-duplicate-decl-specifier',
+]), language: 'c')
+
 fs = import('fs')
 gnome = import('gnome')
 i18n = import('i18n')

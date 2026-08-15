@@ -49,12 +49,38 @@ sources = files(
     'src/ui/pair_new_device_dialog.vala',
     'src/ui/pair_to_existing_dialog.vala',
     'src/native/wolfssl.vala',
-    'src/native/wolfssl_helper.c',
 )
 
 c_args = [
     '-DG_LOG_DOMAIN="x3dhpq"',
 ]
+
+# wolfssl_helper.c is the only hand-written C in this plugin and it is the piece that
+# actually touches key material, so it is built on its own instead of being mixed in
+# with the valac-generated sources. That lets it opt back out of the project-wide
+# -Wno-* set (see the top-level meson.build) and run with full warnings: the
+# suppressions exist to hide code-generator noise, and must not extend to code a human
+# wrote. It compiles clean today, and this keeps it that way.
+lib_x3dhpq_native = static_library(
+    'x3dhpq-native',
+    files('src/native/wolfssl_helper.c'),
+    c_args: c_args + [
+        '-Wall',
+        '-Wextra',
+        # Re-enable explicitly rather than relying on -Wall/-Wextra: these are the
+        # ones the project-wide suppressions turned off, and target args come after
+        # project args on the command line, so the last setting wins.
+        '-Wunused-but-set-variable',
+        '-Wunused-variable',
+        '-Wunused-function',
+        '-Wunused-label',
+        '-Wdiscarded-qualifiers',
+        '-Wduplicate-decl-specifier',
+    ],
+    include_directories: include_directories('src'),
+    dependencies: [dep_glib, dep_wolfssl],
+    install: false,
+)
 
 vala_args = [
     '--vapidir', meson.current_source_dir() / 'vapi',
@@ -68,6 +94,7 @@ lib_x3dhpq = shared_library(
     vala_args: vala_args,
     include_directories: include_directories('src'),
     dependencies: dependencies,
+    link_with: lib_x3dhpq_native,
     install: true,
     install_dir: get_option('libdir') / get_option('plugindir'),
     install_rpath: default_install_rpath,
