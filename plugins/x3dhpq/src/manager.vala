@@ -2304,9 +2304,39 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             warning("x3dhpq group decrypt deferred (no recv chain yet) from %s in %s", sender_aik_fp, room_jid_str);
             queue_undecryptable_group_message(conversation, message, stanza);
             return true;
+        } catch (Protocol.GroupSessionError.AEAD_FAILURE e) {
+            /* Authentication failed. Overwhelmingly this is a DUPLICATE: the same stanza
+             * reached us twice (live delivery plus MUC MAM catch-up after being offline),
+             * the first copy already consumed that chain index, and the ratchet is one-way
+             * (§13.7), so the second copy can never authenticate. The first copy was
+             * displayed correctly, so dropping this one is exactly right.
+             *
+             * The remainder are tampering or a forged sender signature (§13.3a) — also not
+             * something to render. Either way we MUST NOT fall through to the pipeline:
+             * doing so stores the stanza with the sender's cleartext fallback body
+             * ("[This message is x3dhpq group-encrypted]"), which the UI then shows as an
+             * ordinary UNENCRYPTED message beside the real one. That is both visual debris
+             * and actively misleading — an open padlock on content the peer never sent in
+             * the clear.
+             *
+             * Not stashed: unlike the no-recv-chain case below, retrying cannot help. */
+            debug("x3dhpq: dropping group message from %s in %s that did not authenticate"
+                + " (duplicate delivery, or tampered): %s", sender_aik_fp, room_jid_str, e.message);
+            return true;
+        } catch (Protocol.GroupSessionError.REMOVED_MEMBER e) {
+            debug("x3dhpq: dropping group message from removed member %s in %s",
+                sender_aik_fp, room_jid_str);
+            return true;
+        } catch (Protocol.GroupSessionError.STALE_EPOCH e) {
+            debug("x3dhpq: dropping group message from %s in %s with a stale epoch",
+                sender_aik_fp, room_jid_str);
+            return true;
         } catch (GLib.Error e) {
+            /* Anything else (malformed header, chain index already ratcheted past, ...).
+             * Same rule: never let an undecryptable group stanza reach the pipeline with
+             * its cleartext fallback body. */
             warning("x3dhpq group decrypt failed from %s in %s: %s", sender_aik_fp, room_jid_str, e.message);
-            return false;
+            return true;
         }
     }
 
