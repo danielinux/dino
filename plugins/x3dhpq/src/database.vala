@@ -5,7 +5,7 @@ using Xmpp;
 namespace Dino.Plugins.X3dhpq {
 
 public class Database : Qlite.Database {
-    private const int VERSION = 20;
+    private const int VERSION = 21;
 
     public class AccountIdentityTable : Table {
         public Column<int> id = new Column.Integer("id") { primary_key = true, auto_increment = true };
@@ -204,10 +204,15 @@ public class Database : Qlite.Database {
         // rows migrate; new rows are always signed at generation.
         public Column<string?> signature_ed25519_base64 = new Column.Text("signature_ed25519_base64") { min_version = 17 };
         public Column<string?> signature_mldsa_base64 = new Column.Text("signature_mldsa_base64") { min_version = 17 };
+        // §9.1.2: exactly one reusable last-resort key per account, served when the
+        // one-time pool is exhausted. Without it a peer that drained the pool could not
+        // open a session at all; with it, that case degrades to "no per-session KEM
+        // forward secrecy" instead of "no session".
+        public Column<bool> last_resort = new Column.BoolInt("last_resort") { default = "0", min_version = 21 };
 
         internal KemPreKeyTable(Database db) {
             base(db, "kem_pre_key");
-            init({ account_id, key_id, public_base64, private_base64, published, consumed, created_at, signature_ed25519_base64, signature_mldsa_base64 });
+            init({ account_id, key_id, public_base64, private_base64, published, consumed, created_at, signature_ed25519_base64, signature_mldsa_base64, last_resort });
             unique({ account_id, key_id });
         }
     }
@@ -598,6 +603,24 @@ public class Database : Qlite.Database {
         return (int) signed_pre_key.select().with(signed_pre_key.account_id, "=", account.id).count();
     }
 
+    /* §9.1.2: usable ONE-TIME keys only. Counting every row (including consumed and
+     * last-resort ones) would stall replenishment the moment keys start being consumed —
+     * the pool would look full while holding nothing a peer could actually use. */
+    public int count_unconsumed_one_time_kem_pre_keys(Account account) {
+        return (int) kem_pre_key.select()
+            .with(kem_pre_key.account_id, "=", account.id)
+            .with(kem_pre_key.consumed, "=", false)
+            .with(kem_pre_key.last_resort, "=", false)
+            .count();
+    }
+
+    public bool has_last_resort_kem_pre_key(Account account) {
+        return kem_pre_key.select()
+            .with(kem_pre_key.account_id, "=", account.id)
+            .with(kem_pre_key.last_resort, "=", true)
+            .count() > 0;
+    }
+
     public int count_kem_pre_keys(Account account) {
         return (int) kem_pre_key.select().with(kem_pre_key.account_id, "=", account.id).count();
     }
@@ -762,7 +785,29 @@ public class Database : Qlite.Database {
                     .perform();
             }
 
-            while (count_kem_pre_keys(account) < 5) {
+            /* §9.1.2: mint the reusable last-resort key first if the account has none, so
+             * an initiator can still open a session once the one-time pool is drained. */
+            if (!has_last_resort_kem_pre_key(account)) {
+                Bytes lr_pub;
+                Bytes lr_priv;
+                global::X3dhpq.Crypto.generate_mlkem768(out lr_pub, out lr_priv);
+                Bytes lr_sig_ed = global::X3dhpq.Crypto.ed25519_sign(bytes_from_base64(row[account_identity.dik_priv_ed25519_base64]), lr_pub);
+                Bytes lr_sig_ml = global::X3dhpq.Crypto.mldsa65_sign(bytes_from_base64(row[account_identity.dik_priv_mldsa_base64]), lr_pub);
+                kem_pre_key.insert()
+                    .value(kem_pre_key.account_id, account.id)
+                    .value(kem_pre_key.key_id, next_key_id(kem_pre_key, kem_pre_key.account_id, kem_pre_key.key_id, account.id))
+                    .value(kem_pre_key.public_base64, bytes_to_base64(lr_pub))
+                    .value(kem_pre_key.private_base64, bytes_to_base64(lr_priv))
+                    .value(kem_pre_key.signature_ed25519_base64, bytes_to_base64(lr_sig_ed))
+                    .value(kem_pre_key.signature_mldsa_base64, bytes_to_base64(lr_sig_ml))
+                    .value(kem_pre_key.published, false)
+                    .value(kem_pre_key.consumed, false)
+                    .value(kem_pre_key.last_resort, true)
+                    .value(kem_pre_key.created_at, (long) new DateTime.now_utc().to_unix())
+                    .perform();
+            }
+
+            while (count_unconsumed_one_time_kem_pre_keys(account) < 5) {
                 Bytes kem_pub;
                 Bytes kem_priv;
                 global::X3dhpq.Crypto.generate_mlkem768(out kem_pub, out kem_priv);
@@ -780,6 +825,7 @@ public class Database : Qlite.Database {
                     .value(kem_pre_key.signature_mldsa_base64, bytes_to_base64(kem_sig_mldsa))
                     .value(kem_pre_key.published, false)
                     .value(kem_pre_key.consumed, false)
+                    .value(kem_pre_key.last_resort, false)
                     .value(kem_pre_key.created_at, (long) new DateTime.now_utc().to_unix())
                     .perform();
             }
@@ -833,6 +879,23 @@ public class Database : Qlite.Database {
         Row bundle_row = get_required_local_bundle(account);
         string? encoded = bundle_row[bundle.device_certificate_base64];
         return encoded != null ? Protocol.DeviceCertificate.unmarshal(bytes_from_base64(encoded)) : null;
+    }
+
+    /* §9.1.2: rows eligible for bundle publication — unconsumed one-time keys plus the
+     * last-resort key. A consumed one-time key's private half has been erased, so
+     * republishing it would advertise a prekey no handshake choosing it could complete. */
+    public Gee.List<Row> get_publishable_kem_pre_keys(Account account) {
+        Gee.ArrayList<Row> rows = new Gee.ArrayList<Row>();
+        RowIterator iterator = kem_pre_key.select().with(kem_pre_key.account_id, "=", account.id).iterator();
+        Row? row;
+        while ((row = iterator.get_next()) != null) {
+            bool is_consumed = ((!) row)[kem_pre_key.consumed];
+            bool is_last_resort = ((!) row)[kem_pre_key.last_resort];
+            if (!is_consumed || is_last_resort) {
+                rows.add((!) row);
+            }
+        }
+        return rows;
     }
 
     public Gee.List<Row> get_local_kem_pre_keys(Account account) {
@@ -970,6 +1033,20 @@ public class Database : Qlite.Database {
             .with(one_time_pre_key.account_id, "=", account.id)
             .with(one_time_pre_key.key_id, "=", key_id)
             .set(one_time_pre_key.consumed, true)
+            .perform();
+    }
+
+    /* §9.1.2: retire a consumed ONE-TIME ML-KEM prekey. The private half is erased, not
+     * merely flagged: the whole point is that a later compromise of this device must not
+     * decapsulate the recorded kem-ct of past handshakes. The last_resort key is reusable
+     * by design and is excluded by the WHERE clause. */
+    public void mark_local_kem_pre_key_consumed(Account account, int key_id) {
+        kem_pre_key.update()
+            .with(kem_pre_key.account_id, "=", account.id)
+            .with(kem_pre_key.key_id, "=", key_id)
+            .with(kem_pre_key.last_resort, "=", false)
+            .set(kem_pre_key.consumed, true)
+            .set(kem_pre_key.private_base64, "")
             .perform();
     }
 

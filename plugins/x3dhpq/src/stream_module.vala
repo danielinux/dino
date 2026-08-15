@@ -2046,7 +2046,7 @@ public class StreamModule : XmppStreamModule {
 
         StanzaNode kemkeys = new StanzaNode.build("kemkeys", Protocol.NS_BUNDLE);
         int published_kem_keys = 0;
-        foreach (Row row in db.get_local_kem_pre_keys(account)) {
+        foreach (Row row in db.get_publishable_kem_pre_keys(account)) {
             // Structured like <spk>: <key> + hybrid <sig>/<mldsa-sig> (spec §9.1).
             string? kem_sig_ed = row[db.kem_pre_key.signature_ed25519_base64];
             string? kem_sig_mldsa = row[db.kem_pre_key.signature_mldsa_base64];

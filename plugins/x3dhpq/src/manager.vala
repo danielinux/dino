@@ -1339,9 +1339,10 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     // one-time prekey was referenced, so the caller only marks it consumed AFTER
     // the message actually decrypts. Shared by the primary no-session/orphan path
     // and the stale-live-session retry in decrypt_message.
-    private Protocol.SessionState? respond_session_from_prekey(Conversation conversation, StanzaNode prekey_node, string sender_jid_value, int sender_device_id, out bool consumed, out int consumed_opk_id) {
+    private Protocol.SessionState? respond_session_from_prekey(Conversation conversation, StanzaNode prekey_node, string sender_jid_value, int sender_device_id, out bool consumed, out int consumed_opk_id, out int consumed_kem_id) {
         consumed = false;
         consumed_opk_id = 0;
+        consumed_kem_id = 0;
         Protocol.DeviceCertificate? peer_cert = Protocol.DeviceCertificate.unmarshal(bytes_from_base64(prekey_node.get_deep_string_content("dc")));
         if (peer_cert == null) {
             return null;
@@ -1379,7 +1380,8 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         }
         Row local_bundle = db.get_required_local_bundle(conversation.account);
         Row? local_spk = db.get_local_signed_pre_key(conversation.account, local_bundle[db.bundle.signed_pre_key_id]);
-        Row? local_kem = db.get_local_kem_pre_key(conversation.account, prekey_node.get_attribute_int("kemkey-id"));
+        int kem_id = prekey_node.get_attribute_int("kemkey-id");
+        Row? local_kem = db.get_local_kem_pre_key(conversation.account, kem_id);
         if (local_spk == null || local_kem == null) {
             return null;
         }
@@ -1406,6 +1408,10 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                 consumed = true;
                 consumed_opk_id = opk_id;
             }
+            /* §9.1.2: the one-time ML-KEM prekey is retired too, but — like the OPK —
+             * only once the caller has authenticated the ciphertext. Reporting it here
+             * lets the caller do that at the right moment. */
+            consumed_kem_id = kem_id;
             return st;
         } catch (Error e) {
             warning("Unable to respond to x3dhpq prekey message from %s/%d: %s", sender_jid_value, sender_device_id, e.message);
@@ -1653,6 +1659,7 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         Protocol.SessionState? state_to_commit = null;
         bool consume_one_time_prekey = false;
         int consumed_opk_id = 0;
+        int consumed_kem_id = 0;
 
         StanzaNode? prekey_node = ((!) key_node).get_subnode("prekey", Protocol.NS_ENVELOPE);
 
@@ -1688,7 +1695,7 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                 return false;
             }
             state_to_commit = respond_session_from_prekey(conversation, (!) prekey_node,
-                sender_jid_value, sender_device_id, out consume_one_time_prekey, out consumed_opk_id);
+                sender_jid_value, sender_device_id, out consume_one_time_prekey, out consumed_opk_id, out consumed_kem_id);
             if (state_to_commit == null) {
                 return false;
             }
@@ -1731,6 +1738,9 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                     db.store_session(conversation.account, sender_jid_value, sender_device_id, (!) state_to_commit);
                     if (consume_one_time_prekey) {
                         db.mark_local_one_time_pre_key_consumed(conversation.account, consumed_opk_id);
+                    }
+                    if (consumed_kem_id > 0) {
+                        db.mark_local_kem_pre_key_consumed(conversation.account, consumed_kem_id);
                     }
                     warning("x3dhpq: re-established session with %s/%d via rekey heartbeat", sender_jid_value, sender_device_id);
                     return false;
@@ -1780,6 +1790,9 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                     if (consume_one_time_prekey) {
                         db.mark_local_one_time_pre_key_consumed(conversation.account, consumed_opk_id);
                     }
+                    if (consumed_kem_id > 0) {
+                        db.mark_local_kem_pre_key_consumed(conversation.account, consumed_kem_id);
+                    }
                     // Do not set message.body — this is a control message, not visible.
                     return false;
                 }
@@ -1790,6 +1803,9 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             db.store_session(conversation.account, sender_jid_value, sender_device_id, (!) state_to_commit);
             if (consume_one_time_prekey) {
                 db.mark_local_one_time_pre_key_consumed(conversation.account, consumed_opk_id);
+            }
+            if (consumed_kem_id > 0) {
+                db.mark_local_kem_pre_key_consumed(conversation.account, consumed_kem_id);
             }
             message.body = plaintext;
             message.encryption = Encryption.X3DHPQ;
@@ -1821,7 +1837,7 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             // store), so re-running is safe.
             if (attempt == 0 && !responded_from_prekey && prekey_node != null) {
                 Protocol.SessionState? rebuilt = respond_session_from_prekey(conversation, (!) prekey_node,
-                    sender_jid_value, sender_device_id, out consume_one_time_prekey, out consumed_opk_id);
+                    sender_jid_value, sender_device_id, out consume_one_time_prekey, out consumed_opk_id, out consumed_kem_id);
                 if (rebuilt != null) {
                     state_to_commit = rebuilt;
                     responded_from_prekey = true;
