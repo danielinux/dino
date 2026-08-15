@@ -840,26 +840,42 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     }
 
     // Parse a group-sync payload into the announcement bytes and journal entries.
+    /* §5.6 parser requirements. These bounds match PQonversations' group-sync limits so the
+     * two clients accept the same frames. Every field here is attacker-controlled: the frame
+     * arrives over a pairwise session from any member, and any member may relay. */
+    private const int64 GS_MAX_TOTAL = 1024 * 1024;   /* 1 MiB per frame */
+    private const int64 GS_MAX_ENTRIES = 4096;        /* entries per frame */
+    private const int64 GS_MAX_ITEM = 256 * 1024;     /* per announcement/entry */
+
     private static bool parse_group_sync_bytes(uint8[] b, out uint8[] ann_bytes, out Gee.ArrayList<Bytes> entries) {
         ann_bytes = new uint8[0];
         entries = new Gee.ArrayList<Bytes>();
         if (b.length < 6) return false;
+        if ((int64) b.length > GS_MAX_TOTAL) return false;
         int off = 0;
         int ver = (b[0] << 8) | b[1]; off += 2;
         if (ver != 1) return false;
         int64 ann_len = gs_read_u32(b, off); off += 4;
+        if (ann_len < 0 || ann_len > GS_MAX_ITEM) return false;
         if ((int64) off + ann_len + 4 > (int64) b.length) return false;
         ann_bytes = new uint8[(int) ann_len];
         Memory.copy(ann_bytes, (uint8*) b + off, (int) ann_len); off += (int) ann_len;
         int64 n = gs_read_u32(b, off); off += 4;
+        if (n < 0 || n > GS_MAX_ENTRIES) return false;
         for (int64 i = 0; i < n; i++) {
             if ((int64) off + 4 > (int64) b.length) return false;
             int64 el = gs_read_u32(b, off); off += 4;
+            if (el < 0 || el > GS_MAX_ITEM) return false;
             if ((int64) off + el > (int64) b.length) return false;
             uint8[] eb = new uint8[(int) el];
             Memory.copy(eb, (uint8*) b + off, (int) el); off += (int) el;
             entries.add(new Bytes(eb));
         }
+        /* §5.6(4): reject trailing bytes. Not tidiness — §13.1a links entries by
+         * SHA-256(Marshal(entry)), so a tolerated pad produces an entry that verifies and
+         * folds but yields a different link hash than every honest peer computed,
+         * permanently forking this receiver's DAG. Any relay can do it, forging nothing. */
+        if (off != b.length) return false;
         return true;
     }
 
