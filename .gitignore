@@ -6,3 +6,4 @@ Makefile
 .idea
 .sqlite3
 gschemas.compiled
+SECURITY_REVIEW.md

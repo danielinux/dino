@@ -42,6 +42,270 @@ class MembershipDagTest : Gee.TestCase {
         add_test("group_heads_kat_vector", test_group_heads_kat);
         add_test("concurrent_late_entry_does_not_renumber_epoch", test_epoch_monotone);
         add_test("revoked_device_cannot_author_entries", test_revoked_device_cannot_author);
+        // D4.2
+        add_test("device_set_change_rotates_epoch", test_device_set_change_rotates_epoch);
+        add_test("device_set_change_replay_does_not_rotate", test_device_set_change_replay);
+        add_test("device_set_change_for_another_account_rejected", test_device_set_change_wrong_subject);
+        add_test("device_set_change_payload_roundtrip", test_device_set_change_payload);
+        // D5.1
+        add_test("late_concurrent_entry_changes_epoch_id", test_late_entry_changes_epoch_id);
+        // D6
+        add_test("forged_dc_for_unseen_device_id_rejected", test_forged_dc_unseen_device_rejected);
+        add_test("retired_but_formerly_authorized_device_still_folds", test_retired_device_still_folds);
+    }
+
+    // ---------------------------------------------------------------- D4.2 ---
+
+    private void test_device_set_change_payload() {
+        try {
+            Id a = make_id();
+            uint8[] p = JournalEntryV2.build_device_set_change_payload(a.fp, (uint64) 0x0102030405060708);
+            fail_if_not_eq_int(p.length, 28, "DeviceSetChange payload is aik_fp(20) | uint64");
+            uint8[] fp; uint64 ver;
+            fail_if_not(JournalEntryV2.parse_device_set_change_payload(p, out fp, out ver), "parse failed");
+            fail_if_not_eq_str(hex(fp), a.fp_hex, "aik_fp round-trip");
+            fail_if_not(ver == (uint64) 0x0102030405060708, "manifest_version round-trip");
+            fail_if(JournalEntryV2.parse_device_set_change_payload(new uint8[27], out fp, out ver),
+                "a short payload must not parse");
+        } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    /* D4.2: revoking a device from an account's Trust Manifest leaves the ACCOUNT a
+     * room member, so nothing rotates and the revoked device keeps every member's
+     * live sender chain key. A DeviceSetChange entry is what turns that into a room
+     * epoch rotation. A plain MEMBER (not an admin) must be able to author one — an
+     * account speaks for its own device set — which is the one action with a weaker
+     * authorization gate than the rest. */
+    private void test_device_set_change_rotates_epoch() {
+        try {
+            Id owner = make_id(); Id m1 = make_id();
+            var g = sign(owner, 0, heads(null), (uint8) MemberAuditActionV2.ADD_ADMIN, mp(owner.fp), 1000);
+            var add = sign(owner, 1, heads(g.compute_hash()), (uint8) MemberAuditActionV2.ADD_MEMBER, mp(m1.fp), 1001);
+
+            var dag = new MembershipDag();
+            dag.ingest(g.marshal());
+            dag.ingest(add.marshal());
+            uint32 before = dag.recompute(resolver()).epoch;
+            fail_if_not_eq_int((int) before, 1, "one rotation from the AddMember");
+
+            // m1 is a plain member, not an admin, and announces its own device set.
+            var dsc = sign(m1, 2, heads(add.compute_hash()),
+                (uint8) MemberAuditActionV2.DEVICE_SET_CHANGE,
+                JournalEntryV2.build_device_set_change_payload(m1.fp, 5), 1002);
+            dag.ingest(dsc.marshal());
+            DagState st = dag.recompute(resolver());
+            fail_if_not_eq_int((int) st.epoch, (int) before + 1,
+                "a DeviceSetChange from a current member must rotate the epoch");
+            fail_if_not(st.members.contains(m1.fp_hex), "membership itself is unchanged");
+        } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    /* D4.2 rule 3: a replayed entry is ACCEPTED (it still folds, and still counts
+     * towards fold_hash) but is NOT rotation-causing. Letting a replay bump the epoch
+     * would burn epoch numbers, and install-once (§13.4a.2) makes every burnt number
+     * permanently unusable for a real chain. */
+    private void test_device_set_change_replay() {
+        try {
+            Id owner = make_id(); Id m1 = make_id();
+            var g = sign(owner, 0, heads(null), (uint8) MemberAuditActionV2.ADD_ADMIN, mp(owner.fp), 1000);
+            var add = sign(owner, 1, heads(g.compute_hash()), (uint8) MemberAuditActionV2.ADD_MEMBER, mp(m1.fp), 1001);
+            var v5 = sign(m1, 2, heads(add.compute_hash()),
+                (uint8) MemberAuditActionV2.DEVICE_SET_CHANGE,
+                JournalEntryV2.build_device_set_change_payload(m1.fp, 5), 1002);
+            // A distinct entry (different lamport/timestamp ⇒ different hash) that
+            // re-announces the SAME manifest version, and one that goes backwards.
+            var v5_again = sign(m1, 3, heads(v5.compute_hash()),
+                (uint8) MemberAuditActionV2.DEVICE_SET_CHANGE,
+                JournalEntryV2.build_device_set_change_payload(m1.fp, 5), 1003);
+            var v4_stale = sign(m1, 4, heads(v5_again.compute_hash()),
+                (uint8) MemberAuditActionV2.DEVICE_SET_CHANGE,
+                JournalEntryV2.build_device_set_change_payload(m1.fp, 4), 1004);
+
+            var dag = new MembershipDag();
+            foreach (var e in new JournalEntryV2[]{g, add, v5}) dag.ingest(e.marshal());
+            uint32 after_first = dag.recompute(resolver()).epoch;
+
+            dag.ingest(v5_again.marshal());
+            fail_if_not_eq_int((int) dag.recompute(resolver()).epoch, (int) after_first,
+                "re-announcing the same manifest version must not rotate");
+            dag.ingest(v4_stale.marshal());
+            fail_if_not_eq_int((int) dag.recompute(resolver()).epoch, (int) after_first,
+                "announcing an OLDER manifest version must not rotate");
+
+            // A genuinely newer version still rotates.
+            var v6 = sign(m1, 5, heads(v4_stale.compute_hash()),
+                (uint8) MemberAuditActionV2.DEVICE_SET_CHANGE,
+                JournalEntryV2.build_device_set_change_payload(m1.fp, 6), 1005);
+            dag.ingest(v6.marshal());
+            fail_if_not_eq_int((int) dag.recompute(resolver()).epoch, (int) after_first + 1,
+                "a strictly newer manifest version must rotate");
+        } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    /* D4.2 rule 2: payload.aik_fp MUST equal signer_fp. Otherwise one member could
+     * force epoch churn in another member's name. */
+    private void test_device_set_change_wrong_subject() {
+        try {
+            Id owner = make_id(); Id m1 = make_id(); Id m2 = make_id();
+            var g = sign(owner, 0, heads(null), (uint8) MemberAuditActionV2.ADD_ADMIN, mp(owner.fp), 1000);
+            var a1 = sign(owner, 1, heads(g.compute_hash()), (uint8) MemberAuditActionV2.ADD_MEMBER, mp(m1.fp), 1001);
+            var a2 = sign(owner, 2, heads(a1.compute_hash()), (uint8) MemberAuditActionV2.ADD_MEMBER, mp(m2.fp), 1002);
+
+            var dag = new MembershipDag();
+            foreach (var e in new JournalEntryV2[]{g, a1, a2}) dag.ingest(e.marshal());
+            uint32 before = dag.recompute(resolver()).epoch;
+
+            // m1 claims m2's device set changed.
+            var bad = sign(m1, 3, heads(a2.compute_hash()),
+                (uint8) MemberAuditActionV2.DEVICE_SET_CHANGE,
+                JournalEntryV2.build_device_set_change_payload(m2.fp, 9), 1003);
+            dag.ingest(bad.marshal());
+            fail_if_not_eq_int((int) dag.recompute(resolver()).epoch, (int) before,
+                "an account may only speak for its OWN device set");
+
+            // A non-member cannot author one either.
+            Id outsider = make_id();
+            var by_outsider = sign(outsider, 4, heads(a2.compute_hash()),
+                (uint8) MemberAuditActionV2.DEVICE_SET_CHANGE,
+                JournalEntryV2.build_device_set_change_payload(outsider.fp, 1), 1004);
+            dag.ingest(by_outsider.marshal());
+            fail_if_not_eq_int((int) dag.recompute(resolver()).epoch, (int) before,
+                "a non-member's DeviceSetChange must not rotate");
+        } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    // ---------------------------------------------------------------- D5.1 ---
+
+    /* D5: two folds differing only by a late CONCURRENT entry must yield different
+     * epoch_ids. That is the whole recovery path for a contradicted epoch: canonical
+     * order has unstable prefixes, so a late entry can reverse whether an EARLIER
+     * entry was authorized while leaving the numeric epoch untouched — and reusing an
+     * epoch number for a new chain is forbidden by install-once, so without a
+     * fold-derived discriminator there is no way to retire the contradicted chain. */
+    private void test_late_entry_changes_epoch_id() {
+        try {
+            Id owner = make_id(); Id m1 = make_id(); Id m2 = make_id();
+            string room = "room@conference.example.org";
+            var g = sign(owner, 0, heads(null), (uint8) MemberAuditActionV2.ADD_ADMIN, mp(owner.fp), 1000);
+            var a = sign(owner, 1, heads(g.compute_hash()), (uint8) MemberAuditActionV2.ADD_MEMBER, mp(m1.fp), 1001);
+            var b = sign(owner, 1, heads(g.compute_hash()), (uint8) MemberAuditActionV2.ADD_MEMBER, mp(m2.fp), 1002);
+
+            var partial = new MembershipDag();
+            partial.ingest(g.marshal());
+            partial.ingest(b.marshal());
+            DagState s1 = partial.recompute(resolver());
+            uint64 id1 = s1.epoch_id(room);
+
+            partial.ingest(a.marshal());
+            DagState s2 = partial.recompute(resolver());
+            uint64 id2 = s2.epoch_id(room);
+
+            fail_if(id1 == id2, "a late concurrent entry must change epoch_id");
+            fail_if(hex(s1.fold_hash) == hex(s2.fold_hash), "fold_hash must change with the accepted set");
+
+            // epoch_id is a function of the fold, not of arrival order.
+            var other = new MembershipDag();
+            other.ingest(a.marshal());
+            other.ingest(g.marshal());
+            other.ingest(b.marshal());
+            fail_if(other.recompute(resolver()).epoch_id(room) != id2,
+                "epoch_id must converge regardless of ingest order");
+
+            // ...and of the room, so the same fold in two rooms cannot collide.
+            fail_if(s2.epoch_id("other@conference.example.org") == id2,
+                "epoch_id must be bound to the room JID");
+        } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    // ------------------------------------------------------------------ D6 ---
+
+    /* D6 — THE forged-issuer test. §11.8 replicates AIK_priv to every authorized
+     * device, so a device revoked as id 7 can mint a fresh DIK, pick a device id
+     * NOBODY HAS EVER SEEN, and self-sign a completely valid DC under the stolen
+     * account root. The tombstone on 7 does not cover the new id, so "is it
+     * revoked?" was never a sufficient issuer check. "Has this id ever appeared in a
+     * Trust Manifest fold I accepted?" is, because the new id never did. */
+    private void test_forged_dc_unseen_device_rejected() {
+        try {
+            Id owner = make_id(); Id victim = make_id();
+            var g = sign(owner, 0, heads(null), (uint8) MemberAuditActionV2.ADD_ADMIN, mp(owner.fp), 1000);
+
+            // Device 43: never in any manifest, but its DC is signed by the real AIK.
+            Bytes f_ed_pub, f_ed_priv, f_ml_pub, f_ml_priv;
+            Crypto.generate_ed25519(out f_ed_pub, out f_ed_priv);
+            Crypto.generate_mldsa65(out f_ml_pub, out f_ml_priv);
+            uint8[] forged_dc = issue_dc(43, f_ed_pub, f_ml_pub, owner.ed_priv, owner.ml_priv);
+            var by_forged = sign_as_device(owner, 43, forged_dc, f_ed_priv, f_ml_priv,
+                1, heads(g.compute_hash()), (uint8) MemberAuditActionV2.ADD_MEMBER, mp(victim.fp), 1001);
+
+            fail_if_not(by_forged.verify(owner.ed_pub, owner.ml_pub),
+                "the forged issuer's entry is cryptographically valid on its own terms");
+
+            var dag = new MembershipDag();
+            dag.ingest(g.marshal());
+            dag.ingest(by_forged.marshal());
+
+            // Ever-authorized set for this account = {1} (the genesis device only).
+            DagState st = dag.recompute_authorized(resolver(), null, null, ever_authorized({ 1 }));
+            fail_if(st.members.contains(victim.fp_hex),
+                "an entry from a device id that never appeared in an accepted manifest must be rejected");
+            // The genesis entry itself, authored by device 1, still folds.
+            fail_if_not_eq_str(st.owner_fp, owner.fp_hex, "the genesis (device 1) still folds");
+
+            // Tombstoning does not help against an id nobody has ever seen — which is
+            // exactly why the ever-authorized set is the check that matters.
+            DagState tomb = dag.recompute_checked(resolver(), null,
+                (fp_hex, dev) => fp_hex.down() == owner.fp_hex.down() && dev == 7);
+            fail_if_not(tomb.members.contains(victim.fp_hex),
+                "control: a tombstone on the OLD id does not cover the forged one");
+        } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    /* D6 uses EVER-authorized, not currently-authorized, on purpose: a journal entry
+     * is a historical record. Requiring current membership would retroactively erase
+     * the room history authored by devices that have since been legitimately retired. */
+    private void test_retired_device_still_folds() {
+        try {
+            Id owner = make_id(); Id newcomer = make_id();
+            var g = sign(owner, 0, heads(null), (uint8) MemberAuditActionV2.ADD_ADMIN, mp(owner.fp), 1000);
+
+            // Device 7 was a real device of this account and did appear in a manifest
+            // we accepted; it has since been retired (absent from the CURRENT fold).
+            Bytes r_ed_pub, r_ed_priv, r_ml_pub, r_ml_priv;
+            Crypto.generate_ed25519(out r_ed_pub, out r_ed_priv);
+            Crypto.generate_mldsa65(out r_ml_pub, out r_ml_priv);
+            uint8[] retired_dc = issue_dc(7, r_ed_pub, r_ml_pub, owner.ed_priv, owner.ml_priv);
+            var by_retired = sign_as_device(owner, 7, retired_dc, r_ed_priv, r_ml_priv,
+                1, heads(g.compute_hash()), (uint8) MemberAuditActionV2.ADD_MEMBER, mp(newcomer.fp), 1001);
+
+            var dag = new MembershipDag();
+            dag.ingest(g.marshal());
+            dag.ingest(by_retired.marshal());
+
+            DagState st = dag.recompute_authorized(resolver(), null, null, ever_authorized({ 1, 7 }));
+            fail_if_not(st.members.contains(newcomer.fp_hex),
+                "history authored by a formerly-authorized device must still fold");
+
+            // Quarantine: no manifest held for that account at all ⇒ UNRESOLVED, so
+            // the entry is neither folded nor discarded; it stays in the store and is
+            // re-evaluated once the manifest arrives.
+            DagState unresolved = dag.recompute_authorized(resolver(), null, null,
+                (fp_hex, dev) => IssuerAuthStatus.UNRESOLVED);
+            fail_if(unresolved.members.contains(newcomer.fp_hex),
+                "an unresolvable issuer must not fold (quarantine, not fail-open)");
+            fail_if_not_eq_int(dag.size, 2, "quarantined entries stay in the store");
+            fail_if_not(dag.recompute_authorized(resolver(), null, null, ever_authorized({ 1, 7 }))
+                    .members.contains(newcomer.fp_hex),
+                "a quarantined entry folds once authorization becomes resolvable");
+        } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    // An issuer checker backed by a fixed ever-authorized device-id set.
+    private DeviceIssuerChecker ever_authorized(uint32[] ids) {
+        var set = new Gee.HashSet<uint32>();
+        foreach (uint32 i in ids) set.add(i);
+        return (fp_hex, dev) => set.contains(dev)
+            ? IssuerAuthStatus.AUTHORIZED : IssuerAuthStatus.REJECTED;
     }
 
     // §13.1b anti-withholding KAT — the <heads> wire vector. MUST stay

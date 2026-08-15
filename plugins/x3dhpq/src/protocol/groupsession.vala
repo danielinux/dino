@@ -37,10 +37,30 @@ public errordomain GroupSessionError {
     ANNOUNCEMENT_WRONG_ROOM,
     ANNOUNCEMENT_UNKNOWN_SENDER,
     STALE_EPOCH,
+    /* D5.3: a message tagged with an epoch_id other than the one the selected recv
+     * chain was installed under. Decrypting it anyway would silently accept a
+     * message produced under a DIFFERENT fold of the membership DAG. */
+    EPOCH_ID_MISMATCH,
+    /* D4.1: the sending (account, device) is not currently in the receiver's
+     * accepted Trust Manifest fold. */
+    UNAUTHORIZED_DEVICE,
 }
 
-private string recv_key(string aik_fp, uint32 device_id, uint32 epoch) {
-    return @"$aik_fp:$device_id:$epoch";
+// D5.3: recv chains are keyed by the 4-TUPLE (aik_fp, device_id, epoch, epoch_id).
+//
+// Install-once (§13.4a.2) applies to this tuple, not to the numeric epoch alone.
+// That is what gives a contradicted epoch a recovery path: a re-fold that reverses
+// an earlier authorization can leave the numeric epoch unchanged, and reusing an
+// epoch number for a new chain is forbidden — so without the epoch_id in the key,
+// the replacement chain is discarded as a duplicate and the room is stuck.
+private string recv_key(string aik_fp, uint32 device_id, uint32 epoch, uint64 epoch_id) {
+    return @"$aik_fp:$device_id:$epoch:$epoch_id";
+}
+
+// Prefix identifying every chain for a (sender, device) pair regardless of epoch —
+// used by D4.1 to drop all of a revoked device's chains at once.
+private string recv_key_device_prefix(string aik_fp, uint32 device_id) {
+    return @"$aik_fp:$device_id:";
 }
 
 public class GroupSession : Object {
@@ -48,6 +68,10 @@ public class GroupSession : Object {
     public uint8[] my_aik_pub_bytes { get; set; }
     public uint32 my_device_id { get; set; }
     public uint32 epoch { get; set; default = 0; }
+    /* D5.1/D5.3: identity of the fold this session's epoch was derived from.
+     * Zero for a room still driven by the linear v1 journal, which has no DAG and
+     * therefore no fold to bind to. */
+    public uint64 epoch_id { get; set; default = 0; }
 
     // aik_fp -> GroupMember
     private HashMap<string, GroupMember> members = new HashMap<string, GroupMember>();
@@ -80,7 +104,8 @@ public class GroupSession : Object {
         gs.my_aik_pub_bytes = my_aik_pub_bytes.copy();
         gs.my_device_id = my_device_id;
         gs.epoch = 0;
-        gs.send_chain = SenderChain.new_random(0);
+        gs.epoch_id = 0;
+        gs.send_chain = SenderChain.new_random(0, 0);
         /* §13.3a: every epoch gets its own sender signing key, so a compromised device
          * cannot retroactively sign for an epoch it has left. */
         Bytes sig_pub0;
@@ -128,9 +153,54 @@ public class GroupSession : Object {
         removed_aiks[fp] = epoch;
     }
 
+    // D4.1: drop every recv chain held for one DEVICE of one account, across all
+    // epochs, in this room.
+    //
+    // Group membership lives at ACCOUNT-AIK level while sender chains go to
+    // individual DEVICES, so revoking a device from its account's manifest does not
+    // change room membership and no epoch rotation fires. The revoked device
+    // nevertheless still holds every other member's current sender chain key and can
+    // derive their future message keys indefinitely. Rejecting its messages is not
+    // enough on its own — what actually matters is deleting the chain state we
+    // already installed for it, so a device revoked MID-EPOCH stops being served by
+    // material we hold. Returns the number of chains dropped.
+    public int drop_recv_chains_for_device(string aik_fp, uint32 device_id) {
+        string prefix = recv_key_device_prefix(aik_fp, device_id);
+        var to_remove = new ArrayList<string>();
+        foreach (string k in recv_chains.keys) {
+            if (k.has_prefix(prefix)) to_remove.add(k);
+        }
+        foreach (string k in to_remove) recv_chains.unset(k);
+        return to_remove.size;
+    }
+
+    // D5.3: adopt the (epoch, epoch_id) the current fold produces.
+    //
+    // A sender MUST rotate its sender chain whenever a re-fold changes epoch_id for
+    // the room, INCLUDING when the numeric epoch is unchanged — that case is exactly
+    // the contradiction-recovery one: a late concurrent entry reorders ahead and
+    // reverses an earlier authorization without changing the count of authorized
+    // rotations. Rotating gives a fresh chain key and a fresh per-epoch signing key
+    // that the contradicted fold's members were never handed.
+    //
+    // Returns true iff the session rotated (so the caller can persist + re-announce).
+    public bool apply_fold_epoch(uint32 new_epoch, uint64 new_epoch_id) throws GLib.Error {
+        if (send_chain != null && epoch == new_epoch && epoch_id == new_epoch_id) {
+            return false;
+        }
+        epoch = new_epoch;
+        epoch_id = new_epoch_id;
+        rotate_chain_for_current_epoch();
+        return true;
+    }
+
     private void rotate_epoch() throws GLib.Error {
         epoch++;
-        send_chain = SenderChain.new_random(epoch);
+        rotate_chain_for_current_epoch();
+    }
+
+    private void rotate_chain_for_current_epoch() throws GLib.Error {
+        send_chain = SenderChain.new_random(epoch, epoch_id);
         /* §13.3a: a new epoch means a new signing key, so authority to sign as us in this
          * room never outlives the epoch it was issued for. */
         Bytes rot_sig_pub;
@@ -179,6 +249,7 @@ public class GroupSession : Object {
         ann.sender_device_id = my_device_id;
         ann.room_jid = room_jid;
         ann.epoch = epoch;
+        ann.epoch_id = epoch_id;   // D5.2/D5.3
         if (send_ckpt_key.length == 32) {
             ann.chain_key = send_ckpt_key.copy();
             ann.next_index = send_ckpt_index;
@@ -206,7 +277,7 @@ public class GroupSession : Object {
         if (!members.has_key(fp)) {
             throw new GroupSessionError.ANNOUNCEMENT_UNKNOWN_SENDER(@"sender AIK $fp not a current member");
         }
-        SenderChain? sc = SenderChain.restore(ann.epoch, ann.chain_key, ann.next_index);
+        SenderChain? sc = SenderChain.restore(ann.epoch, ann.chain_key, ann.next_index, ann.epoch_id);
         if (sc != null) {
             /* §13.3a: the verification key for everything this sender emits in this epoch. */
             ((!) sc).sig_pub = ann.sig_pub.copy();
@@ -214,13 +285,17 @@ public class GroupSession : Object {
         if (sc == null) {
             throw new IOError.FAILED("senderchain restore failed");
         }
-        string rk = recv_key(fp, ann.sender_device_id, ann.epoch);
+        string rk = recv_key(fp, ann.sender_device_id, ann.epoch, ann.epoch_id);
         // Install ONCE per (sender, device, epoch). Announcements now carry a
         // forward-MOVING checkpoint; overwriting a recv chain we already ratcheted
         // forward with a LATER checkpoint would skip us past (and permanently lose)
         // messages between our position and the new checkpoint. A member that
         // already holds a chain for this epoch simply ratchets it forward / catches
         // up via MAM instead of re-installing.
+        //
+        // D5.3: "this epoch" now means the 4-tuple INCLUDING epoch_id, so a chain
+        // produced under a different (contradicting) fold installs cleanly instead
+        // of being swallowed here as a duplicate of the epoch it replaces.
         if (!recv_chains.has_key(rk)) {
             recv_chains[rk] = sc;
         }
@@ -239,7 +314,7 @@ public class GroupSession : Object {
     // MUST pass exactly the bytes it puts on the wire.
     public void encrypt_with_heads(uint8[] plaintext, uint8[]? heads_payload, out GroupMessageHeader header_out, out uint8[] ciphertext_out, out uint8[] sig_out) throws GLib.Error {
         if (send_chain == null) {
-            send_chain = SenderChain.new_random(epoch);
+            send_chain = SenderChain.new_random(epoch, epoch_id);
             /* §13.3a: a lazily created send chain still needs a signing key, or we would
              * emit unsigned (and therefore unattributable) group messages. */
             Bytes lazy_sig_pub;
@@ -255,10 +330,11 @@ public class GroupSession : Object {
         }
 
         GroupMessageHeader hdr = new GroupMessageHeader();
-        hdr.version = 1;
+        hdr.version = 2;                 // D5.2
         hdr.epoch = epoch;
         hdr.sender_device_id = my_device_id;
         hdr.chain_index = idx;
+        hdr.epoch_id = epoch_id;         // D5.2
 
         uint8[] aad_bytes = hdr.aad_with_heads(room_jid, heads_payload);
         uint8[] nonce_bytes = hdr.aead_nonce();
@@ -310,9 +386,22 @@ public class GroupSession : Object {
         if (hdr.epoch < epoch) {
             throw new GroupSessionError.STALE_EPOCH("header epoch behind session epoch");
         }
-        string rk = recv_key(sender_aik_fp, hdr.sender_device_id, hdr.epoch);
+        string rk = recv_key(sender_aik_fp, hdr.sender_device_id, hdr.epoch, hdr.epoch_id);
         SenderChain? sc = recv_chains[rk];
         if (sc == null) {
+            /* D5.3: distinguish "we hold no chain for this sender/epoch at all"
+             * (wait for the announcement) from "we hold a chain for this sender at
+             * this numeric epoch but under a DIFFERENT fold". The second case must
+             * be rejected outright, not decrypted under the chain we happen to have
+             * — that would silently accept a message produced under a fold this
+             * receiver never accepted. */
+            string epoch_prefix = @"$sender_aik_fp:$(hdr.sender_device_id):$(hdr.epoch):";
+            foreach (string k in recv_chains.keys) {
+                if (k.has_prefix(epoch_prefix)) {
+                    throw new GroupSessionError.EPOCH_ID_MISMATCH(
+                        @"epoch_id $(hdr.epoch_id) does not match the installed chain for epoch $(hdr.epoch)");
+                }
+            }
             throw new GroupSessionError.UNKNOWN_SENDER(@"no recv chain for $rk");
         }
         // §13.7: derive the key WITHOUT mutating the chain, authenticate, and only then
@@ -391,7 +480,7 @@ public class GroupSession : Object {
     // Serialise to a key=value string for DB storage (sender_state column).
     public string serialize_send_state() {
         if (send_chain == null) return "";
-        return @"epoch=$(epoch)\nsend_chain=$(Base64.encode(send_chain.marshal()))\nckpt_index=$(send_ckpt_index)\nckpt_time=$(send_ckpt_time)\nckpt_key=$(Base64.encode(send_ckpt_key))\n";
+        return @"epoch=$(epoch)\nepoch_id=$(epoch_id)\nsend_chain=$(Base64.encode(send_chain.marshal()))\nckpt_index=$(send_ckpt_index)\nckpt_time=$(send_ckpt_time)\nckpt_key=$(Base64.encode(send_ckpt_key))\n";
     }
 
     // Serialise member / removed-aik maps as JSON-like text for the member_state column.
@@ -447,12 +536,15 @@ public class GroupSession : Object {
 
         // Parse send_state.
         uint32 parsed_epoch = 0;
+        uint64 parsed_epoch_id = 0;
         string? send_chain_b64 = null;
         string? ckpt_key_b64 = null;
         uint32 ckpt_index = 0;
         int64 ckpt_time = 0;
         foreach (string line in send_state.split("\n")) {
-            if (line.has_prefix("epoch=")) {
+            if (line.has_prefix("epoch_id=")) {
+                parsed_epoch_id = uint64.parse(line.substring(9));
+            } else if (line.has_prefix("epoch=")) {
                 parsed_epoch = (uint32) int.parse(line.substring(6));
             } else if (line.has_prefix("send_chain=")) {
                 send_chain_b64 = line.substring(11);
@@ -465,6 +557,7 @@ public class GroupSession : Object {
             }
         }
         gs.epoch = parsed_epoch;
+        gs.epoch_id = parsed_epoch_id;
         if (send_chain_b64 != null && send_chain_b64 != "") {
             uint8[] sc_bytes = Base64.decode(send_chain_b64);
             gs.send_chain = SenderChain.unmarshal(sc_bytes);

@@ -259,8 +259,14 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     private Protocol.DagState recompute_dag_pinned(Account account, string room_jid_str,
                                                    Protocol.MembershipDag dag) {
         string? pin = db.get_pinned_room_owner(account, room_jid_str);
-        Protocol.DagState st = dag.recompute_checked(
-            make_aik_resolver(account), pin, make_revocation_checker(account));
+        Protocol.DagState st = dag.recompute_authorized(
+            make_aik_resolver(account), pin, make_revocation_checker(account),
+            make_issuer_checker(account));
+        // D6 failure policy: entries whose issuer could not be resolved are
+        // QUARANTINED (kept in the store, not folded). Fetch the author's manifest
+        // so the next fold can decide; without this they would stay quarantined
+        // forever and legitimate room history would never appear.
+        flush_pending_manifest_fetches(account);
         if (pin == null && st.owner_fp != null) {
             db.pin_room_owner(account, room_jid_str, ((!) st.owner_fp).down());
         } else if (pin != null && st.owner_fp == null) {
@@ -313,6 +319,21 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             } catch (GLib.Error e) {
                 warning("rebuild dag: remove member failed in %s: %s", room_jid_str, e.message);
             }
+        }
+
+        /* D5.3: the FOLD is authoritative for both the epoch and its identity. A
+         * re-fold that changes epoch_id — including one that leaves the numeric
+         * epoch untouched, which is exactly the contradicted-epoch case — forces a
+         * sender-chain rotation here: fresh chain key, fresh per-epoch signing key,
+         * checkpoint back to index 0. Without it a contradicted epoch is stuck,
+         * because install-once forbids reusing the number for a different chain. */
+        try {
+            if (gs.apply_fold_epoch(st.epoch, st.epoch_id(room_jid_str))) {
+                debug("x3dhpq: %s rotated to epoch %u (epoch_id %s) after re-fold",
+                    room_jid_str, st.epoch, gs.epoch_id.to_string());
+            }
+        } catch (GLib.Error e) {
+            warning("rebuild dag: epoch rotation failed in %s: %s", room_jid_str, e.message);
         }
     }
 
@@ -430,6 +451,83 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                 return false;
             }
         };
+    }
+
+    /* D6 (§13.1a.0 step 5): the issuing device must be in this receiver's durable
+     * EVER-AUTHORIZED set for the author's account, and must not be tombstoned.
+     *
+     * The entry's certificate chain proves the ACCOUNT certified the device, and
+     * §11.8 replicates AIK_priv to every authorized device — so a device revoked as
+     * id 42 can mint a fresh DIK, pick an id that has never been seen, and self-sign
+     * a valid DC under the stolen account root. The tombstone on 42 does not cover
+     * the new id. Requiring the id to have appeared in a manifest THIS install
+     * accepted is what defeats it.
+     *
+     * EVER- rather than CURRENTLY-authorized is deliberate (unlike D4.1, which
+     * governs live traffic): a journal entry is a historical record, and demanding
+     * current membership would retroactively erase history authored by devices since
+     * legitimately retired. */
+    private Gee.HashSet<string> pending_manifest_fetch = new Gee.HashSet<string>();
+    private Gee.HashSet<string> manifest_fetch_in_flight = new Gee.HashSet<string>();
+
+    private Protocol.DeviceIssuerChecker make_issuer_checker(Account account) {
+        return (signer_fp_hex, device_id) => {
+            string? owner_jid = owner_jid_for_hex_fp(account, signer_fp_hex);
+            if (owner_jid == null) {
+                // We cannot even name the account, so we certainly hold no manifest
+                // for it: quarantine rather than fail either way.
+                return Protocol.IssuerAuthStatus.UNRESOLVED;
+            }
+            string owner = (!) owner_jid;
+            if (!db.has_ever_authorized_devices(account, owner)) {
+                pending_manifest_fetch.add(owner);
+                return Protocol.IssuerAuthStatus.UNRESOLVED;
+            }
+            bool tombstoned = owner == account.bare_jid.to_string()
+                ? db.is_device_revoked(account, (int) device_id)
+                : db.get_manifest_revoked_devices(account, owner).contains(device_id);
+            if (tombstoned) return Protocol.IssuerAuthStatus.REJECTED;
+            return db.is_ever_authorized_device(account, owner, (int) device_id)
+                ? Protocol.IssuerAuthStatus.AUTHORIZED
+                : Protocol.IssuerAuthStatus.REJECTED;
+        };
+    }
+
+    // Resolve a 40-char raw-hex AIK fingerprint to the owning bare JID (self first,
+    // then the peer identity table / bundle fallback).
+    private string? owner_jid_for_hex_fp(Account account, string fp_hex) {
+        uint8[] fp_raw = hex_to_raw20(fp_hex);
+        if (fp_raw.length != 20) return null;
+        uint8[] my_ed, my_ml, my_canon, my_fp;
+        if (local_aik(account, out my_ed, out my_ml, out my_canon, out my_fp)) {
+            bool is_self = true;
+            for (int i = 0; i < 20; i++) if (my_fp[i] != fp_raw[i]) { is_self = false; break; }
+            if (is_self) return account.bare_jid.to_string();
+        }
+        return db.find_peer_jid_by_aik_fp(account, fp_raw);
+    }
+
+    private void flush_pending_manifest_fetches(Account account) {
+        if (pending_manifest_fetch.size == 0) return;
+        var todo = new Gee.ArrayList<string>();
+        todo.add_all(pending_manifest_fetch);
+        pending_manifest_fetch.clear();
+        XmppStream? stream = app.stream_interactor.get_stream(account);
+        StreamModule? module = app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
+        if (stream == null || module == null) return;
+        foreach (string bare in todo) {
+            string key = "%d/%s".printf(account.id, bare);
+            if (!manifest_fetch_in_flight.add(key)) continue;
+            try {
+                Jid j = new Jid(bare);
+                module.fetch_and_apply_peer_manifest.begin((!) stream, j, (obj, res) => {
+                    module.fetch_and_apply_peer_manifest.end(res);
+                    manifest_fetch_in_flight.remove(key);
+                });
+            } catch (Xmpp.InvalidJidError e) {
+                manifest_fetch_in_flight.remove(key);
+            }
+        }
     }
 
     private static uint8[] hex_to_raw20(string hex_in) {
@@ -660,6 +758,42 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         module.membership_entry_received.connect((room_jid, item_id, b64_payload) => {
             on_membership_entry_received(account, room_jid, item_id, b64_payload);
         });
+        // D4.2: our own device set changed → rotate the epoch of every room we are in.
+        module.own_device_set_changed.connect((manifest_version) => {
+            broadcast_device_set_change(account, manifest_version);
+        });
+    }
+
+    /* D4.2: emit a DeviceSetChange (action 11) into every room this account is a
+     * member of, carrying the new Trust Manifest version.
+     *
+     * Without it, revoking a device from the account manifest leaves the ACCOUNT a
+     * room member, so nothing rotates — while the revoked device still holds every
+     * other member's current sender chain key and its own per-epoch signing key, and
+     * can derive their future message keys indefinitely. The rotation this triggers
+     * mints a fresh chain key and per-epoch signing keypair distributed only to
+     * currently authorized devices, which is what actually severs it.
+     */
+    private void broadcast_device_set_change(Account account, uint64 manifest_version) {
+        uint8[] my_ed, my_ml, my_canon, my_fp;
+        if (!local_aik(account, out my_ed, out my_ml, out my_canon, out my_fp)) return;
+        string my_fp_hex = Protocol.hex_of(my_fp);
+        uint8[] payload = Protocol.JournalEntryV2.build_device_set_change_payload(my_fp, manifest_version);
+        foreach (string room in db.list_membership_dag_rooms(account)) {
+            if (!is_v2_active(account, room)) continue;
+            Protocol.MembershipDag? dag = get_dag(account, room);
+            if (dag == null) continue;
+            Protocol.DagState st = recompute_dag_pinned(account, room, (!) dag);
+            // Rule 1: only a current member may author one.
+            if (!st.members.contains(my_fp_hex)) continue;
+            try {
+                Jid rj = new Jid(room);
+                emit_v2.begin(account, rj,
+                    (uint8) Protocol.MemberAuditActionV2.DEVICE_SET_CHANGE, payload, null);
+            } catch (Xmpp.InvalidJidError e) {
+                warning("x3dhpq: cannot emit DeviceSetChange for %s: %s", room, e.message);
+            }
+        }
     }
 
     // Verify and persist a membership-journal entry received via PEP. The
@@ -1701,6 +1835,82 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         return true;
     }
 
+    // ── D3.4: bounded pairwise deferral queue ─────────────────────────────────
+    //
+    // A message that overtook a checkpoint-bearing one cannot be processed yet: what
+    // is missing is a STATE TRANSITION, not a chain step, so the skipped-key cache
+    // cannot serve it. It is held here — per session, FIFO, oldest evicted first —
+    // and re-run through the receive pipeline immediately after any successful
+    // checkpoint application or DH ratchet on that session.
+    //
+    // Deferral is never surfaced as a decryption failure: the pipeline is aborted so
+    // the stanza is neither stored with its cleartext fallback body nor deduped away
+    // before the retry, and the session is deliberately left alone (renegotiating
+    // would destroy a perfectly healthy session over a mere reordering).
+    private class DeferredPairwiseMessage {
+        public Entities.Message message;
+        public Xmpp.MessageStanza stanza;
+        public Conversation conversation;
+        public string dedup_key;
+        public DeferredPairwiseMessage(Entities.Message m, Xmpp.MessageStanza s, Conversation c, string k) {
+            message = m; stanza = s; conversation = c; dedup_key = k;
+        }
+    }
+    private HashMap<string, Gee.ArrayList<DeferredPairwiseMessage>> deferred_pairwise_msgs =
+        new HashMap<string, Gee.ArrayList<DeferredPairwiseMessage>>();
+    // D3.4 cap: 64 messages per session.
+    private const int MAX_DEFERRED_PAIRWISE_MSGS = 64;
+
+    private static string pairwise_session_key(Account account, string sender_jid, int device_id) {
+        return "%d/%s/%d".printf(account.id, sender_jid, device_id);
+    }
+
+    private void queue_deferred_pairwise_message(Conversation conversation, Entities.Message message,
+            Xmpp.MessageStanza stanza, string sender_jid, int device_id) {
+        string key = pairwise_session_key(conversation.account, sender_jid, device_id);
+        string dedup = message.server_id ?? (message.stanza_id ?? "");
+        Gee.ArrayList<DeferredPairwiseMessage>? q = deferred_pairwise_msgs.has_key(key)
+            ? deferred_pairwise_msgs.get(key) : null;
+        if (q == null) {
+            q = new Gee.ArrayList<DeferredPairwiseMessage>();
+            deferred_pairwise_msgs.set(key, q);
+        }
+        if (dedup != "") {
+            foreach (DeferredPairwiseMessage p in q) {
+                if (p.dedup_key == dedup) return;
+            }
+        }
+        if (q.size >= MAX_DEFERRED_PAIRWISE_MSGS) {
+            q.remove_at(0);   // oldest evicted first
+        }
+        q.add(new DeferredPairwiseMessage(message, stanza, conversation, dedup));
+    }
+
+    // Re-run every deferred message for one session. Entries that still cannot be
+    // processed are simply re-queued by the normal path and wait for the next
+    // transition (or eviction). Deferred to an idle callback so the message that
+    // caused the transition has already stored its session state.
+    private void schedule_pairwise_drain(Account account, string sender_jid, int device_id) {
+        string key = pairwise_session_key(account, sender_jid, device_id);
+        if (!deferred_pairwise_msgs.has_key(key)) return;
+        Idle.add(() => {
+            drain_deferred_pairwise_messages(key);
+            return false;
+        });
+    }
+
+    private void drain_deferred_pairwise_messages(string key) {
+        if (!deferred_pairwise_msgs.has_key(key)) return;
+        Gee.ArrayList<DeferredPairwiseMessage> q = deferred_pairwise_msgs.get(key);
+        deferred_pairwise_msgs.unset(key);
+        if (q.size == 0) return;
+        MessageProcessor? mp = app.stream_interactor.get_module(MessageProcessor.IDENTITY);
+        if (mp == null) return;
+        foreach (DeferredPairwiseMessage p in q) {
+            mp.received_pipeline.run.begin(p.message, p.stanza, p.conversation);
+        }
+    }
+
     private bool decrypt_message(Entities.Message message, Xmpp.MessageStanza stanza, Conversation conversation) {
         // Check for group envelope first.
         StanzaNode? group_env = stanza.stanza.get_subnode("x3dhpq-group", Protocol.NS_ENVELOPE);
@@ -1811,7 +2021,16 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             if (header == null) {
                 return false;
             }
-            Bytes transport_key = Protocol.decrypt_transport_key((!) state_to_commit, header, bytes_from_base64(emk_node.get_string_content()));
+            bool applied_transition;
+            Bytes transport_key = Protocol.decrypt_transport_key_ex((!) state_to_commit, header,
+                bytes_from_base64(emk_node.get_string_content()), out applied_transition);
+            // D3.4: a checkpoint or DH ratchet just landed, so anything deferred on
+            // this session may now be processable. Draining is scheduled AFTER this
+            // message finishes and its session is stored, otherwise the drained
+            // messages would run against the pre-commit state.
+            if (applied_transition) {
+                schedule_pairwise_drain(conversation.account, sender_jid_value, sender_device_id);
+            }
 
             // Check for a sender-chain typed payload in place of a chat message payload.
             StanzaNode? typed_payload = envelope.get_subnode("payload", Protocol.NS_ENVELOPE);
@@ -1916,6 +2135,14 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             // Decrypted → continue the pipeline so it is stored (return value is
             // now "abort pipeline?", see DecryptMessageListener).
             return false;
+        } catch (Protocol.PairwiseSessionError.CHECKPOINT_DEFERRED e) {
+            /* D3.3/D3.4: this message overtook a checkpoint-bearing one. It is NOT a
+             * decryption failure — the ratchet state was left untouched (D3.5), the
+             * session must NOT be renegotiated, and nothing may be reported to the
+             * user. Queue it and re-run it once the missing transition arrives. */
+            debug("x3dhpq: deferring message from %s/%d — %s", sender_jid_value, sender_device_id, e.message);
+            queue_deferred_pairwise_message(conversation, message, stanza, sender_jid_value, sender_device_id);
+            return true;
         } catch (Error e) {
             // First failure with a cached session but a fresh prekey present:
             // the peer re-initiated (reset/forget). Rebuild as responder from the
@@ -2023,9 +2250,121 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         return true;
     }
 
+    /* D4.1: is (account AIK fingerprint, device_id) CURRENTLY present in the Trust
+     * Manifest fold this receiver has accepted for that account?
+     *
+     * Group membership is at ACCOUNT level while sender chains go to DEVICES, so a
+     * device revoked from its account's manifest leaves the account a room member,
+     * nothing rotates, and the revoked device keeps every other member's current
+     * sender chain key — able to derive their future message keys indefinitely.
+     *
+     * Deliberately stricter than the ever-authorized rule D6 applies to journal
+     * issuers: this is LIVE traffic, not a historical record, so an unavailable
+     * manifest is treated as NOT authorized and the manifest is fetched. Failing
+     * open here would leave the revoked device fully served.
+     */
+    private bool group_sender_currently_authorized(Account account, string sender_display_fp, uint32 device_id) {
+        string? owner = owner_jid_for_display_fp(account, sender_display_fp);
+        if (owner == null) {
+            return false;
+        }
+        string owner_jid = (!) owner;
+        string? blob = db.get_trust_manifest_payload(account, owner_jid);
+        if (blob == null || blob == "") {
+            // No manifest held: reject and fetch. Not fail-open (see above).
+            pending_manifest_fetch.add(owner_jid);
+            flush_pending_manifest_fetches(account);
+            return false;
+        }
+        // Folding verifies a hybrid (Ed25519 + ML-DSA-65) signature per entry, and
+        // this runs on EVERY group message — a MAM catch-up burst would otherwise
+        // re-verify the same manifest hundreds of times. Memoise on the exact stored
+        // blob plus the tombstone set, so any change to either invalidates the entry.
+        Gee.Set<uint32> tombstones = db.get_manifest_revoked_devices(account, owner_jid);
+        var tomb_sorted = new Gee.ArrayList<uint32>();
+        tomb_sorted.add_all(tombstones);
+        tomb_sorted.sort((a, b) => (a < b) ? -1 : (a > b ? 1 : 0));
+        string blob_str = (!) blob;
+        var sb = new StringBuilder();
+        sb.append(owner_jid);
+        sb.append("|");
+        sb.append(blob_str);
+        sb.append("|");
+        foreach (uint32 t in tomb_sorted) {
+            sb.append(t.to_string());
+            sb.append(",");
+        }
+        string cache_key = sb.str;
+
+        Gee.Set<string>? authorized = authorized_device_cache.get(cache_key);
+        if (authorized == null) {
+            Protocol.TrustManifest? m = null;
+            try {
+                m = Protocol.TrustManifest.unmarshal(bytes_to_uint8_array(bytes_from_base64(blob_str)));
+            } catch (GLib.Error e) {
+                m = null;
+            }
+            if (m == null) return false;
+            authorized = new Gee.HashSet<string>();
+            foreach (var en in ((!) m).fold_with_tombstones(tombstones).entries) {
+                ((!) authorized).add(en.key);
+            }
+            if (authorized_device_cache.size > 32) authorized_device_cache.clear();
+            authorized_device_cache.set(cache_key, (!) authorized);
+        }
+        return ((!) authorized).contains(device_id.to_string());
+    }
+
+    // Memoised D4.1 folds, keyed by (owner, stored manifest blob, tombstone set).
+    private HashMap<string, Gee.Set<string>> authorized_device_cache =
+        new HashMap<string, Gee.Set<string>>();
+
+    // Reverse-resolve the spaced display fingerprint carried on group envelopes.
+    private string? owner_jid_for_display_fp(Account account, string display_fp) {
+        string? own = db.get_aik_fingerprint(account);
+        if (own != null && (!) own == display_fp) return account.bare_jid.to_string();
+        return db.find_peer_jid_by_display_fp(account, display_fp);
+    }
+
+    /* D4.1: drop every recv chain held for a (account, device) pair in EVERY room.
+     * Rejecting the device's messages is not on its own enough — what matters is
+     * deleting the chain state we already installed, so a device revoked mid-epoch
+     * stops being served by material we are still holding. */
+    private void drop_recv_chains_everywhere(Account account, string sender_display_fp, uint32 device_id) {
+        int? local_device_id = db.get_local_device_id(account);
+        if (local_device_id == null) return;
+        uint8[] aik_ed = bytes_to_uint8_array(db.get_local_identity_bytes(account, db.account_identity.aik_pub_ed25519_base64));
+        uint8[] aik_mldsa = bytes_to_uint8_array(db.get_local_identity_bytes(account, db.account_identity.aik_pub_mldsa_base64));
+        uint8[] canonical_aik = Manager.build_canonical_aik_bytes_static(aik_ed, aik_mldsa);
+        foreach (string room in db.list_group_session_rooms(account)) {
+            Protocol.GroupSession? gs = db.load_group_session(account, room, canonical_aik, (uint32) (!) local_device_id);
+            if (gs == null) continue;
+            if (((!) gs).drop_recv_chains_for_device(sender_display_fp, device_id) > 0) {
+                db.store_group_session(account, room, (!) gs);
+                warning("x3dhpq: dropped recv chains for revoked device %u of %s in %s (§D4.1)",
+                    device_id, sender_display_fp, room);
+            }
+        }
+    }
+
     private void on_sender_chain_announcement(Dino.Entities.Account account, Protocol.SenderChainAnnouncement ann,
                                               string sender_jid_value, int sender_device_id) {
         if (!announcement_matches_outer_sender(account, ann, sender_jid_value, sender_device_id)) {
+            return;
+        }
+        // D4.1: a sender chain from a device that is no longer in its account's
+        // accepted manifest fold must not be installed, and anything we already hold
+        // for it must go.
+        string ann_fp;
+        try {
+            ann_fp = ann.aik_fingerprint();
+        } catch (GLib.Error e) {
+            return;
+        }
+        if (!group_sender_currently_authorized(account, ann_fp, ann.sender_device_id)) {
+            warning("x3dhpq: rejecting sender-chain announcement from %s/%u — not currently authorized in that account's trust manifest (§D4.1)",
+                sender_jid_value, ann.sender_device_id);
+            drop_recv_chains_everywhere(account, ann_fp, ann.sender_device_id);
             return;
         }
         // Look up or create the group session for this room.
@@ -2218,6 +2557,20 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             return false;
         }
 
+        /* D4.1: current authorization is required for LIVE group traffic. A device
+         * revoked from its account's Trust Manifest keeps holding every member's
+         * current sender chain key, and no epoch rotation fires from its removal
+         * (room membership is at account level). Reject its messages AND delete
+         * every recv chain we hold for it, in every room — the deletion is the part
+         * that actually stops a mid-epoch revocation being served by state we
+         * already installed. */
+        if (!group_sender_currently_authorized(conversation.account, (!) sender_aik_fp, hdr.sender_device_id)) {
+            warning("x3dhpq: dropping group message in %s from device %u of %s — not currently authorized"
+                + " in that account's trust manifest (§D4.1)", room_jid_str, hdr.sender_device_id, sender_aik_fp);
+            drop_recv_chains_everywhere(conversation.account, (!) sender_aik_fp, hdr.sender_device_id);
+            return true;
+        }
+
         Protocol.GroupSession? gs = db.load_group_session(conversation.account, room_jid_str, canonical_aik, (uint32)(!) local_device_id);
         if (gs == null) {
             try {
@@ -2326,6 +2679,13 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         } catch (Protocol.GroupSessionError.REMOVED_MEMBER e) {
             debug("x3dhpq: dropping group message from removed member %s in %s",
                 sender_aik_fp, room_jid_str);
+            return true;
+        } catch (Protocol.GroupSessionError.EPOCH_ID_MISMATCH e) {
+            /* D5.3: we hold a chain for this sender at this numeric epoch, but it was
+             * installed under a DIFFERENT fold. Decrypting under it would accept a
+             * message produced from a membership fold this receiver never accepted. */
+            warning("x3dhpq: dropping group message from %s in %s — epoch_id does not match the"
+                + " installed chain for that epoch (§D5.3)", sender_aik_fp, room_jid_str);
             return true;
         } catch (Protocol.GroupSessionError.STALE_EPOCH e) {
             debug("x3dhpq: dropping group message from %s in %s with a stale epoch",

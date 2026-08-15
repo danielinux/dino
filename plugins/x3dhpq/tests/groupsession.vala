@@ -11,6 +11,7 @@ class GroupSessionTest : Gee.TestCase {
         add_test("senderchain_marshal_roundtrip", test_senderchain_marshal_roundtrip);
         add_test("senderchain_skipped_keys", test_senderchain_skipped_keys);
         add_test("groupmsg_header_roundtrip", test_groupmsg_header_roundtrip);
+        add_test("epoch_id_derivation_kat", test_epoch_id_derivation_kat);
         add_test("groupmsg_nonce_aad", test_groupmsg_nonce_aad);
         add_test("groupmsg_aad_binds_heads", test_groupmsg_aad_binds_heads);
         add_test("groupshare_marshal_roundtrip", test_groupshare_marshal_roundtrip);
@@ -21,6 +22,250 @@ class GroupSessionTest : Gee.TestCase {
         add_test("groupsession_serialize_deserialize", test_groupsession_serialize_deserialize);
         add_test("groupsession_checkpoint_bounds_history", test_groupsession_checkpoint_bounds_history);
         add_test("member_cannot_forge_another_senders_signature", test_member_cannot_forge_signature);
+        // D5.2/D5.3
+        add_test("groupshare_rejects_v2_and_trailing_bytes", test_groupshare_version_and_trailing);
+        add_test("same_epoch_different_epoch_id_both_install", test_same_epoch_different_epoch_id);
+        add_test("wrong_epoch_id_message_rejected", test_wrong_epoch_id_rejected);
+        add_test("epoch_id_change_rotates_sender_chain", test_epoch_id_change_rotates);
+        // D4.1
+        add_test("revoked_device_recv_chains_dropped", test_revoked_device_recv_chains_dropped);
+    }
+
+    // D7 + D5.2: v1/v2 announcements are rejected outright, and trailing bytes after
+    // a fully-parsed announcement are rejected (§5.6) — ignoring them leaves a
+    // malleability channel where the same logical announcement re-encodes freely.
+    private void test_groupshare_version_and_trailing() {
+        try {
+            SenderChainAnnouncement ann = make_ann(make_aik_bytes(new uint8[32], new uint8[0]), 5, "r@x", 2, 0);
+            ann.epoch_id = (uint64) 0xAABBCCDD11223344;
+            uint8[] wire = ann.marshal();
+            fail_if_not_eq_int((int) wire[0], 0, "version high byte");
+            fail_if_not_eq_int((int) wire[1], 3, "announcement must be version 3");
+
+            SenderChainAnnouncement? ok = SenderChainAnnouncement.unmarshal(wire);
+            fail_if(ok == null, "v3 announcement must parse");
+            fail_if_not(((!) ok).epoch_id == (uint64) 0xAABBCCDD11223344, "epoch_id round-trip");
+
+            // Trailing garbage.
+            uint8[] padded = new uint8[wire.length + 1];
+            Memory.copy(padded, wire, wire.length);
+            padded[wire.length] = 0x00;
+            fail_if(SenderChainAnnouncement.unmarshal(padded) != null,
+                "trailing bytes after a fully-parsed announcement must be rejected");
+
+            // Downgrade to v2 (drop the epoch_id and relabel the version).
+            uint8[] v2 = new uint8[wire.length - 8];
+            Memory.copy(v2, wire, v2.length);
+            v2[1] = 2;
+            fail_if(SenderChainAnnouncement.unmarshal(v2) != null, "v2 announcements must be rejected");
+        } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    /* D5.3 — the contradiction-recovery property. Install-once applies to the
+     * 4-tuple (aik_fp, device_id, epoch, epoch_id), NOT to the numeric epoch, so a
+     * chain produced under a re-fold that contradicts an earlier one installs
+     * cleanly at the SAME numeric epoch instead of being swallowed as a duplicate.
+     * Without this a contradicted epoch has no recovery path at all: reusing the
+     * number for a new chain is forbidden, and the number does not change. */
+    private void test_same_epoch_different_epoch_id() {
+        try {
+            uint8[] alice_aik = random_aik();
+            uint8[] bob_aik = random_aik();
+            string room = "room@conference.example.org";
+
+            GroupSession bob = GroupSession.new_session(room, bob_aik, 2);
+            bob.add_member(make_member(alice_aik, 1));
+
+            // Alice announces under fold #1, then re-announces at the SAME numeric
+            // epoch under a contradicting fold #2.
+            GroupSession alice1 = GroupSession.new_session(room, alice_aik, 1);
+            alice1.apply_fold_epoch(4, 0x1111111111111111);
+            SenderChainAnnouncement a1 = alice1.announce_sender_chain();
+
+            GroupSession alice2 = GroupSession.new_session(room, alice_aik, 1);
+            alice2.apply_fold_epoch(4, 0x2222222222222222);
+            SenderChainAnnouncement a2 = alice2.announce_sender_chain();
+
+            fail_if_not_eq_int((int) a1.epoch, (int) a2.epoch, "same numeric epoch");
+            fail_if(a1.epoch_id == a2.epoch_id, "different fold ⇒ different epoch_id");
+
+            bob.accept_sender_chain(a1);
+            bob.accept_sender_chain(a2);
+            string alice_fp = a1.aik_fingerprint();
+
+            // BOTH chains must be usable — that is what "installs cleanly" means.
+            GroupMessageHeader h1; uint8[] c1; uint8[] s1;
+            alice1.encrypt(string_to_bytes("from fold one"), out h1, out c1, out s1);
+            fail_if_not_eq_uint8_arr(string_to_bytes("from fold one"),
+                bob.decrypt(alice_fp, h1, c1, s1), "the first fold's chain must decrypt");
+
+            GroupMessageHeader h2; uint8[] c2; uint8[] s2;
+            alice2.encrypt(string_to_bytes("from fold two"), out h2, out c2, out s2);
+            fail_if_not_eq_uint8_arr(string_to_bytes("from fold two"),
+                bob.decrypt(alice_fp, h2, c2, s2),
+                "the replacement chain at the same numeric epoch must install and decrypt");
+        } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    /* D5.3: a message whose epoch_id does not match the chain selected by
+     * (aik_fp, device_id, epoch) MUST be rejected, not silently decrypted under a
+     * chain from a different fold. */
+    private void test_wrong_epoch_id_rejected() {
+        try {
+            uint8[] alice_aik = random_aik();
+            uint8[] bob_aik = random_aik();
+            string room = "room@conference.example.org";
+
+            GroupSession alice = GroupSession.new_session(room, alice_aik, 1);
+            alice.apply_fold_epoch(2, 0xDEADBEEFCAFEF00D);
+            GroupSession bob = GroupSession.new_session(room, bob_aik, 2);
+            bob.add_member(make_member(alice_aik, 1));
+            SenderChainAnnouncement ann = alice.announce_sender_chain();
+            bob.accept_sender_chain(ann);
+            string alice_fp = ann.aik_fingerprint();
+
+            GroupMessageHeader hdr; uint8[] ct; uint8[] sig;
+            alice.encrypt(string_to_bytes("hello"), out hdr, out ct, out sig);
+            fail_if_not(hdr.epoch_id == alice.epoch_id, "the header carries the session's epoch_id");
+
+            // Relabel the message with a different fold's epoch_id.
+            GroupMessageHeader tampered = new GroupMessageHeader();
+            tampered.version = 2;
+            tampered.epoch = hdr.epoch;
+            tampered.sender_device_id = hdr.sender_device_id;
+            tampered.chain_index = hdr.chain_index;
+            tampered.epoch_id = hdr.epoch_id ^ 1;
+
+            // The rejection must be the EXPLICIT epoch_id check, not an incidental
+            // AEAD failure: the receiver has to know it is looking at a message from
+            // a fold it never accepted, and must not consume chain state deciding so.
+            bool rejected = false;
+            try {
+                bob.decrypt(alice_fp, tampered, ct, sig);
+            } catch (GroupSessionError.EPOCH_ID_MISMATCH e) {
+                rejected = true;
+            } catch (GLib.Error e) {
+                fail_if_reached("expected EPOCH_ID_MISMATCH, got: " + e.message);
+            }
+            fail_if_not(rejected, "a message tagged with the wrong epoch_id must be rejected");
+
+            // The untouched message still decrypts.
+            fail_if_not_eq_uint8_arr(string_to_bytes("hello"),
+                bob.decrypt(alice_fp, hdr, ct, sig), "the genuine message must still decrypt");
+        } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    /* D5.3: a sender MUST rotate — fresh chain key, fresh per-epoch signing key,
+     * checkpoint back to index 0 — whenever a re-fold changes epoch_id, INCLUDING
+     * when the numeric epoch is unchanged. */
+    private void test_epoch_id_change_rotates() {
+        try {
+            uint8[] aik = random_aik();
+            GroupSession gs = GroupSession.new_session("r@x", aik, 1);
+            gs.apply_fold_epoch(3, 0x1111);
+            uint8[] ck_before = gs.send_chain.chain_key.copy();
+            uint8[] sig_before = gs.send_chain.sig_pub.copy();
+
+            fail_if(gs.apply_fold_epoch(3, 0x1111), "an unchanged fold must not rotate");
+            fail_if_not_eq_uint8_arr(ck_before, gs.send_chain.chain_key, "no rotation ⇒ same chain key");
+
+            fail_if_not(gs.apply_fold_epoch(3, 0x2222),
+                "a changed epoch_id at the SAME numeric epoch must rotate");
+            fail_if(hex_of_arr(ck_before) == hex_of_arr(gs.send_chain.chain_key),
+                "rotation must mint a fresh chain key");
+            fail_if(hex_of_arr(sig_before) == hex_of_arr(gs.send_chain.sig_pub),
+                "rotation must mint a fresh per-epoch signing key");
+            fail_if_not_eq_int((int) gs.announce_sender_chain().next_index, 0,
+                "rotation must reinitialise the checkpoint at index 0");
+            fail_if_not(gs.epoch_id == (uint64) 0x2222, "epoch_id adopted");
+        } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    /* D4.1: group membership is at ACCOUNT level while sender chains go to
+     * individual DEVICES, so revoking a device from its account's manifest rotates
+     * nothing and the revoked device keeps every member's live chain key. Rejecting
+     * its messages is not on its own enough — deleting the recv chains we already
+     * installed is the part that stops a MID-EPOCH revocation being served by state
+     * we are still holding. */
+    private void test_revoked_device_recv_chains_dropped() {
+        try {
+            uint8[] alice_aik = random_aik();
+            uint8[] bob_aik = random_aik();
+            string room = "room@conference.example.org";
+
+            GroupSession bob = GroupSession.new_session(room, bob_aik, 2);
+            bob.add_member(make_member(alice_aik, 1));
+
+            // Alice has two devices in the room; only device 1 is revoked later.
+            GroupSession a1 = GroupSession.new_session(room, alice_aik, 1);
+            a1.apply_fold_epoch(bob.epoch, 0x77);
+            GroupSession a2 = GroupSession.new_session(room, alice_aik, 9);
+            a2.apply_fold_epoch(bob.epoch, 0x77);
+
+            SenderChainAnnouncement ann1 = a1.announce_sender_chain();
+            SenderChainAnnouncement ann9 = a2.announce_sender_chain();
+            bob.accept_sender_chain(ann1);
+            bob.accept_sender_chain(ann9);
+            string alice_fp = ann1.aik_fingerprint();
+
+            // Both devices can be read before the revocation.
+            GroupMessageHeader h1; uint8[] c1; uint8[] s1;
+            a1.encrypt(string_to_bytes("from d1"), out h1, out c1, out s1);
+            fail_if_not_eq_uint8_arr(string_to_bytes("from d1"),
+                bob.decrypt(alice_fp, h1, c1, s1), "device 1 readable before revocation");
+
+            // Device 1 is revoked from Alice's manifest: drop its chains.
+            int dropped = bob.drop_recv_chains_for_device(alice_fp, 1);
+            fail_if_not(dropped > 0, "the revoked device's recv chains must be dropped");
+
+            // Its subsequent messages are no longer decryptable...
+            GroupMessageHeader h2; uint8[] c2; uint8[] s2;
+            a1.encrypt(string_to_bytes("after revocation"), out h2, out c2, out s2);
+            bool rejected = false;
+            try {
+                bob.decrypt(alice_fp, h2, c2, s2);
+            } catch (GLib.Error e) {
+                rejected = true;
+            }
+            fail_if_not(rejected, "a revoked device's later group messages must be rejected");
+
+            // ...while a SIBLING device of the same account is untouched: revocation
+            // is per-device, and dropping the whole account would silence a member
+            // whose other devices are perfectly authorized.
+            GroupMessageHeader h9; uint8[] c9; uint8[] s9;
+            a2.encrypt(string_to_bytes("from d9"), out h9, out c9, out s9);
+            fail_if_not_eq_uint8_arr(string_to_bytes("from d9"),
+                bob.decrypt(alice_fp, h9, c9, s9),
+                "a surviving sibling device of the same account must still be readable");
+        } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    private static SenderChainAnnouncement make_ann(uint8[] aik, uint32 dev, string room,
+                                                    uint32 epoch, uint32 next_index) throws Error {
+        var a = new SenderChainAnnouncement();
+        a.sender_aik_pub_bytes = aik;
+        a.sender_device_id = dev;
+        a.room_jid = room;
+        a.epoch = epoch;
+        a.chain_key = bytes_to_arr(Crypto.random_bytes(32));
+        a.next_index = next_index;
+        uint8[] sp = new uint8[32];
+        for (int i = 0; i < 32; i++) sp[i] = 0x5A;
+        a.sig_pub = sp;
+        return a;
+    }
+
+    private static uint8[] random_aik() throws Error {
+        Bytes ed_pub; Bytes ed_priv; Bytes ml_pub; Bytes ml_priv;
+        Crypto.generate_ed25519(out ed_pub, out ed_priv);
+        Crypto.generate_mldsa65(out ml_pub, out ml_priv);
+        return make_aik_bytes(bytes_to_arr(ed_pub), bytes_to_arr(ml_pub));
+    }
+
+    private static string hex_of_arr(uint8[] b) {
+        StringBuilder sb = new StringBuilder();
+        foreach (uint8 x in b) sb.append_printf("%02x", x);
+        return sb.str;
     }
 
     private static uint8[] make_aik_bytes(uint8[] ed32, uint8[] mldsa) {
@@ -122,23 +367,82 @@ class GroupSessionTest : Gee.TestCase {
         }
     }
 
+    // D5.2: header is version 2 and exactly 22 bytes, with a trailing uint64
+    // epoch_id. Version 1 MUST be rejected — a v1 message carries no binding to the
+    // fold it was produced under, so a contradicted epoch would again have no
+    // recovery path. Cross-client wire, so the layout is pinned byte-for-byte.
     private void test_groupmsg_header_roundtrip() {
         GroupMessageHeader h = new GroupMessageHeader();
-        h.version = 1;
+        h.version = 2;
         h.epoch = 3;
         h.sender_device_id = (uint32) 0xdeadbeef;
         h.chain_index = 42;
+        h.epoch_id = (uint64) 0x0102030405060708;
         uint8[] bytes = h.marshal();
-        fail_if_not_eq_int(bytes.length, 14, "header must be 14 bytes");
+        fail_if_not_eq_int(bytes.length, 22, "header must be 22 bytes (v2)");
+        fail_if_not_eq_uint8_arr(
+            hex_bin("0002" + "00000003" + "deadbeef" + "0000002a" + "0102030405060708"),
+            bytes, "GroupMessageHeader v2 encoding mismatch");
         GroupMessageHeader? h2 = GroupMessageHeader.unmarshal(bytes);
         fail_if(h2 == null, "unmarshal returned null");
         fail_if_not_eq_int((int)((!) h2).epoch, 3, "epoch mismatch");
         fail_if_not_eq_int((int)((!) h2).chain_index, 42, "chain_index mismatch");
+        fail_if_not(((!) h2).epoch_id == (uint64) 0x0102030405060708, "epoch_id mismatch");
+
+        // A version-1 header (14 bytes, no epoch_id) must be rejected.
+        uint8[] v1 = hex_bin("0001" + "00000003" + "deadbeef" + "0000002a");
+        fail_if(GroupMessageHeader.unmarshal(v1) != null, "version 1 headers must be rejected");
+    }
+
+    // D5.1: epoch_id = SHA-256("X3DHPQ-EpochId-v1\0" || uint16 len || roomJID
+    //                          || uint32 epoch || fold_hash)[0..8] as a BE uint64.
+    // Cross-client wire — pinned.
+    private void test_epoch_id_derivation_kat() {
+        try {
+            uint8[] fold_hash = new uint8[32];
+            for (int i = 0; i < 32; i++) fold_hash[i] = (uint8) i;
+            uint64 got = GroupMessageHeader.derive_epoch_id("room@example.org", 7, fold_hash);
+
+            // Independently recompute the pinned input and hash it here, so a change
+            // to either the label, the field order or the truncation is caught.
+            uint8[] room = string_to_bytes("room@example.org");
+            uint8[] input = new uint8[18 + 2 + room.length + 4 + 32];
+            uint8[] label = { 'X','3','D','H','P','Q','-','E','p','o','c','h','I','d','-','v','1', 0x00 };
+            Memory.copy(input, label, 18);
+            int off = 18;
+            input[off++] = 0; input[off++] = (uint8) room.length;
+            Memory.copy((uint8*) input + off, room, room.length); off += room.length;
+            input[off++] = 0; input[off++] = 0; input[off++] = 0; input[off++] = 7;
+            Memory.copy((uint8*) input + off, fold_hash, 32);
+            uint8[] digest = bytes_to_arr(Crypto.sha256(new Bytes(input)));
+            uint64 want = 0;
+            for (int i = 0; i < 8; i++) want = (want << 8) | digest[i];
+            fail_if_not(got == want, "epoch_id derivation does not match the pinned input");
+
+            // Two folds differing only in fold_hash must give different epoch_ids
+            // even at the SAME numeric epoch — that is the contradiction-recovery
+            // property the whole of D5 rests on.
+            uint8[] other = fold_hash.copy();
+            other[31] = 0xFF;
+            fail_if(GroupMessageHeader.derive_epoch_id("room@example.org", 7, other) == got,
+                "a different fold must yield a different epoch_id at the same epoch");
+        } catch (Error e) {
+            fail_if_reached(e.message);
+        }
+    }
+
+    private static uint8[] hex_bin(string hex) {
+        uint8[] o = new uint8[hex.length / 2];
+        for (int i = 0; i < o.length; i++) {
+            o[i] = (uint8) ("0123456789abcdef".index_of_char(hex[i * 2]) * 16
+                          + "0123456789abcdef".index_of_char(hex[i * 2 + 1]));
+        }
+        return o;
     }
 
     private void test_groupmsg_nonce_aad() {
         GroupMessageHeader h = new GroupMessageHeader();
-        h.version = 1; h.epoch = 1; h.sender_device_id = 2; h.chain_index = 3;
+        h.version = 2; h.epoch = 1; h.sender_device_id = 2; h.chain_index = 3;
         uint8[] nonce = h.aead_nonce();
         fail_if_not_eq_int(nonce.length, 12, "nonce must be 12 bytes");
         fail_if_not_eq_int((int) nonce[0], (int) 'G', "nonce[0] must be G");
@@ -146,7 +450,7 @@ class GroupSessionTest : Gee.TestCase {
         fail_if_not_eq_int((int) nonce[2], (int) 'S', "nonce[2] must be S");
         fail_if_not_eq_int((int) nonce[3], (int) 'G', "nonce[3] must be G");
         uint8[] aad = h.aad("room@example.org");
-        fail_if_not_eq_int(aad.length, 14 + "room@example.org".length + 1,
+        fail_if_not_eq_int(aad.length, 22 + "room@example.org".length + 1,
             "aad = header + roomJID + 1-byte absent-heads marker");
         fail_if_not_eq_int((int) aad[aad.length - 1], 0x00,
             "absent <heads> must be encoded as a 0x00 marker");
@@ -158,7 +462,7 @@ class GroupSessionTest : Gee.TestCase {
     // "sender had no frontier" — exactly the forgery the binding prevents.
     private void test_groupmsg_aad_binds_heads() {
         GroupMessageHeader h = new GroupMessageHeader();
-        h.version = 1; h.epoch = 7; h.sender_device_id = 1; h.chain_index = 3;
+        h.version = 2; h.epoch = 7; h.sender_device_id = 1; h.chain_index = 3;
         string room = "room@example.org";
 
         uint8[] heads_a = new uint8[34];
@@ -171,9 +475,9 @@ class GroupSessionTest : Gee.TestCase {
         uint8[] present = h.aad_with_heads(room, heads_a);
         uint8[] other = h.aad_with_heads(room, heads_b);
 
-        fail_if_not_eq_int(present.length, 14 + room.length + 3 + heads_a.length,
+        fail_if_not_eq_int(present.length, 22 + room.length + 3 + heads_a.length,
             "present <heads> contributes marker + uint16 length + payload");
-        fail_if_not_eq_int((int) present[14 + room.length], 0x01,
+        fail_if_not_eq_int((int) present[22 + room.length], 0x01,
             "present <heads> must be encoded with a 0x01 marker");
 
         fail_if(absent.length == present.length && Memory.cmp(absent, present, absent.length) == 0,
@@ -392,7 +696,7 @@ class GroupSessionTest : Gee.TestCase {
 
             // Attempt to decrypt a message from the removed member — must fail.
             GroupMessageHeader hdr = new GroupMessageHeader();
-            hdr.version = 1; hdr.epoch = ann.epoch; hdr.sender_device_id = 2; hdr.chain_index = 0;
+            hdr.version = 2; hdr.epoch = ann.epoch; hdr.sender_device_id = 2; hdr.chain_index = 0;
             bool got_error = false;
             try {
                 gs.decrypt(fp2, hdr, new uint8[32], new uint8[64]);
@@ -476,7 +780,8 @@ class GroupSessionTest : Gee.TestCase {
 
             // Pre-checkpoint message (index 1) must NOT be decryptable.
             GroupMessageHeader hpre = new GroupMessageHeader();
-            hpre.version = 1; hpre.epoch = a1.epoch; hpre.sender_device_id = 1; hpre.chain_index = 1;
+            hpre.version = 2; hpre.epoch = a1.epoch; hpre.sender_device_id = 1; hpre.chain_index = 1;
+            hpre.epoch_id = a1.epoch_id;
             bool pre_failed = false;
             try {
                 bob.decrypt(alice_fp, hpre, new uint8[32], new uint8[64]);

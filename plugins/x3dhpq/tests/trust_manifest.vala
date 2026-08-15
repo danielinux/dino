@@ -32,6 +32,7 @@ class TrustManifestTest : Gee.TestCase {
         add_test("marshal_roundtrip", test_roundtrip);
         add_test("head_sign_verify", test_head_sign_verify);
         add_test("migration_roundtrip", test_migration_roundtrip);
+        add_test("dik_reissued_dc_rejects_manifest", test_dik_reissued_dc_rejects_manifest);
         add_test("reset_fresh_genesis_new_aik", test_reset_fresh_genesis_new_aik);
     }
 
@@ -198,7 +199,8 @@ class TrustManifestTest : Gee.TestCase {
             AccountIdentityKey aik = AccountIdentityKey.generate();
             Dev d1 = make_dev(1001, new Bytes(aik.priv_ed25519), new Bytes(aik.priv_mldsa));
             var g = genesis(aik, d1);
-            Dev d2 = make_dev(1002, new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa));
+            // D8: the subject's DC is the ordinary AIK-signed one, embedded unmodified.
+            Dev d2 = make_dev(1002, new Bytes(aik.priv_ed25519), new Bytes(aik.priv_mldsa));
             var add2 = sign_entry(TrustEntry.ACTION_ADD, d2.id, d2.dc,
                 d1.id, sha512_arr(d1.dc.marshal()), 1001,
                 new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa));
@@ -218,7 +220,8 @@ class TrustManifestTest : Gee.TestCase {
             AccountIdentityKey aik = AccountIdentityKey.generate();
             Dev d1 = make_dev(1001, new Bytes(aik.priv_ed25519), new Bytes(aik.priv_mldsa));
             var g = genesis(aik, d1);
-            Dev d2 = make_dev(1002, new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa));
+            // D8: the subject's DC is the ordinary AIK-signed one, embedded unmodified.
+            Dev d2 = make_dev(1002, new Bytes(aik.priv_ed25519), new Bytes(aik.priv_mldsa));
             var add2 = sign_entry(TrustEntry.ACTION_ADD, d2.id, d2.dc,
                 d1.id, sha512_arr(d1.dc.marshal()), 1001,
                 new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa));
@@ -228,7 +231,9 @@ class TrustManifestTest : Gee.TestCase {
             DeviceCertificate rogue_dc = DeviceCertificate.issue(9999,
                 new Bytes(rogue.pub_ed25519), new Bytes(rogue.pub_x25519), new Bytes(rogue.pub_mldsa),
                 new Bytes(rogue.priv_ed25519), new Bytes(rogue.priv_mldsa), 0);  // self-issued garbage
-            Dev d3 = make_dev(1003, new Bytes(rogue.priv_ed25519), new Bytes(rogue.priv_mldsa));
+            // The DC itself is legitimate (AIK-signed); only the AUTHOR is rogue, so
+            // this exercises the per-entry drop, not the D8 whole-manifest rejection.
+            Dev d3 = make_dev(1003, new Bytes(aik.priv_ed25519), new Bytes(aik.priv_mldsa));
             var bad = sign_entry(TrustEntry.ACTION_ADD, d3.id, d3.dc,
                 9999, sha512_arr(rogue_dc.marshal()), 1002,
                 new Bytes(rogue.priv_ed25519), new Bytes(rogue.priv_mldsa));
@@ -247,7 +252,8 @@ class TrustManifestTest : Gee.TestCase {
             AccountIdentityKey aik = AccountIdentityKey.generate();
             Dev d1 = make_dev(1001, new Bytes(aik.priv_ed25519), new Bytes(aik.priv_mldsa));
             var g = genesis(aik, d1);
-            Dev d2 = make_dev(1002, new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa));
+            // D8: the subject's DC is the ordinary AIK-signed one, embedded unmodified.
+            Dev d2 = make_dev(1002, new Bytes(aik.priv_ed25519), new Bytes(aik.priv_mldsa));
             var add2 = sign_entry(TrustEntry.ACTION_ADD, d2.id, d2.dc,
                 d1.id, sha512_arr(d1.dc.marshal()), 1001,
                 new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa));
@@ -292,19 +298,22 @@ class TrustManifestTest : Gee.TestCase {
 
     // Mirrors build_snapshot_manifest: the primary (D1, AIK holder) builds a
     // snapshot from a 2-device set — its own self DC (AIK-signed genesis) plus a
-    // sibling D2 whose DC is RE-ISSUED under the primary's DIK and appended as a
+    // sibling D2 whose ORDINARY AIK-SIGNED DC is embedded unmodified in a
     // genesis-authored ADD. Fold must yield {D1, D2}.
+    //
+    // D8: the primary used to RE-ISSUE the sibling's DC under its own DIK first.
+    // §7.3.1 defines a DeviceCertificate as AIK-signed by definition, so that
+    // produced an object called a DC that verifies only under a DIK — and it was
+    // redundant, because the entry is already DIK-signed and already names the
+    // subject, so the ENTRY signature is the delegation edge.
     private void test_migration_roundtrip() {
         try {
             AccountIdentityKey aik = AccountIdentityKey.generate();
             Dev d1 = make_dev(1001, new Bytes(aik.priv_ed25519), new Bytes(aik.priv_mldsa));
-            DeviceIdentityKey d2_dik = DeviceIdentityKey.generate();
-            DeviceCertificate d2_reissued = DeviceCertificate.issue(1002,
-                new Bytes(d2_dik.pub_ed25519), new Bytes(d2_dik.pub_x25519), new Bytes(d2_dik.pub_mldsa),
-                new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa), 0);
+            Dev d2 = make_dev(1002, new Bytes(aik.priv_ed25519), new Bytes(aik.priv_mldsa));
 
             var g = genesis(aik, d1);
-            var add2 = sign_entry(TrustEntry.ACTION_ADD, 1002, d2_reissued,
+            var add2 = sign_entry(TrustEntry.ACTION_ADD, d2.id, d2.dc,
                 d1.id, sha512_arr(d1.dc.marshal()), 2000,
                 new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa));
             var m = manifest_of(aik.public_key(), new TrustEntry[]{ g, add2 });
@@ -314,9 +323,37 @@ class TrustManifestTest : Gee.TestCase {
             var trusted = m.fold();
             fail_if_not_eq_int(trusted.size, 2, "snapshot folds to exactly {D1, D2}");
             fail_if_not(trusted.has_key("1001"), "D1 (genesis) present");
-            fail_if_not(trusted.has_key("1002"), "D2 (re-issued member) present");
+            fail_if_not(trusted.has_key("1002"), "D2 (AIK-signed member DC) present");
             fail_if_not(m.verify_head(new Bytes(d1.dik.pub_ed25519), new Bytes(d1.dik.pub_mldsa)),
                 "head signed by a folded device (D1)");
+        } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    // D8: a manifest embedding a DIK-RE-SIGNED DC is at the PREVIOUS format and must
+    // be REJECTED WHOLE — not silently reduced to its genesis. The difference between
+    // "the primary republished at the new format" and "the primary quietly dropped
+    // every sibling" is the difference between a working account and one that stops
+    // delivering to its own devices, so an empty fold (which the caller treats as
+    // REJECT and keeps last-good for) is the only safe outcome.
+    private void test_dik_reissued_dc_rejects_manifest() {
+        try {
+            AccountIdentityKey aik = AccountIdentityKey.generate();
+            Dev d1 = make_dev(1001, new Bytes(aik.priv_ed25519), new Bytes(aik.priv_mldsa));
+            var g = genesis(aik, d1);
+
+            // Previous format: D2's DC re-issued under the PRIMARY'S DIK.
+            DeviceIdentityKey d2_dik = DeviceIdentityKey.generate();
+            DeviceCertificate d2_reissued = DeviceCertificate.issue(1002,
+                new Bytes(d2_dik.pub_ed25519), new Bytes(d2_dik.pub_x25519), new Bytes(d2_dik.pub_mldsa),
+                new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa), 0);
+            var add2 = sign_entry(TrustEntry.ACTION_ADD, 1002, d2_reissued,
+                d1.id, sha512_arr(d1.dc.marshal()), 2000,
+                new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa));
+
+            var m = manifest_of(aik.public_key(), new TrustEntry[]{ g, add2 });
+            m.sign_head(new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa));
+            fail_if_not_eq_int(m.fold().size, 0,
+                "a manifest embedding a DIK-re-signed DC must be rejected outright");
         } catch (Error e) { fail_if_reached(e.message); }
     }
 
@@ -329,7 +366,8 @@ class TrustManifestTest : Gee.TestCase {
             AccountIdentityKey aik1 = AccountIdentityKey.generate();
             Dev d1 = make_dev(1001, new Bytes(aik1.priv_ed25519), new Bytes(aik1.priv_mldsa));
             var g1 = genesis(aik1, d1);
-            Dev d2 = make_dev(1002, new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa));
+            // D8: the subject's DC is the ordinary AIK-signed one, embedded unmodified.
+            Dev d2 = make_dev(1002, new Bytes(aik1.priv_ed25519), new Bytes(aik1.priv_mldsa));
             var add2 = sign_entry(TrustEntry.ACTION_ADD, d2.id, d2.dc,
                 d1.id, sha512_arr(d1.dc.marshal()), 1001,
                 new Bytes(d1.dik.priv_ed25519), new Bytes(d1.dik.priv_mldsa));

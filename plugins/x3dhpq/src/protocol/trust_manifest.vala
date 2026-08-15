@@ -360,7 +360,9 @@ public class TrustManifest : Object {
     //  2. Accept remaining ADD entries, ordered by ascending device_id, whose
     //     author is the genesis device, author_dc_hash == SHA-512(genesis DC),
     //     the entry sig verifies under the genesis DC's DIK, and dc.device_id ==
-    //     device_id. A bad entry is dropped (that one), never fatal.
+    //     device_id, AND (D8) the embedded DC itself verifies under the account
+    //     AIK. A bad entry is dropped (that one); an entry whose DC is not
+    //     AIK-signed is the PREVIOUS wire format and rejects the whole manifest.
     // No lamport/parents/topo-sort. Revocation is expressed by absence from the
     // snapshot, but that is not binding on its own — see fold_with_tombstones.
     // Keyed by device_id's base-10 string form (Gee generics prefer string keys).
@@ -437,7 +439,33 @@ public class TrustManifest : Object {
             if (revoked.contains(e.device_id)) continue;
             if (e.dc.device_id != e.device_id) continue;
             if (!byte_eq(e.author_dc_hash, genesis_dc_hash)) continue;
+            // The entry signature IS the delegation edge: the primary's DIK signed an
+            // entry that names this subject device.
             if (!verify_entry_sig(e, g.dc.dik_pub_ed25519, g.dc.dik_pub_mldsa)) continue;
+
+            /* D8 (§7.3.1/§11.7): the embedded object is a DEVICE CERTIFICATE, and a
+             * DeviceCertificate is by definition AIK-signed. The primary used to
+             * re-issue each member's DC under its OWN DIK before embedding it, which
+             * produced an object called a DC that verifies under a DIK — a
+             * contradiction of the type, and redundant besides, since the entry
+             * signature already establishes the delegation edge.
+             *
+             * A manifest carrying a DIK-re-signed DC is at the PREVIOUS format and is
+             * REJECTED WHOLE (empty fold), not silently reduced to its genesis: the
+             * difference between "the primary republished at the new format" and "the
+             * primary quietly dropped every sibling device" is exactly the difference
+             * between a working account and one that stops delivering to its own
+             * devices. The primary republishes fresh instead. */
+            bool dc_ok;
+            try {
+                dc_ok = e.dc.verify(new Bytes(aik.pub_ed25519), new Bytes(aik.pub_mldsa));
+            } catch (GLib.Error err) {
+                dc_ok = false;
+            }
+            if (!dc_ok) {
+                return new Gee.HashMap<string, DeviceCertificate>();
+            }
+
             trusted.set(e.device_id.to_string(), e.dc);
         }
         return trusted;

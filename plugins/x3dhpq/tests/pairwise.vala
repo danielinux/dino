@@ -16,6 +16,500 @@ class Pairwise : Gee.TestCase {
         add_test("checkpoint_keeps_in_flight_opposite_message", test_checkpoint_keeps_in_flight_opposite_message);
         add_test("cross_vector_from_pqonversations", test_cross_vector_from_pqonversations);
         add_test("cross_vector_ratchet_from_pqonversations", test_cross_vector_ratchet_from_pqonversations);
+        // D1
+        add_test("prekey_sig_input_kat", test_prekey_sig_input_kat);
+        add_test("bundle_rejects_legacy_naked_key_signature", test_bundle_rejects_legacy_naked_key_signature);
+        add_test("bundle_rejects_relabelled_prekey_id", test_bundle_rejects_relabelled_prekey_id);
+        // D2
+        add_test("crossed_checkpoints_then_ratchet_both_ways", test_crossed_checkpoints_then_ratchet_both_ways);
+        // D3
+        add_test("header_kat_and_five_field_rejection", test_header_kat_and_five_field_rejection);
+        add_test("checkpoint_overtake_defers_then_recovers", test_checkpoint_overtake_defers_then_recovers);
+        add_test("failed_auth_leaves_state_unchanged", test_failed_auth_leaves_state_unchanged);
+        // D2 persistence
+        add_test("legacy_session_blob_is_discarded", test_legacy_session_blob_is_discarded);
+        // D2+D3 combined
+        add_test("crossed_checkpoints_with_overtake", test_crossed_checkpoints_with_overtake);
+        add_test("ratchet_step_precedes_checkpoint_mix", test_ratchet_precedes_checkpoint_mix);
+    }
+
+    // ------------------------------------------------------------ D2 + D3 ----
+
+    // D2 and D3 are ONE fix, not two.
+    //
+    // D2's convergence argument — per-direction accumulators agree because each
+    // direction's checkpoints are totally ordered by its own message chain — holds
+    // only if the receiver APPLIES that direction's checkpoints in the order the
+    // sender emitted them, which is exactly what D3's deferral rule enforces. D2
+    // without D3 still diverges under reordering; D3 without D2 still diverges under
+    // concurrency. This is the combined trace: crossed checkpoints AND one of them
+    // delivered after its own successor.
+    //
+    // The assertion is on the ACCUMULATORS, not only on decryptability: a trace that
+    // merely decrypts can leave the state already diverged in a way that only breaks
+    // at the next ratchet.
+    private void test_crossed_checkpoints_with_overtake() {
+        try {
+            TestIdentity alice = new TestIdentity();
+            TestIdentity bob = new TestIdentity();
+            SessionBootstrap a;
+            SessionState b;
+            establish(alice, bob, out a, out b);
+
+            // Both directions live, so each side knows the other's KEM reply key.
+            roundtrip(a.state, b);
+            roundtrip(b, a.state);
+
+            // Both sides checkpoint on their next send, neither having seen the other's.
+            a.state.last_checkpoint_time = 0;
+            b.last_checkpoint_time = 0;
+
+            Bytes a_ck_key = Crypto.random_bytes(44);
+            MessageHeader a_ck_h; Bytes a_ck_ct;
+            encrypt_transport_key(a.state, a_ck_key, out a_ck_h, out a_ck_ct);
+            fail_if(a_ck_h.kem_ciphertext == null, "A's checkpoint message");
+
+            Bytes a_next_key = Crypto.random_bytes(44);
+            MessageHeader a_next_h; Bytes a_next_ct;
+            encrypt_transport_key(a.state, a_next_key, out a_next_h, out a_next_ct);
+            fail_if_not(a_next_h.ckpt_n == a_ck_h.n, "A's successor advertises the checkpoint index");
+
+            Bytes b_ck_key = Crypto.random_bytes(44);
+            MessageHeader b_ck_h; Bytes b_ck_ct;
+            encrypt_transport_key(b, b_ck_key, out b_ck_h, out b_ck_ct);
+            fail_if(b_ck_h.kem_ciphertext == null, "B's checkpoint message");
+
+            Bytes b_next_key = Crypto.random_bytes(44);
+            MessageHeader b_next_h; Bytes b_next_ct;
+            encrypt_transport_key(b, b_next_key, out b_next_h, out b_next_ct);
+
+            // ── Delivery, deliberately out of order in the A->B direction ────────
+            // A's successor arrives FIRST and must be deferred, untouched.
+            string b_before = b.serialize();
+            bool deferred = false;
+            try {
+                decrypt_transport_key(b, a_next_h, a_next_ct);
+            } catch (PairwiseSessionError.CHECKPOINT_DEFERRED de) {
+                deferred = true;
+            }
+            fail_if_not(deferred, "the overtaking message must be deferred");
+            fail_if_not_eq_str(b_before, b.serialize(), "deferral must not touch state");
+
+            // B->A is delivered in order.
+            Bytes a_got_ck = decrypt_transport_key(a.state, b_ck_h, b_ck_ct);
+            fail_if_not_eq_uint8_arr(bytes_to_array(b_ck_key), bytes_to_array(a_got_ck), "A reads B's checkpoint");
+            Bytes a_got_next = decrypt_transport_key(a.state, b_next_h, b_next_ct);
+            fail_if_not_eq_uint8_arr(bytes_to_array(b_next_key), bytes_to_array(a_got_next), "A reads B's successor");
+
+            // A's checkpoint finally lands, then the drained successor.
+            Bytes b_got_ck = decrypt_transport_key(b, a_ck_h, a_ck_ct);
+            fail_if_not_eq_uint8_arr(bytes_to_array(a_ck_key), bytes_to_array(b_got_ck), "B reads A's checkpoint");
+            Bytes b_got_next = decrypt_transport_key(b, a_next_h, a_next_ct);
+            fail_if_not_eq_uint8_arr(bytes_to_array(a_next_key), bytes_to_array(b_got_next),
+                "the deferred successor must decrypt once the checkpoint has been applied");
+
+            // ── The load-bearing assertion: accumulators agree PAIRWISE ─────────
+            fail_if_not_eq_str(Base64.encode(bytes_to_array(a.state.kem_history_send)),
+                Base64.encode(bytes_to_array(b.kem_history_recv)),
+                "A->B: A.kem_history_send must equal B.kem_history_recv");
+            fail_if_not_eq_str(Base64.encode(bytes_to_array(b.kem_history_send)),
+                Base64.encode(bytes_to_array(a.state.kem_history_recv)),
+                "B->A: B.kem_history_send must equal A.kem_history_recv");
+            // ...and the two DIRECTIONS must not have been conflated into one value.
+            fail_if(Base64.encode(bytes_to_array(a.state.kem_history_send))
+                    == Base64.encode(bytes_to_array(a.state.kem_history_recv)),
+                "the two accumulators must be independent, not a single shared value");
+
+            // ── A DH ratchet in each direction must still decrypt ───────────────
+            Bytes a_dh_before = a.state.sending_dh_pub;
+            roundtrip(a.state, b);      // B ratchets on A's (already-current) chain
+            Bytes b_dh_before = b.sending_dh_pub;
+            roundtrip(b, a.state);      // A ratchets onto B's new DH
+            fail_if(Base64.encode(bytes_to_array(a_dh_before))
+                    == Base64.encode(bytes_to_array(a.state.sending_dh_pub)),
+                "A must have performed a DH ratchet");
+            roundtrip(a.state, b);      // B ratchets onto A's new DH
+            fail_if(Base64.encode(bytes_to_array(b_dh_before))
+                    == Base64.encode(bytes_to_array(b.sending_dh_pub)),
+                "B must have performed a DH ratchet");
+            roundtrip(b, a.state);
+        } catch (Error e) {
+            fail_if_reached(e.message);
+        }
+    }
+
+    // Ordering is fixed and MUST be: DH ratchet step FIRST, then this message's
+    // checkpoint mix — on both the send and the receive path. A checkpoint riding on
+    // a ratchet-bearing message therefore does not affect that message's own ratchet
+    // derivation on either side.
+    //
+    // The check is not cosmetic: the ratchet consumes dh_out || KEMHistory, so a
+    // receiver that folded the message's own checkpoint into kemHistoryRecv BEFORE
+    // ratcheting would derive a different root and chain key than the sender, which
+    // ratcheted before its checkpoint. The message would simply not decrypt, and the
+    // session would be dead from that point on.
+    private void test_ratchet_precedes_checkpoint_mix() {
+        try {
+            TestIdentity alice = new TestIdentity();
+            TestIdentity bob = new TestIdentity();
+            SessionBootstrap a;
+            SessionState b;
+            establish(alice, bob, out a, out b);
+
+            roundtrip(a.state, b);
+            roundtrip(b, a.state);   // Alice now holds a fresh send chain (she ratcheted)
+
+            Bytes send_hist_before = a.state.kem_history_send;
+            Bytes recv_hist_before = b.kem_history_recv;
+            Bytes a_dh_at_send = a.state.sending_dh_pub;
+
+            // The next Alice→Bob message is BOTH ratchet-bearing (Bob has not seen
+            // this DH public yet) and checkpoint-bearing.
+            a.state.last_checkpoint_time = 0;
+            Bytes key = Crypto.random_bytes(44);
+            MessageHeader h; Bytes ct;
+            encrypt_transport_key(a.state, key, out h, out ct);
+            fail_if(h.kem_ciphertext == null, "the message must carry a checkpoint");
+            fail_if_not_eq_str(Base64.encode(bytes_to_array(h.dh_pub)),
+                Base64.encode(bytes_to_array(a_dh_at_send)),
+                "the message must carry the DH public Bob has not ratcheted onto yet");
+            fail_if_not(h.ckpt_n == CKPT_NONE,
+                "a checkpoint on a fresh send chain must advertise CkptN = 0xFFFFFFFF,"
+                + " i.e. NOT its own checkpoint");
+            // Send side: the checkpoint mix advanced kemHistorySend, but only AFTER
+            // the chain this message rides on was already derived.
+            fail_if(Base64.encode(bytes_to_array(send_hist_before))
+                    == Base64.encode(bytes_to_array(a.state.kem_history_send)),
+                "the outgoing checkpoint must have folded kemHistorySend");
+
+            // Receive side: Bob ratchets, THEN mixes. If the order were reversed the
+            // ratchet would consume a different accumulator and this would not decrypt.
+            Bytes got = decrypt_transport_key(b, h, ct);
+            fail_if_not_eq_uint8_arr(bytes_to_array(key), bytes_to_array(got),
+                "a checkpoint riding on a ratchet-bearing message must decrypt");
+            fail_if(Base64.encode(bytes_to_array(recv_hist_before))
+                    == Base64.encode(bytes_to_array(b.kem_history_recv)),
+                "the incoming checkpoint must have folded kemHistoryRecv");
+            fail_if_not_eq_str(Base64.encode(bytes_to_array(a.state.kem_history_send)),
+                Base64.encode(bytes_to_array(b.kem_history_recv)),
+                "both sides must have folded the same value for this direction");
+
+            // The chain keeps working on both sides afterwards.
+            roundtrip(a.state, b);
+            roundtrip(b, a.state);
+        } catch (Error e) {
+            fail_if_reached(e.message);
+        }
+    }
+
+    // ---------------------------------------------------------------- D1 -----
+
+    // The signing input is cross-client wire, so pin it byte-for-byte:
+    //   "X3DHPQ-PreKeySig-v1\x00" (20) | uint8 type | uint32 id | uint16 len | pub
+    private void test_prekey_sig_input_kat() {
+        uint8[] pub = new uint8[32];
+        for (int i = 0; i < 32; i++) pub[i] = (uint8) i;
+        uint8[] got = prekey_sig_input(PREKEY_TYPE_SPK, 0x01020304, new Bytes(pub));
+        string want = "5833444850512d5072654b65795369672d763100"   // label + NUL
+             + "01"                                          // key_type
+             + "01020304"                                    // key_id
+             + "0020"                                        // pub_len = 32
+             + "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        fail_if_not_eq_uint8_arr(hex_to_bin(want), got, "pre-key signing input is not the pinned encoding");
+        fail_if_not_eq_int(got.length, 20 + 1 + 4 + 2 + 32, "pre-key signing input length");
+    }
+
+    // A signature made the OLD way — Ed25519/ML-DSA over the naked public key —
+    // must no longer verify. That signature says nothing about which slot or id the
+    // key was advertised under, which is exactly what let a relay relabel it.
+    private void test_bundle_rejects_legacy_naked_key_signature() {
+        try {
+            TestIdentity bob = new TestIdentity();
+            PeerBundle legacy_spk = bob.to_peer_bundle();
+            legacy_spk.signed_pre_key_signature_base64 =
+                Pairwise.bytes_b64(Crypto.ed25519_sign(bob.dik_priv_ed25519, bob.spk_pub_x25519));
+            fail_if(legacy_spk.verify(), "SPK signed over the naked key must not verify");
+
+            PeerBundle legacy_kem = bob.to_peer_bundle();
+            legacy_kem.kem_pre_keys[0].signature_ed25519_base64 =
+                Pairwise.bytes_b64(Crypto.ed25519_sign(bob.dik_priv_ed25519, bob.kem_pub));
+            legacy_kem.kem_pre_keys[0].signature_mldsa_base64 =
+                Pairwise.bytes_b64(Crypto.mldsa65_sign(bob.dik_priv_mldsa, bob.kem_pub));
+            fail_if(legacy_kem.verify(), "KEM pre-key signed over the naked key must not verify");
+        } catch (Error e) {
+            fail_if_reached(e.message);
+        }
+    }
+
+    // Taking a validly signed key and re-advertising it under a DIFFERENT id must
+    // fail: the id is inside the signed input now.
+    private void test_bundle_rejects_relabelled_prekey_id() {
+        try {
+            TestIdentity bob = new TestIdentity();
+
+            PeerBundle relabelled_spk = bob.to_peer_bundle();
+            fail_if_not(relabelled_spk.verify(), "control: an untouched bundle must verify");
+            relabelled_spk.signed_pre_key_id = bob.spk_id + 1;
+            fail_if(relabelled_spk.verify(), "SPK re-advertised under a different id must not verify");
+
+            PeerBundle relabelled_kem = bob.to_peer_bundle();
+            relabelled_kem.kem_pre_keys[0].id = bob.kem_id + 1;
+            fail_if(relabelled_kem.verify(), "KEM pre-key re-advertised under a different id must not verify");
+
+            // Type confusion: an SPK signature replayed into a KEM slot (and vice
+            // versa) must fail even when the id happens to line up.
+            PeerBundle swapped = bob.to_peer_bundle();
+            swapped.signed_pre_key_signature_base64 = Pairwise.bytes_b64(
+                Crypto.ed25519_sign(bob.dik_priv_ed25519,
+                    prekey_sig_message(PREKEY_TYPE_KEM, bob.spk_id, bob.spk_pub_x25519)));
+            fail_if(swapped.verify(), "SPK signed under the KEM key type must not verify");
+        } catch (Error e) {
+            fail_if_reached(e.message);
+        }
+    }
+
+    // ---------------------------------------------------------------- D2 -----
+
+    // Crossed checkpoints. Alice and Bob each emit a checkpoint before receiving the
+    // other's, so with ONE shared accumulator Alice folds (A, then B) and Bob folds
+    // (B, then A). The fold is not commutative, so the two accumulators diverge and
+    // the next DH ratchet — which consumes dh_out || KEMHistory — derives different
+    // root keys on the two sides. With one accumulator per DIRECTION there is
+    // nothing to reorder, and both directions keep working.
+    private void test_crossed_checkpoints_then_ratchet_both_ways() {
+        try {
+            TestIdentity alice = new TestIdentity();
+            TestIdentity bob = new TestIdentity();
+            SessionBootstrap a;
+            SessionState b;
+            establish(alice, bob, out a, out b);
+
+            // Bootstrap both directions so each side knows the other's KEM pub
+            // (required before either can checkpoint).
+            roundtrip(a.state, b);
+            roundtrip(b, a.state);
+
+            // Force BOTH sides to checkpoint on their next send.
+            a.state.last_checkpoint_time = 0;
+            b.last_checkpoint_time = 0;
+
+            Bytes a_key = Crypto.random_bytes(44);
+            MessageHeader a_h; Bytes a_ct;
+            encrypt_transport_key(a.state, a_key, out a_h, out a_ct);
+            fail_if(a_h.kem_ciphertext == null, "Alice's message must carry a checkpoint");
+
+            Bytes b_key = Crypto.random_bytes(44);
+            MessageHeader b_h; Bytes b_ct;
+            encrypt_transport_key(b, b_key, out b_h, out b_ct);
+            fail_if(b_h.kem_ciphertext == null, "Bob's message must carry a checkpoint");
+
+            // Both cross on the wire and are delivered.
+            Bytes b_got = decrypt_transport_key(b, a_h, a_ct);
+            fail_if_not_eq_uint8_arr(bytes_to_array(a_key), bytes_to_array(b_got), "Bob could not read Alice's checkpoint message");
+            Bytes a_got = decrypt_transport_key(a.state, b_h, b_ct);
+            fail_if_not_eq_uint8_arr(bytes_to_array(b_key), bytes_to_array(a_got), "Alice could not read Bob's checkpoint message");
+
+            // The accumulators must agree PER DIRECTION, which is what the next
+            // ratchet in each direction depends on.
+            fail_if_not_eq_str(Base64.encode(bytes_to_array(a.state.kem_history_send)),
+                Base64.encode(bytes_to_array(b.kem_history_recv)),
+                "A->B stream: Alice's send accumulator must equal Bob's recv accumulator");
+            fail_if_not_eq_str(Base64.encode(bytes_to_array(b.kem_history_send)),
+                Base64.encode(bytes_to_array(a.state.kem_history_recv)),
+                "B->A stream: Bob's send accumulator must equal Alice's recv accumulator");
+
+            // A DH ratchet in each direction must still decrypt. The ratchet folds
+            // the accumulator of the chain it derives, so a divergence shows here.
+            roundtrip(a.state, b);
+            roundtrip(b, a.state);
+            roundtrip(a.state, b);
+        } catch (Error e) {
+            fail_if_reached(e.message);
+        }
+    }
+
+    // A blob written before the KEMHistory split must be DISCARDED, not migrated:
+    // there is no way to know which direction's stream the single accumulator
+    // folded, and guessing derives wrong root keys at the next ratchet.
+    private void test_legacy_session_blob_is_discarded() {
+        string legacy = ""
+            + "rk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+            + "chain_send_key=\n"
+            + "chain_recv_key=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+            + "sending_dh_pub=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+            + "sending_dh_priv=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+            + "remote_dh_pub=\n"
+            + "send_count=0\nrecv_count=0\nprev_send_count=0\n"
+            + "kem_send_pub=\nkem_recv_priv=\nkem_recv_pub=\n"
+            + "kem_since_checkpoint=0\nlast_checkpoint_time=0\n"
+            + "ad=AAA=\n"
+            + "kem_history=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n";
+        fail_if(SessionState.deserialize(legacy) != null,
+            "a pre-split session blob must be rejected so the session renegotiates");
+    }
+
+    // ---------------------------------------------------------------- D3 -----
+
+    // The header is cross-client wire: pin the six-field encoding, and prove that a
+    // header ending after five fields is rejected (without CkptN the receiver cannot
+    // detect a missing checkpoint transition at all).
+    private void test_header_kat_and_five_field_rejection() {
+        MessageHeader h = new MessageHeader();
+        uint8[] dh = new uint8[32];
+        for (int i = 0; i < 32; i++) dh[i] = 0xAB;
+        h.dh_pub = new Bytes(dh);
+        h.prev_chain_len = 3;
+        h.n = 7;
+        h.kem_ciphertext = null;
+        h.kem_pub_for_reply = null;
+        h.ckpt_n = 5;
+
+        string want = "00000020"
+            + "abababababababababababababababababababababababababababababababab"
+            + "0000000400000003"   // prev_chain_len
+            + "0000000400000007"   // n
+            + "00000000"           // kem_ciphertext absent
+            + "00000000"           // kem_pub_for_reply absent
+            + "0000000400000005";  // CkptN
+        uint8[] marshalled = bytes_to_array(h.marshal());
+        fail_if_not_eq_uint8_arr(hex_to_bin(want), marshalled, "MessageHeader v6-field encoding mismatch");
+
+        MessageHeader? round = MessageHeader.unmarshal(new Bytes(marshalled));
+        fail_if(round == null, "six-field header must unmarshal");
+        fail_if_not_eq_int((int) ((!) round).ckpt_n, 5, "CkptN did not round-trip");
+
+        // The same header truncated to five fields: MUST be rejected.
+        uint8[] five = hex_to_bin(want.substring(0, want.length - 16));
+        fail_if(MessageHeader.unmarshal(new Bytes(five)) != null,
+            "a header that ends after five fields must be rejected");
+
+        // CKPT_NONE must round-trip as 0xFFFFFFFF, not be normalised away.
+        MessageHeader none = new MessageHeader();
+        none.dh_pub = new Bytes(dh);
+        MessageHeader? none_round = MessageHeader.unmarshal(none.marshal());
+        fail_if(none_round == null, "default header must unmarshal");
+        fail_if_not(((!) none_round).ckpt_n == CKPT_NONE, "default CkptN must be 0xFFFFFFFF");
+    }
+
+    // Message N+1 (post-checkpoint) overtakes checkpoint-bearing message N.
+    //
+    // Pre-fix, the receiver had no way to know a STATE TRANSITION was missing: it
+    // advanced the pre-checkpoint chain and derived the wrong key, and the
+    // skipped-key cache could not help. Now N+1 is deferred with state untouched,
+    // and decrypts once N arrives.
+    private void test_checkpoint_overtake_defers_then_recovers() {
+        try {
+            TestIdentity alice = new TestIdentity();
+            TestIdentity bob = new TestIdentity();
+            SessionBootstrap a;
+            SessionState b;
+            establish(alice, bob, out a, out b);
+
+            roundtrip(a.state, b);      // A->B
+            roundtrip(b, a.state);      // B->A, so Alice learns Bob's KEM pub
+
+            // Alice checkpoints on message N, then sends N+1 on the post-checkpoint chain.
+            a.state.last_checkpoint_time = 0;
+            Bytes n_key = Crypto.random_bytes(44);
+            MessageHeader n_h; Bytes n_ct;
+            encrypt_transport_key(a.state, n_key, out n_h, out n_ct);
+            fail_if(n_h.kem_ciphertext == null, "message N must carry the checkpoint");
+            fail_if_not(n_h.ckpt_n == CKPT_NONE,
+                "the checkpoint-bearing message must advertise the value from BEFORE its own checkpoint");
+
+            Bytes n1_key = Crypto.random_bytes(44);
+            MessageHeader n1_h; Bytes n1_ct;
+            encrypt_transport_key(a.state, n1_key, out n1_h, out n1_ct);
+            fail_if_not(n1_h.ckpt_n == n_h.n,
+                "the next message must advertise the index the checkpoint was applied at");
+
+            string before = b.serialize();
+
+            // N+1 arrives first: deferred, and the ratchet must be untouched.
+            bool deferred = false;
+            try {
+                decrypt_transport_key(b, n1_h, n1_ct);
+            } catch (PairwiseSessionError.CHECKPOINT_DEFERRED de) {
+                deferred = true;
+            }
+            fail_if_not(deferred, "a message that overtook a checkpoint must be deferred");
+            fail_if_not_eq_str(before, b.serialize(), "deferral must not touch ratchet state");
+
+            // N arrives and applies the checkpoint.
+            Bytes got_n = decrypt_transport_key(b, n_h, n_ct);
+            fail_if_not_eq_uint8_arr(bytes_to_array(n_key), bytes_to_array(got_n), "checkpoint message must decrypt");
+
+            // The drained N+1 now decrypts.
+            Bytes got_n1 = decrypt_transport_key(b, n1_h, n1_ct);
+            fail_if_not_eq_uint8_arr(bytes_to_array(n1_key), bytes_to_array(got_n1),
+                "the deferred message must decrypt once the checkpoint transition has been applied");
+        } catch (Error e) {
+            fail_if_reached(e.message);
+        }
+    }
+
+    // D3.5: a message that fails authentication must leave chain keys, recv_ckpt_n,
+    // both accumulators and the skipped-key cache exactly as they were. Asserted on
+    // the full serialized state, which is the digest of everything decryption
+    // touches.
+    private void test_failed_auth_leaves_state_unchanged() {
+        try {
+            TestIdentity alice = new TestIdentity();
+            TestIdentity bob = new TestIdentity();
+            SessionBootstrap a;
+            SessionState b;
+            establish(alice, bob, out a, out b);
+
+            roundtrip(a.state, b);
+
+            Bytes key = Crypto.random_bytes(44);
+            MessageHeader h; Bytes ct;
+            encrypt_transport_key(a.state, key, out h, out ct);
+
+            // Flip a bit in the ciphertext so the GCM tag fails.
+            uint8[] tampered = bytes_to_array(ct);
+            tampered[0] = tampered[0] ^ 0x01;
+
+            string before = b.serialize();
+            bool threw = false;
+            try {
+                decrypt_transport_key(b, h, new Bytes(tampered));
+            } catch (Error e) {
+                threw = true;
+            }
+            fail_if_not(threw, "a tampered ciphertext must not decrypt");
+            fail_if_not_eq_str(before, b.serialize(),
+                "a message that fails authentication must leave ratchet state unchanged");
+
+            // And the genuine message must still decrypt afterwards.
+            Bytes got = decrypt_transport_key(b, h, ct);
+            fail_if_not_eq_uint8_arr(bytes_to_array(key), bytes_to_array(got),
+                "the genuine message must still decrypt after a forgery attempt");
+        } catch (Error e) {
+            fail_if_reached(e.message);
+        }
+    }
+
+    // ------------------------------------------------------------- helpers ---
+
+    private void establish(TestIdentity alice, TestIdentity bob,
+                           out SessionBootstrap a, out SessionState b) throws Error {
+        PeerBundle peer_bundle = bob.to_peer_bundle();
+        a = initiate_session(alice.dik_priv_x25519, alice.dik_pub_x25519, peer_bundle);
+        b = respond_session(
+            bob.dik_priv_x25519, bob.dik_pub_x25519,
+            bob.spk_priv_x25519, bob.spk_pub_x25519,
+            bob.opk_priv_x25519, bob.kem_priv,
+            alice.device_certificate, alice.aik_pub_ed25519, alice.aik_pub_mldsa,
+            a.prekey_ephemeral_pub, a.kem_ciphertext);
+    }
+
+    private void roundtrip(SessionState from, SessionState to) throws Error {
+        Bytes k = Crypto.random_bytes(44);
+        MessageHeader h; Bytes ct;
+        encrypt_transport_key(from, k, out h, out ct);
+        Bytes got = decrypt_transport_key(to, h, ct);
+        fail_if_not_eq_uint8_arr(bytes_to_array(k), bytes_to_array(got), "roundtrip transport key mismatch");
     }
 
     // A KEM pre-key signed by a foreign key (not the bundle's DIK) MUST be
@@ -124,9 +618,59 @@ class Pairwise : Gee.TestCase {
     // divergence could only live in something crossing the boundary — the chain KDF,
     // the AAD, or the header encoding. This asserts THIS implementation derives the
     // same message keys the other one used. No DH ratchet here; see the companion test.
+    // Cross-implementation vector, same chain.
+    //
+    // The receiving session state below is PQonversations' CrossVectorGeneratorTest
+    // fixture, carried forward unchanged apart from the two per-direction
+    // accumulators and the two checkpoint indices D2/D3 introduced. The message
+    // bytes had to be re-derived: D3.1 appends CkptN to the header, and the header
+    // is part of the AAD, so the original ciphertexts can no longer authenticate.
+    //
+    // They are re-derived DETERMINISTICALLY from the same fixture — the peer's send
+    // chain IS this state's recv chain, so mirroring it reproduces exactly what the
+    // other implementation would emit — and then pinned, so the vector stays a
+    // cross-client KAT rather than a self-consistency check.
     private void test_cross_vector_from_pqonversations() {
         try {
-            string blob = ""
+            SessionState? st = SessionState.deserialize(cross_vector_blob());
+            fail_if(st == null, "could not load the cross-vector session state");
+
+            // Mirror the peer's sending half of this same chain.
+            SessionState peer = new SessionState();
+            peer.rk = ((!) st).rk;
+            peer.chain_send_key = ((!) st).chain_recv_key;
+            peer.chain_recv_key = null;
+            peer.sending_dh_pub = (!) ((!) st).remote_dh_pub;
+            peer.sending_dh_priv = new Bytes(new uint8[32]);
+            peer.remote_dh_pub = null;
+            peer.send_count = ((!) st).recv_count;
+            peer.recv_count = 0;
+            peer.prev_send_count = 0;
+            peer.kem_since_checkpoint = 0;
+            peer.last_checkpoint_time = 0;
+            peer.ad = ((!) st).ad;
+            peer.kem_history_send = new Bytes(new uint8[32]);
+            peer.kem_history_recv = new Bytes(new uint8[32]);
+            peer.send_ckpt_n = CKPT_NONE;
+            peer.recv_ckpt_n = CKPT_NONE;
+
+            check_pinned_message(peer, (!) st,
+                "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+                "000000204fda7cc29346c2fab2d57cf44e63d578622148a3c13f715f260dd09e893ebf4f00000004000000000000000400000001000000000000000000000004ffffffff",
+                "4c83931b8c6f519b0bfe486044b9d05e2c71d0075b202f50192ff8d074d9f5063b7050a890f62bb7ff6c39218ed5a82dfd296d913e2adddd5068b4eb",
+                "msg1");
+            check_pinned_message(peer, (!) st,
+                "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+                "000000204fda7cc29346c2fab2d57cf44e63d578622148a3c13f715f260dd09e893ebf4f00000004000000000000000400000002000000000000000000000004ffffffff",
+                "840925e301560f289475e0c445eadd4a1f30f5bf00435c5a073bb0af2a18e2a7e41aeccb8ca41a69d38fb4a3c111adbe9dcc6cf505a542a7494eb7d8",
+                "msg2");
+        } catch (Error e) {
+            fail_if_reached(e.message);
+        }
+    }
+
+    private static string cross_vector_blob() {
+        return ""
             + "rk=BMiHjdKK7qH1ygGpNigfUw4iDcVrbRahiQSV/0qZHlU=\n"
             + "chain_send_key=\n"
             + "chain_recv_key=3DbaBA2d9n+2y/D1VhagoVTAaJ3/V6chER7ntRcinLM=\n"
@@ -142,17 +686,26 @@ class Pairwise : Gee.TestCase {
             + "kem_since_checkpoint=0\n"
             + "last_checkpoint_time=0\n"
             + "ad=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==\n"
-            + "kem_history=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
-            ;
-            SessionState? st = SessionState.deserialize(blob);
-            fail_if(st == null, "could not load the cross-vector session state");
-            check_cross_vector_message((!) st, "000000204fda7cc29346c2fab2d57cf44e63d578622148a3c13f715f260dd09e893ebf4f000000040000000000000004000000010000000000000000", "4c83931b8c6f519b0bfe486044b9d05e2c71d0075b202f50192ff8d074d9f5063b7050a890f62bb7ff6c3921ad4cff0ddf33eba31c585ccf2c34d69e", "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1", "msg1");
-            check_cross_vector_message((!) st, "000000204fda7cc29346c2fab2d57cf44e63d578622148a3c13f715f260dd09e893ebf4f000000040000000000000004000000020000000000000000", "840925e301560f289475e0c445eadd4a1f30f5bf00435c5a073bb0af2a18e2a7e41aeccb8ca41a69d38fb4a3fa7226707d1155996ecc3f2a791d725d", "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2", "msg2");
-        } catch (Error e) {
-            fail_if_reached(e.message);
-        }
+            + "kem_history_send=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+            + "kem_history_recv=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+            + "send_ckpt_n=4294967295\n"
+            + "recv_ckpt_n=4294967295\n";
     }
 
+    // Cross-implementation vector across a DH RATCHET STEP.
+    //
+    // Companion to the same-chain vector above, which proves only that the symmetric
+    // half agrees. This one loads the receiver state captured BEFORE the peer minted
+    // a new sending DH and decrypts a message bearing that new key, so it exercises
+    // dh_ratchet_step — and, after D2, specifically that step 1 of the ratchet folds
+    // kemHistoryRECV. If the two implementations disagree on which accumulator that
+    // step consumes, this is where it shows.
+    //
+    // The canned message bytes could NOT be carried forward: the header now includes
+    // CkptN and is covered by the AAD, and re-deriving a ratchet message needs the
+    // generator's ephemeral private key, which the fixture never contained. The peer
+    // side is therefore reconstructed with new_sending_state() against the fixture's
+    // rk and DH public — identical inputs, freshly minted ephemeral.
     private void test_cross_vector_ratchet_from_pqonversations() {
         try {
             string blob = ""
@@ -171,14 +724,47 @@ class Pairwise : Gee.TestCase {
             + "kem_since_checkpoint=1\n"
             + "last_checkpoint_time=0\n"
             + "ad=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==\n"
-            + "kem_history=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+            + "kem_history_send=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+            + "kem_history_recv=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+            + "send_ckpt_n=4294967295\n"
+            + "recv_ckpt_n=4294967295\n"
             ;
             SessionState? st = SessionState.deserialize(blob);
             fail_if(st == null, "could not load the ratchet cross-vector session state");
-            check_cross_vector_message((!) st, "0000002054c90785341bc0b756c1d06570ced5b5975dea1498f1855c3c29544071998a57000000040000000300000004000000000000000000000000", "f5a6886c0144e6e7a6ac61df68a08f0db8c6c05cf92ef4b9b65570fc7457055bc52b954c73b7e56c1250aa054596d83e90e424d5ca7cce72f6b209b0", "e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4", "ratchet");
+
+            // Root material: only the first 32 bytes (the root key) are consumed.
+            uint8[] root = new uint8[64];
+            uint8[] rk = bytes_to_array(((!) st).rk);
+            Memory.copy(root, rk, 32);
+            SessionState peer = new_sending_state(new Bytes(root),
+                bytes_to_array(((!) st).ad), ((!) st).sending_dh_pub);
+
+            Bytes k = Crypto.random_bytes(44);
+            MessageHeader h; Bytes ct;
+            encrypt_transport_key(peer, k, out h, out ct);
+            fail_if_not(h.ckpt_n == CKPT_NONE, "a fresh send chain must advertise CkptN = 0xFFFFFFFF");
+            Bytes got = decrypt_transport_key((!) st, h, ct);
+            fail_if_not_eq_uint8_arr(bytes_to_array(k), bytes_to_array(got),
+                "message across a DH ratchet step must decrypt");
         } catch (Error e) {
             fail_if_reached(e.message);
         }
+    }
+
+    // Encrypt `want_hex` from `sender`, assert the resulting header/ciphertext match
+    // the pinned cross-client bytes, then assert `receiver` decrypts them back.
+    private void check_pinned_message(SessionState sender, SessionState receiver, string want_hex,
+                                      string hdr_hex, string ct_hex, string label) throws Error {
+        MessageHeader h;
+        Bytes ct;
+        encrypt_transport_key(sender, new Bytes(hex_to_bin(want_hex)), out h, out ct);
+        fail_if_not_eq_uint8_arr(hex_to_bin(hdr_hex), bytes_to_array(h.marshal()),
+            label + ": header bytes differ from the pinned cross-client vector");
+        fail_if_not_eq_uint8_arr(hex_to_bin(ct_hex), bytes_to_array(ct),
+            label + ": ciphertext differs from the pinned cross-client vector");
+        Bytes got = decrypt_transport_key(receiver, h, ct);
+        fail_if_not_eq_uint8_arr(hex_to_bin(want_hex), bytes_to_array(got),
+            label + ": decrypted transport key does not match");
     }
 
     private void check_cross_vector_message(SessionState st, string hdr_hex, string ct_hex,
@@ -423,7 +1009,7 @@ private static uint8[] join_arrays(uint8[] a, uint8[] b) {
         public Bytes opk_pub_x25519;
         public Bytes opk_priv_x25519;
         public uint32 opk_id = 1;
-        public uint32 kem_id = 1;
+        public uint32 kem_id = 7;
 
         public TestIdentity() throws Error {
             Crypto.generate_ed25519(out aik_pub_ed25519, out aik_priv_ed25519);
@@ -433,10 +1019,14 @@ private static uint8[] join_arrays(uint8[] a, uint8[] b) {
             Crypto.generate_mldsa65(out dik_pub_mldsa, out dik_priv_mldsa);
             device_certificate = DeviceCertificate.issue(1, dik_pub_ed25519, dik_pub_x25519, dik_pub_mldsa, aik_priv_ed25519, aik_priv_mldsa, 1);
             Crypto.generate_x25519(out spk_pub_x25519, out spk_priv_x25519);
-            spk_signature_ed25519 = Crypto.ed25519_sign(dik_priv_ed25519, spk_pub_x25519);
+            // D1: sign the domain-separated input, not the naked key.
+            spk_signature_ed25519 = Crypto.ed25519_sign(dik_priv_ed25519,
+                prekey_sig_message(PREKEY_TYPE_SPK, spk_id, spk_pub_x25519));
             Crypto.generate_mlkem768(out kem_pub, out kem_priv);
-            kem_signature_ed25519 = Crypto.ed25519_sign(dik_priv_ed25519, kem_pub);
-            kem_signature_mldsa = Crypto.mldsa65_sign(dik_priv_mldsa, kem_pub);
+            kem_signature_ed25519 = Crypto.ed25519_sign(dik_priv_ed25519,
+                prekey_sig_message(PREKEY_TYPE_KEM, kem_id, kem_pub));
+            kem_signature_mldsa = Crypto.mldsa65_sign(dik_priv_mldsa,
+                prekey_sig_message(PREKEY_TYPE_KEM, kem_id, kem_pub));
             Crypto.generate_x25519(out opk_pub_x25519, out opk_priv_x25519);
         }
 

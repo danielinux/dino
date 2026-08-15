@@ -1,18 +1,33 @@
 // Group message header and AEAD helpers matching groupmsg.go wire format.
-// Header is exactly 14 bytes: uint16 version | uint32 epoch | uint32 sender_device_id | uint32 chain_index (all BE).
-// Nonce: "GMSG" || epoch(4 BE) || chain_index(4 BE) = 12 bytes.
-// AAD: header.marshal() || room_jid_utf8.
+//
+// D5.2 — header is VERSION 2, exactly 22 bytes (was 14):
+//   uint16 version (= 2) | uint32 epoch | uint32 sender_device_id
+//   | uint32 chain_index | uint64 epoch_id       (all BE)
+//
+// Nonce derivation is UNCHANGED: "GMSG" || epoch(4 BE) || chain_index(4 BE).
+// AAD is still the marshalled header (now 22 bytes) || roomJID || heads tag.
+//
+// epoch_id exists because canonical DAG order has unstable prefixes: a late
+// concurrent entry can change whether an EARLIER entry was authorized, and the
+// numeric epoch (a count of authorized rotations) can be unchanged across that
+// reversal. Install-once forbids reusing an epoch number for a different chain,
+// so without a fold-derived discriminator a contradicted epoch has no recovery
+// path at all. Binding the fold into the epoch's identity gives one.
 
 namespace Dino.Plugins.X3dhpq.Protocol {
 
 public class GroupMessageHeader : Object {
-    public uint16 version { get; set; default = 1; }
+    public const int MARSHALLED_LENGTH = 22;
+
+    public uint16 version { get; set; default = 2; }
     public uint32 epoch { get; set; }
     public uint32 sender_device_id { get; set; }
     public uint32 chain_index { get; set; }
+    // D5.1: SHA-256("X3DHPQ-EpochId-v1\0" || len||roomJID || epoch || fold_hash)[0..8]
+    public uint64 epoch_id { get; set; }
 
     public uint8[] marshal() {
-        uint8[] buf = new uint8[14];
+        uint8[] buf = new uint8[MARSHALLED_LENGTH];
         buf[0] = (uint8)(version >> 8);
         buf[1] = (uint8) version;
         buf[2] = (uint8)(epoch >> 24);
@@ -27,19 +42,45 @@ public class GroupMessageHeader : Object {
         buf[11] = (uint8)(chain_index >> 16);
         buf[12] = (uint8)(chain_index >> 8);
         buf[13] = (uint8) chain_index;
+        for (int i = 0; i < 8; i++) {
+            buf[14 + i] = (uint8)(epoch_id >> ((7 - i) * 8));
+        }
         return buf;
     }
 
     public static GroupMessageHeader? unmarshal(uint8[] b) {
-        if (b.length < 14) return null;
+        if (b.length < MARSHALLED_LENGTH) return null;
         uint16 v = (uint16)(((uint16) b[0] << 8) | b[1]);
-        if (v != 1) return null;
+        /* Version 1 carried no epoch_id, so a v1 message cannot be bound to the fold
+         * it was produced under and the contradiction-recovery path does not exist
+         * for it. Accepting one would reinstate the defect wholesale. */
+        if (v != 2) return null;
         GroupMessageHeader h = new GroupMessageHeader();
         h.version = v;
         h.epoch = uint32_from_bytes(b, 2);
         h.sender_device_id = uint32_from_bytes(b, 6);
         h.chain_index = uint32_from_bytes(b, 10);
+        h.epoch_id = uint64_from_bytes(b, 14);
         return h;
+    }
+
+    // D5.1: epoch_id = SHA-256( "X3DHPQ-EpochId-v1\0"
+    //                        || uint16 room_jid_len || roomJID (UTF-8)
+    //                        || uint32 epoch
+    //                        || fold_hash )[0..8], read as a big-endian uint64.
+    //
+    // The label is assembled with an explicit trailing NUL: Vala's string.data
+    // drops it (C terminator), which would make this derivation one byte of
+    // domain separator short and diverge from every other client.
+    public static uint64 derive_epoch_id(string room_jid, uint32 epoch, uint8[] fold_hash) throws GLib.Error {
+        uint8[] room = string_to_bytes(room_jid);
+        uint8[] input = concat_four_byte_arrays(
+            label_with_nul("X3DHPQ-EpochId-v1"),
+            concat_byte_arrays(uint16_to_bytes((uint16) room.length), room),
+            uint32_to_bytes(epoch),
+            fold_hash);
+        uint8[] digest = bytes_to_uint8_array(global::X3dhpq.Crypto.sha256(new Bytes(input)));
+        return uint64_from_bytes(digest, 0);
     }
 
     // "GMSG" || epoch(4 BE) || chain_index(4 BE)

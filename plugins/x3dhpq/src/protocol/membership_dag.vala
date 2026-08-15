@@ -50,6 +50,17 @@ public enum MemberAuditActionV2 {
     ADD_ADMIN = 7,
     REMOVE_ADMIN = 8,
     SNAPSHOT = 10,
+    /* D4.2 — an account announcing that its own device set changed.
+     * Payload: aik_fp(20) | manifest_version(uint64).
+     *
+     * Group membership is at ACCOUNT-AIK level while sender chains go to individual
+     * DEVICES, so revoking one device from an account's Trust Manifest leaves that
+     * account a room member and nothing rotates — while the revoked device still
+     * holds every other member's current sender chain key and its own per-epoch
+     * signing key. This entry is what turns a device-set change into a room epoch
+     * rotation, which is what actually severs the revoked device: the fresh chain
+     * key and signing keypair are distributed only to currently authorized devices. */
+    DEVICE_SET_CHANGE = 11,
 }
 
 // Resolve a signer's AIK public keys from its raw-hex fingerprint. Returns false
@@ -62,6 +73,30 @@ public delegate bool AikResolver(string signer_fp_hex, out Bytes ed, out Bytes m
  * phone keeps a valid DC (and, under §11.8, the account root), so without this it could keep
  * administering rooms forever. */
 public delegate bool DeviceRevocationChecker(string signer_fp_hex, uint32 device_id);
+
+/* D6 (§13.1a.0 step 5) — verdict on whether an entry's ISSUING DEVICE may author
+ * journal entries for its account. */
+public enum IssuerAuthStatus {
+    /* The device appears in a Trust Manifest fold this receiver accepted and is not
+     * tombstoned. Fold the entry. */
+    AUTHORIZED,
+    /* We hold manifest history for that account and this device id never appeared in
+     * it, or it is tombstoned. Reject: this is the forged-DC case — AIK_priv is
+     * replicated to every authorized device (§11.8), so a device revoked as id 42 can
+     * mint a fresh DIK, pick an unseen id and self-sign a valid DC under the stolen
+     * account root. The tombstone on 42 does not cover the new id; "ever appeared in a
+     * manifest we accepted" does. */
+    REJECTED,
+    /* We hold NO manifest for that account yet, so authorization cannot be decided.
+     * The entry is QUARANTINED — kept in the store, not folded, re-evaluated once the
+     * author's manifest arrives. Failing open here would restore the attack; discarding
+     * would let a transient lookup gap permanently erase a room's history. */
+    UNRESOLVED,
+}
+
+/* D6: resolves the issuer verdict above. Returning AUTHORIZED for everything
+ * reproduces the pre-D6 (vulnerable) behaviour, so callers must supply a real one. */
+public delegate IssuerAuthStatus DeviceIssuerChecker(string signer_fp_hex, uint32 device_id);
 
 public static string hex_of(uint8[] b) {
     StringBuilder sb = new StringBuilder();
@@ -260,6 +295,25 @@ public class JournalEntryV2 : Object {
         return payload.length >= 25 && (payload[24] & 0x01) != 0;
     }
 
+    // D4.2 DeviceSetChange payload: aik_fp(20) | manifest_version(uint64 BE).
+    public static uint8[] build_device_set_change_payload(uint8[] fp20, uint64 manifest_version) {
+        uint8[] buf = new uint8[28];
+        Memory.copy(buf, fp20, 20);
+        int off = 20;
+        put_u64(buf, ref off, manifest_version);
+        return buf;
+    }
+
+    public static bool parse_device_set_change_payload(uint8[] p, out uint8[] fp20, out uint64 manifest_version) {
+        fp20 = new uint8[20];
+        manifest_version = 0;
+        if (p.length < 28) return false;
+        Memory.copy(fp20, p, 20);
+        int off = 20;
+        manifest_version = get_u64(p, ref off);
+        return true;
+    }
+
     // v1->v2 bridge Snapshot payload (cross-client contract, big-endian):
     //   owner_fp(20) | epoch(8) | member_count(4) |
     //   member[ fp(20) | is_admin(1) ]* |
@@ -358,6 +412,29 @@ public class DagState : Object {
     public Gee.HashSet<string> banned = new Gee.HashSet<string>();      // fp_hex
     public string? owner_fp = null;                                     // fp_hex
     public uint32 epoch = 0;
+    /* D4.2: highest Trust Manifest version each account has announced through a
+     * DeviceSetChange entry. An entry whose version is NOT GREATER than the recorded
+     * one is accepted but is not rotation-causing, so a replayed entry cannot inflate
+     * the epoch (and, through install-once, burn epoch numbers). */
+    public Gee.HashMap<string, uint64?> device_set_version = new Gee.HashMap<string, uint64?>();
+    /* D5.1: SHA-256 over the concatenation of every ACCEPTED entry_hash in canonical
+     * fold order. Zeroed 32 bytes when nothing folded. */
+    public uint8[] fold_hash = new uint8[32];
+
+    /* D5.1: epoch_id = SHA-256("X3DHPQ-EpochId-v1\0" || len||roomJID || epoch
+     *                          || fold_hash)[0..8] as a big-endian uint64.
+     *
+     * Two folds that differ only by a late concurrent entry produce different
+     * fold_hashes and therefore different epoch_ids even when the numeric epoch is
+     * identical — which is what lets a contradicted epoch be retired and replaced
+     * instead of being permanently unusable under install-once. */
+    public uint64 epoch_id(string room_jid) {
+        try {
+            return GroupMessageHeader.derive_epoch_id(room_jid, epoch, fold_hash);
+        } catch (GLib.Error e) {
+            return 0;
+        }
+    }
 }
 
 public class MembershipDag : Object {
@@ -461,9 +538,20 @@ public class MembershipDag : Object {
 
     public DagState recompute_checked(AikResolver resolver, string? pinned_owner_fp,
                                       DeviceRevocationChecker? revocation_checker) {
+        return recompute_authorized(resolver, pinned_owner_fp, revocation_checker, null);
+    }
+
+    // `issuer_checker` (D6) supersedes `revocation_checker` when supplied: it answers
+    // the stronger question of whether the ISSUING DEVICE has ever appeared in a Trust
+    // Manifest fold this receiver accepted, which "is it tombstoned?" alone cannot.
+    public DagState recompute_authorized(AikResolver resolver, string? pinned_owner_fp,
+                                         DeviceRevocationChecker? revocation_checker,
+                                         DeviceIssuerChecker? issuer_checker) {
         var st = new DagState();
         var order = canonical_order();
         var removal_node = new Gee.HashMap<string, string>();
+        // D5.1: entry_hashes of every ACCEPTED entry, in canonical fold order.
+        var accepted_hashes = new Gee.ArrayList<string>();
         // The genesis is the first entry that actually AUTHENTICATES (and matches the
         // pin), NOT whatever sorts first. Keying it off the raw index made the genesis
         // slot consumable: one entry that sorts first and fails to verify — which costs
@@ -488,6 +576,23 @@ public class MembershipDag : Object {
              * to add, remove and promote members in every room its account administers. */
             if (revocation_checker != null
                     && revocation_checker(signer_hex, e.issuer_device_id)) {
+                continue;
+            }
+
+            /* D6 (§13.1a.0 step 5): the issuing device MUST be in this receiver's
+             * EVER-AUTHORIZED set for the author's account, and MUST NOT be
+             * tombstoned. The verification chain above proves only that the account
+             * AIK certified this device — and AIK_priv is replicated to every
+             * authorized device (§11.8), so a revoked device can mint a fresh DIK,
+             * pick a device id nobody has ever seen, and self-sign a valid DC under
+             * the stolen root. Tombstoning the id it USED to have does not cover the
+             * new one.
+             *
+             * UNRESOLVED (no manifest held for that account) does not fold the entry
+             * either, but the entry stays in the store and is re-evaluated on the
+             * next fold once the manifest arrives — quarantine, not discard. */
+            if (issuer_checker != null
+                    && issuer_checker(signer_hex, e.issuer_device_id) != IssuerAuthStatus.AUTHORIZED) {
                 continue;
             }
 
@@ -528,6 +633,7 @@ public class MembershipDag : Object {
                     }
                     st.epoch = (uint32) sp.epoch;
                     genesis_established = true;
+                    accepted_hashes.add(e.hash_hex());
                     continue;
                 }
                 // A plain genesis: the signer becomes owner. The AIK resolver is seeded
@@ -543,9 +649,18 @@ public class MembershipDag : Object {
                 st.members.add(signer_hex);
                 st.epoch = 0;
                 genesis_established = true;
+                accepted_hashes.add(e.hash_hex());
                 continue;
             }
-            if (!st.admins.contains(signer_hex)) continue;
+
+            /* D4.2 rule 1: a DeviceSetChange speaks only for its author's own device
+             * set, so it needs MEMBERSHIP, not adminship — any member may announce
+             * that its own devices changed. Every other action still requires admin. */
+            if (e.action == (uint8) MemberAuditActionV2.DEVICE_SET_CHANGE) {
+                if (!st.members.contains(signer_hex)) continue;
+            } else if (!st.admins.contains(signer_hex)) {
+                continue;
+            }
 
             /* §13.5: the epoch is a MONOTONE COUNT of accepted rotation-causing entries —
              * never the entry's index in the canonical order.
@@ -568,7 +683,42 @@ public class MembershipDag : Object {
             JournalEntryV2.parse_subject_fp(e.payload, out subject);
             string subj_hex = (e.payload.length >= 20) ? hex_of(subject) : "";
 
-            if (is_rotation_causing(e.action)) {
+            bool rotation_causing = is_rotation_causing(e.action);
+
+            /* D4.2 rules 2–4, evaluated BEFORE the epoch is advanced because whether a
+             * DeviceSetChange rotates depends on its payload and on the recorded
+             * version, not on its action alone. */
+            if (e.action == (uint8) MemberAuditActionV2.DEVICE_SET_CHANGE) {
+                uint8[] claimed_fp;
+                uint64 manifest_version;
+                if (!JournalEntryV2.parse_device_set_change_payload(e.payload, out claimed_fp, out manifest_version)) {
+                    continue;
+                }
+                /* Rule 2: an account speaks only for ITS OWN device set. Any other
+                 * value makes the entry unauthorized — otherwise one member could
+                 * force epoch churn in another member's name. */
+                if (hex_of(claimed_fp).down() != signer_hex.down()) continue;
+                /* Rule 3: not-greater than the recorded version ⇒ accepted (it folds,
+                 * and counts towards fold_hash) but NOT rotation-causing. Replaying an
+                 * old entry must not inflate the epoch: install-once (§13.4a.2) makes
+                 * every burnt epoch number permanently unusable for a real chain. */
+                uint64 recorded = st.device_set_version.has_key(signer_hex)
+                    ? (uint64) st.device_set_version.get(signer_hex) : (uint64) 0;
+                if (manifest_version <= recorded) {
+                    rotation_causing = false;
+                } else {
+                    /* Rule 4: record and rotate, exactly like Add/RemoveMember (§13.5).
+                     * The rotation mints a fresh chain key and a fresh per-epoch signing
+                     * keypair handed only to currently authorized devices — that, not the
+                     * bookkeeping, is what severs the revoked device. */
+                    st.device_set_version.set(signer_hex, manifest_version);
+                    rotation_causing = true;
+                }
+            }
+
+            accepted_hashes.add(e.hash_hex());
+
+            if (rotation_causing) {
                 st.epoch = st.epoch + 1;
             }
 
@@ -601,9 +751,44 @@ public class MembershipDag : Object {
                     break;
                 case (uint8) MemberAuditActionV2.SNAPSHOT:
                     break;
+                case (uint8) MemberAuditActionV2.DEVICE_SET_CHANGE:
+                    /* No membership effect: the whole point of the entry is the epoch
+                     * rotation handled above. */
+                    break;
             }
         }
+
+        /* D5.1: fold_hash = SHA-256( concat of every accepted entry_hash, in canonical
+         * fold order ). Accepted means "passed every authorization check and was
+         * applied" — entries skipped above never contribute, so two receivers that
+         * accept the same entries agree, and a fold that reverses an earlier
+         * authorization produces a different hash even at an unchanged epoch count. */
+        st.fold_hash = compute_fold_hash(accepted_hashes);
         return st;
+    }
+
+    private static uint8[] compute_fold_hash(Gee.ArrayList<string> accepted_hashes_hex) {
+        uint8[] buf = new uint8[accepted_hashes_hex.size * 32];
+        int off = 0;
+        foreach (string h in accepted_hashes_hex) {
+            for (int i = 0; i < 32; i++) {
+                int hi = hex_nibble_value(h[2 * i]);
+                int lo = hex_nibble_value(h[2 * i + 1]);
+                buf[off++] = (uint8) (((hi < 0 ? 0 : hi) << 4) | (lo < 0 ? 0 : lo));
+            }
+        }
+        try {
+            return bytes_to_uint8_array(global::X3dhpq.Crypto.sha256(new Bytes(buf)));
+        } catch (GLib.Error e) {
+            return new uint8[32];
+        }
+    }
+
+    private static int hex_nibble_value(char c) {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
     }
     /* §13.5 rotation triggers. Genesis establishes epoch 0 and does not rotate; a Snapshot
      * is a passive checkpoint and does not rotate on its own. */

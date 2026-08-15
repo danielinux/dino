@@ -58,6 +58,14 @@ public class StreamModule : XmppStreamModule {
     private Account account;
     private Database db;
 
+    /* D4.2: this account just accepted a Trust Manifest whose fold CHANGES its own
+     * device set. Group membership is at account level, so a device leaving (or
+     * joining) rotates nothing by itself and the departing device keeps every
+     * member's live sender chain key. The manager turns this into a DeviceSetChange
+     * journal entry in every room the account is a member of, which is what forces
+     * the epoch rotation that actually severs it. */
+    public signal void own_device_set_changed(uint64 manifest_version);
+
     public signal void device_list_loaded(Jid jid, ArrayList<int> devices);
     public signal void bundle_fetched(Jid jid, int device_id, StanzaNode bundle);
     public signal void membership_entry_received(Jid room_jid, string? id, string b64_payload);
@@ -1399,8 +1407,32 @@ public class StreamModule : XmppStreamModule {
             int did = (int) dc.device_id;
             folded_ids.add(did);
             db.store_remote_device(account, bare, did, Base64.encode(dc.marshal()), (long) dc.created_at, dc.flags, true);
+            /* D6: maintain the durable EVER-AUTHORIZED set as a side effect of every
+             * ACCEPTED fold. Entries are never removed on revocation — tombstones are
+             * the revocation mechanism, and removing would retroactively erase the room
+             * history authored by devices that have since been legitimately retired. */
+            db.record_ever_authorized_device(account, bare, did);
         }
         db.prune_remote_devices_not_in(account, bare, folded_ids);
+
+        /* D4.2: if this is OUR account and the accepted fold changes our device set,
+         * every room we are in needs a DeviceSetChange entry so its epoch rotates.
+         * Adding is announced too, not just removing: the new device needs
+         * current-epoch material anyway and rotating is the conservative choice. */
+        if (is_self) {
+            var prev_ids = new Gee.HashSet<int>();
+            foreach (var pe in prior_fold.entries) prev_ids.add((int) pe.value.device_id);
+            var now_ids = new Gee.HashSet<int>();
+            foreach (int d in folded_ids) now_ids.add(d);
+            bool changed = prev_ids.size != now_ids.size;
+            if (!changed) {
+                foreach (int d in now_ids) { if (!prev_ids.contains(d)) { changed = true; break; } }
+            }
+            if (changed && !first_ever_manifest) {
+                own_device_set_changed(m.version);
+            }
+        }
+
         var loaded = new ArrayList<int>();
         loaded.add_all(folded_ids);
         device_list_loaded(jid, loaded);
@@ -1445,6 +1477,22 @@ public class StreamModule : XmppStreamModule {
             // an edit and lets a once-bloated manifest self-heal on connect.
             if (local_m != null && db.has_local_aik_priv(account)) {
                 var members = fold_members((!) local_m);
+                /* D8: a manifest at the PREVIOUS format (DIK-re-signed member DCs) now
+                 * folds to nothing. Left alone it would be rejected forever and never
+                 * replaced, which cascades into revoke being a no-op and peers seeing no
+                 * identity — so the primary republishes a fresh, correctly-formed
+                 * snapshot from the devicelist instead. */
+                if (members.size == 0 && db.is_authorized(account)) {
+                    warning("ensure_trust_manifest: local manifest for %s folds to nothing"
+                        + " (previous format — member DCs not AIK-signed); republishing fresh at version %s",
+                        own_bare, (((!) local_m).version + 1).to_string());
+                    try {
+                        yield build_and_publish_genesis_manifest(stream, ((!) local_m).version + 1, false);
+                    } catch (GLib.Error e) {
+                        warning("ensure_trust_manifest: D8 republish failed for %s: %s", own_bare, e.message);
+                    }
+                    return;
+                }
                 if (members.size > 0 && ((!) local_m).entries.size > members.size) {
                     try {
                         uint8[] ph = manifest_sha512(((!) local_m).marshal());
@@ -1639,14 +1687,22 @@ public class StreamModule : XmppStreamModule {
             self_id, self_dc_hash, aik_priv_ed, aik_priv_ml);
         m.entries.add(genesis);
 
-        // One DIK-signed ADD per OTHER current member (DC re-issued under this device's DIK).
+        // One DIK-signed ADD per OTHER current member, embedding that device's
+        // ORDINARY AIK-SIGNED DC, unmodified.
+        //
+        // D8 (§7.3.1/§11.7): this used to re-issue each member's DC under THIS
+        // device's DIK before embedding it. §7.3.1 defines a DeviceCertificate as, by
+        // definition, AIK-signed, so an object called a DC that verifies only under a
+        // DIK contradicts its own type — and the re-issue was redundant anyway: the
+        // TrustEntry is already DIK-signed and already names the subject device, so
+        // the ENTRY SIGNATURE is the delegation edge. Embedding the untouched
+        // AIK-signed DC lets the folder check both halves independently:
+        // entry.Verify(primary DIK) for the delegation, dc.Verify(account AIK) for
+        // the certificate, exactly as everywhere else.
         foreach (var e in members.entries) {
             if (e.key == self_id) continue;
             Protocol.DeviceCertificate odc = e.value;
-            Protocol.DeviceCertificate reissued = Protocol.DeviceCertificate.issue(
-                e.key, odc.dik_pub_ed25519, odc.dik_pub_x25519, odc.dik_pub_mldsa,
-                dik_priv_ed, dik_priv_ml, odc.flags);
-            var add = build_signed_trust_entry(Protocol.TrustEntry.ACTION_ADD, e.key, reissued,
+            var add = build_signed_trust_entry(Protocol.TrustEntry.ACTION_ADD, e.key, odc,
                 self_id, self_dc_hash, dik_priv_ed, dik_priv_ml);
             m.entries.add(add);
         }
@@ -1778,6 +1834,16 @@ public class StreamModule : XmppStreamModule {
             warning("append_device_remove_to_manifest: snapshot build failed: %s", e.message);
             return false;
         }
+    }
+
+    // D6 quarantine release: fetch a PEER's trust manifest and, if it verifies,
+    // apply it — which is what populates the durable ever-authorized device set for
+    // that account and lets a quarantined journal entry finally be folded (or
+    // rejected). Returns true if a manifest was accepted.
+    public async bool fetch_and_apply_peer_manifest(XmppStream stream, Jid jid) {
+        Protocol.TrustManifest? m = yield fetch_trust_manifest(stream, jid);
+        if (m == null) return false;
+        return verify_and_apply_manifest(jid, ((!) m).marshal());
     }
 
     // §D3: a freshly paired newcomer fetches + verifies + folds the account's own

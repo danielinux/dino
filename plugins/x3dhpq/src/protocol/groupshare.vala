@@ -1,6 +1,6 @@
 // SenderChainAnnouncement wire format matching groupshare.go byte-for-byte.
-// Layout:
-//   uint16 version(=2)
+// Layout (D5.2 takes this to version 3):
+//   uint16 version(=3)
 //   uint16 aik_pub_len | <aik_pub bytes>
 //   uint32 sender_device_id
 //   uint16 room_jid_len | <room_jid UTF-8>
@@ -8,6 +8,7 @@
 //   uint32 chain_key_len(=32) | <chain_key 32 bytes>
 //   uint32 next_index
 //   uint16 sig_pub_len(=32) | <Ed25519 sender signing public key 32 bytes>   [v2+]
+//   uint64 epoch_id                                                          [v3+]
 //
 // §13.3a: sig_pub is the public half of a per-(room, epoch) signing key the sender uses
 // on every group message it emits in that epoch. It is what makes group messages
@@ -32,6 +33,12 @@ public class SenderChainAnnouncement : Object {
     public uint32 next_index { get; set; }
     // §13.3a: 32-byte Ed25519 verification key for this sender's messages in this epoch.
     public uint8[] sig_pub { get; set; }
+    /* D5.2/D5.3: the fold this chain belongs to. Recv chains are keyed by the
+     * 4-tuple (aik_fp, device_id, epoch, epoch_id), so a chain produced under a
+     * re-fold that CONTRADICTS an earlier one installs cleanly at the same numeric
+     * epoch instead of being discarded by install-once as a duplicate. That is the
+     * whole recovery path for a contradicted epoch. */
+    public uint64 epoch_id { get; set; }
 
     // Returns the AIK fingerprint string via blake2b-160 of the AIK bytes
     // encoded as described in account_fingerprint() in util.vala.
@@ -66,12 +73,12 @@ public class SenderChainAnnouncement : Object {
         }
         uint8[] room_bytes = string_to_bytes(room_jid);
         int size = 2 + 2 + sender_aik_pub_bytes.length + 4 + 2 + room_bytes.length + 4 + 4 + 32 + 4
-                 + 2 + 32;
+                 + 2 + 32 + 8;
         uint8[] buf = new uint8[size];
         int off = 0;
 
-        // version = 2
-        buf[off++] = 0; buf[off++] = 2;
+        // version = 3 (D5.2)
+        buf[off++] = 0; buf[off++] = 3;
 
         // uint16 aik_pub_len
         uint16 aik_len = (uint16) sender_aik_pub_bytes.length;
@@ -115,6 +122,11 @@ public class SenderChainAnnouncement : Object {
         Memory.copy((uint8*) buf + off, sig_pub, 32);
         off += 32;
 
+        // uint64 epoch_id (D5.2)
+        for (int i = 7; i >= 0; i--) {
+            buf[off++] = (uint8)(epoch_id >> (i * 8));
+        }
+
         return buf;
     }
 
@@ -125,8 +137,11 @@ public class SenderChainAnnouncement : Object {
         uint16 version = uint16_from_bytes(b, off);
         off += 2;
         /* v1 carried no signing key, so a v1 announcement cannot produce verifiable group
-         * messages. Accepting one would silently reinstate the forgery hole §13.3a closes. */
-        if (version != 2) return null;
+         * messages — accepting one silently reinstates the forgery hole §13.3a closes.
+         * v2 carried no epoch_id, so its chain cannot be keyed to the fold it came from
+         * and a contradicted epoch would again have no recovery path (D5.2). Both are
+         * rejected outright. */
+        if (version != 3) return null;
 
         if (off + 2 > b.length) return null;
         int aik_len = (int) uint16_from_bytes(b, off);
@@ -173,6 +188,16 @@ public class SenderChainAnnouncement : Object {
         Memory.copy(sp, (uint8*) b + off, 32);
         off += 32;
 
+        if (off + 8 > b.length) return null;
+        uint64 eid = uint64_from_bytes(b, off);
+        off += 8;
+
+        /* D7 (§5.6): reject trailing bytes after a fully-parsed announcement.
+         * Ignoring them leaves a malleability channel — the same logical
+         * announcement can be re-encoded with arbitrary padding, so anything that
+         * dedups or fingerprints announcement bytes can be defeated for free. */
+        if (off != b.length) return null;
+
         SenderChainAnnouncement ann = new SenderChainAnnouncement();
         ann.sender_aik_pub_bytes = aik_bytes;
         ann.sender_device_id = dev_id;
@@ -181,6 +206,7 @@ public class SenderChainAnnouncement : Object {
         ann.chain_key = ck;
         ann.next_index = ni;
         ann.sig_pub = sp;
+        ann.epoch_id = eid;
         return ann;
     }
 }

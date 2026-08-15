@@ -5,7 +5,10 @@ using Xmpp;
 namespace Dino.Plugins.X3dhpq {
 
 public class Database : Qlite.Database {
-    private const int VERSION = 21;
+    // v22: D1 changed the pre-key signing input (domain-separated, id-bound), so
+    // every stored SPK/KEM signature is stale and must be re-made; and D6 adds the
+    // durable ever-authorized device set.
+    private const int VERSION = 22;
 
     public class AccountIdentityTable : Table {
         public Column<int> id = new Column.Integer("id") { primary_key = true, auto_increment = true };
@@ -435,6 +438,36 @@ public class Database : Qlite.Database {
         }
     }
 
+    // D6 (§13.1a.0 step 5): the durable EVER-AUTHORIZED device set — every
+    // (owner account, device_id) pair that has appeared in a Trust Manifest fold
+    // this install accepted. Added at schema v22.
+    //
+    // A journal entry names the device that authored it and embeds that device's
+    // AIK-signed DC. Since AIK_priv is replicated to every authorized device
+    // (§11.8), a device revoked as id 42 can mint a fresh DIK, pick an id nobody
+    // has ever seen — say 43 — and self-sign a perfectly valid DC under the stolen
+    // account root. The tombstone on 42 does not cover 43, so "not tombstoned" was
+    // never a sufficient issuer check. Requiring the id to have appeared in a
+    // manifest WE accepted defeats it, because 43 never did.
+    //
+    // EVER-authorized rather than CURRENTLY-authorized is deliberate: a journal
+    // entry is a historical record, and demanding current membership would
+    // retroactively erase room history authored by devices that have since been
+    // legitimately retired. Entries are therefore NEVER removed here on
+    // revocation — tombstones are the revocation mechanism.
+    public class EverAuthorizedDeviceTable : Table {
+        public Column<int> account_id = new Column.Integer("account_id") { not_null = true };
+        public Column<string> owner_jid = new Column.NonNullText("owner_jid");
+        public Column<int> device_id = new Column.Integer("device_id") { not_null = true };
+        public Column<long> first_seen_at = new Column.Long("first_seen_at") { default = "0" };
+
+        internal EverAuthorizedDeviceTable(Database db) {
+            base(db, "ever_authorized_device");
+            init({ account_id, owner_jid, device_id, first_seen_at });
+            unique({ account_id, owner_jid, device_id });
+        }
+    }
+
     public class RevokedDeviceTable : Table {
         public Column<int> account_id = new Column.Integer("account_id") { not_null = true };
         public Column<int> device_id = new Column.Integer("device_id") { not_null = true };
@@ -551,6 +584,7 @@ public class Database : Qlite.Database {
     public PendingEnrollmentRequestTable pending_enrollment_request { get; private set; }
     public DeviceNicknameTable device_nickname { get; private set; }
     public ManifestRevokedDeviceTable manifest_revoked_device { get; private set; }
+    public EverAuthorizedDeviceTable ever_authorized_device { get; private set; }
     public RevokedDeviceTable revoked_device { get; private set; }
     public MessageDeviceTable message_device { get; private set; }
 
@@ -578,9 +612,10 @@ public class Database : Qlite.Database {
         pending_enrollment_request = new PendingEnrollmentRequestTable(this);
         device_nickname = new DeviceNicknameTable(this);
         manifest_revoked_device = new ManifestRevokedDeviceTable(this);
+        ever_authorized_device = new EverAuthorizedDeviceTable(this);
         revoked_device = new RevokedDeviceTable(this);
         message_device = new MessageDeviceTable(this);
-        init({ account_identity, peer_account_identity, peer_device, device_list, trust_manifest, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, group_session, room_owner_pin, room_genesis_quarantine, membership_journal, membership_dag, device_audit, audit_entry, recovery_blob, pairing_session, pending_enrollment_request, device_nickname, manifest_revoked_device, revoked_device, message_device });
+        init({ account_identity, peer_account_identity, peer_device, device_list, trust_manifest, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, group_session, room_owner_pin, room_genesis_quarantine, membership_journal, membership_dag, device_audit, audit_entry, recovery_blob, pairing_session, pending_enrollment_request, device_nickname, manifest_revoked_device, ever_authorized_device, revoked_device, message_device });
     }
 
     public Row? get_local_identity(int account_id) {
@@ -740,9 +775,14 @@ public class Database : Qlite.Database {
                 Bytes spk_pub;
                 Bytes spk_priv;
                 global::X3dhpq.Crypto.generate_x25519(out spk_pub, out spk_priv);
-                Bytes spk_sig_ed25519 = global::X3dhpq.Crypto.ed25519_sign(bytes_from_base64(row[account_identity.dik_priv_ed25519_base64]), spk_pub);
-                Bytes spk_sig_mldsa = global::X3dhpq.Crypto.mldsa65_sign(bytes_from_base64(row[account_identity.dik_priv_mldsa_base64]), spk_pub);
+                // D1 (§9.1): the key id must be allocated BEFORE signing, because it
+                // is part of the signed input now. Signing the naked key first and
+                // labelling it afterwards is exactly the relabelling this closes.
                 int key_id = next_key_id(signed_pre_key, signed_pre_key.account_id, signed_pre_key.key_id, account.id);
+                Bytes spk_msg = Protocol.prekey_sig_message(
+                    Protocol.PREKEY_TYPE_SPK, (uint32) key_id, spk_pub);
+                Bytes spk_sig_ed25519 = global::X3dhpq.Crypto.ed25519_sign(bytes_from_base64(row[account_identity.dik_priv_ed25519_base64]), spk_msg);
+                Bytes spk_sig_mldsa = global::X3dhpq.Crypto.mldsa65_sign(bytes_from_base64(row[account_identity.dik_priv_mldsa_base64]), spk_msg);
                 signed_pre_key.insert()
                     .value(signed_pre_key.account_id, account.id)
                     .value(signed_pre_key.key_id, key_id)
@@ -766,6 +806,12 @@ public class Database : Qlite.Database {
             // a post-reset bundle advertises the NEW identity. The DC column is
             // left untouched (ensure_local_device_certificate, called above, owns
             // it) so we never clobber it.
+            // D1: re-sign any SPK row still carrying a signature over the OLD
+            // (naked-key) input, before the bundle row is synced from it below —
+            // otherwise the bundle would advertise a stale signature that no
+            // conforming peer accepts, taking this account off the air.
+            backfill_signed_pre_key_signatures(account);
+
             Row? spk_row = get_current_signed_pre_key(account);
             if (spk_row != null) {
                 bundle.upsert()
@@ -791,11 +837,15 @@ public class Database : Qlite.Database {
                 Bytes lr_pub;
                 Bytes lr_priv;
                 global::X3dhpq.Crypto.generate_mlkem768(out lr_pub, out lr_priv);
-                Bytes lr_sig_ed = global::X3dhpq.Crypto.ed25519_sign(bytes_from_base64(row[account_identity.dik_priv_ed25519_base64]), lr_pub);
-                Bytes lr_sig_ml = global::X3dhpq.Crypto.mldsa65_sign(bytes_from_base64(row[account_identity.dik_priv_mldsa_base64]), lr_pub);
+                // D1: id first, then sign over the domain-separated input.
+                int lr_key_id = next_key_id(kem_pre_key, kem_pre_key.account_id, kem_pre_key.key_id, account.id);
+                Bytes lr_msg = Protocol.prekey_sig_message(
+                    Protocol.PREKEY_TYPE_KEM, (uint32) lr_key_id, lr_pub);
+                Bytes lr_sig_ed = global::X3dhpq.Crypto.ed25519_sign(bytes_from_base64(row[account_identity.dik_priv_ed25519_base64]), lr_msg);
+                Bytes lr_sig_ml = global::X3dhpq.Crypto.mldsa65_sign(bytes_from_base64(row[account_identity.dik_priv_mldsa_base64]), lr_msg);
                 kem_pre_key.insert()
                     .value(kem_pre_key.account_id, account.id)
-                    .value(kem_pre_key.key_id, next_key_id(kem_pre_key, kem_pre_key.account_id, kem_pre_key.key_id, account.id))
+                    .value(kem_pre_key.key_id, lr_key_id)
                     .value(kem_pre_key.public_base64, bytes_to_base64(lr_pub))
                     .value(kem_pre_key.private_base64, bytes_to_base64(lr_priv))
                     .value(kem_pre_key.signature_ed25519_base64, bytes_to_base64(lr_sig_ed))
@@ -814,11 +864,15 @@ public class Database : Qlite.Database {
                 // Hybrid DIK signature over the KEM public key (spec §9.1): the
                 // KEM pre-key carries post-quantum (HNDL) confidentiality, so it
                 // is signed with both the DIK Ed25519 and ML-DSA-65 keys.
-                Bytes kem_sig_ed25519 = global::X3dhpq.Crypto.ed25519_sign(bytes_from_base64(row[account_identity.dik_priv_ed25519_base64]), kem_pub);
-                Bytes kem_sig_mldsa = global::X3dhpq.Crypto.mldsa65_sign(bytes_from_base64(row[account_identity.dik_priv_mldsa_base64]), kem_pub);
+                // D1: id first, then sign over the domain-separated input.
+                int otk_key_id = next_key_id(kem_pre_key, kem_pre_key.account_id, kem_pre_key.key_id, account.id);
+                Bytes kem_msg = Protocol.prekey_sig_message(
+                    Protocol.PREKEY_TYPE_KEM, (uint32) otk_key_id, kem_pub);
+                Bytes kem_sig_ed25519 = global::X3dhpq.Crypto.ed25519_sign(bytes_from_base64(row[account_identity.dik_priv_ed25519_base64]), kem_msg);
+                Bytes kem_sig_mldsa = global::X3dhpq.Crypto.mldsa65_sign(bytes_from_base64(row[account_identity.dik_priv_mldsa_base64]), kem_msg);
                 kem_pre_key.insert()
                     .value(kem_pre_key.account_id, account.id)
-                    .value(kem_pre_key.key_id, next_key_id(kem_pre_key, kem_pre_key.account_id, kem_pre_key.key_id, account.id))
+                    .value(kem_pre_key.key_id, otk_key_id)
                     .value(kem_pre_key.public_base64, bytes_to_base64(kem_pub))
                     .value(kem_pre_key.private_base64, bytes_to_base64(kem_priv))
                     .value(kem_pre_key.signature_ed25519_base64, bytes_to_base64(kem_sig_ed25519))
@@ -981,8 +1035,11 @@ public class Database : Qlite.Database {
             int key_id = row[kem_pre_key.key_id];
             try {
                 Bytes kem_pub = bytes_from_base64((!) pub_b64);
-                Bytes new_ed = global::X3dhpq.Crypto.ed25519_sign(bytes_from_base64((!) dik_priv_ed), kem_pub);
-                Bytes new_ml = global::X3dhpq.Crypto.mldsa65_sign(bytes_from_base64((!) dik_priv_ml), kem_pub);
+                // D1: over the domain-separated input, bound to this row's key id.
+                Bytes kem_msg = Protocol.prekey_sig_message(
+                    Protocol.PREKEY_TYPE_KEM, (uint32) key_id, kem_pub);
+                Bytes new_ed = global::X3dhpq.Crypto.ed25519_sign(bytes_from_base64((!) dik_priv_ed), kem_msg);
+                Bytes new_ml = global::X3dhpq.Crypto.mldsa65_sign(bytes_from_base64((!) dik_priv_ml), kem_msg);
                 kem_pre_key.update()
                     .with(kem_pre_key.account_id, "=", account.id)
                     .with(kem_pre_key.key_id, "=", key_id)
@@ -992,6 +1049,44 @@ public class Database : Qlite.Database {
             } catch (GLib.Error e) {
                 warning("x3dhpq: could not backfill signature for KEM pre-key %d: %s",
                     key_id, e.message);
+            }
+        }
+    }
+
+    // D1 companion to backfill_kem_pre_key_signatures: re-sign any signed pre-key
+    // whose stored signature is missing or empty. The v22 migration empties these
+    // columns precisely so this runs once and replaces every signature made over
+    // the old naked-key input — a peer verifying under the new rule would reject
+    // the bundle outright otherwise, which silently takes the account off the air.
+    public void backfill_signed_pre_key_signatures(Account account) {
+        Row? identity = account_identity.select().with(account_identity.account_id, "=", account.id).single().row().inner;
+        if (identity == null) return;
+        string? dik_priv_ed = ((!) identity)[account_identity.dik_priv_ed25519_base64];
+        string? dik_priv_ml = ((!) identity)[account_identity.dik_priv_mldsa_base64];
+        if (dik_priv_ed == null || dik_priv_ml == null) return;
+
+        RowIterator it = signed_pre_key.select().with(signed_pre_key.account_id, "=", account.id).iterator();
+        Row? row;
+        while ((row = it.get_next()) != null) {
+            string sig_ed = ((!) row)[signed_pre_key.signature_ed25519_base64];
+            string sig_ml = ((!) row)[signed_pre_key.signature_mldsa_base64];
+            if (sig_ed != "" && sig_ml != "") continue;
+            string pub_b64 = ((!) row)[signed_pre_key.public_base64];
+            if (pub_b64 == "") continue;
+            int key_id = ((!) row)[signed_pre_key.key_id];
+            try {
+                Bytes msg = Protocol.prekey_sig_message(
+                    Protocol.PREKEY_TYPE_SPK, (uint32) key_id, bytes_from_base64(pub_b64));
+                Bytes new_ed = global::X3dhpq.Crypto.ed25519_sign(bytes_from_base64((!) dik_priv_ed), msg);
+                Bytes new_ml = global::X3dhpq.Crypto.mldsa65_sign(bytes_from_base64((!) dik_priv_ml), msg);
+                signed_pre_key.update()
+                    .with(signed_pre_key.account_id, "=", account.id)
+                    .with(signed_pre_key.key_id, "=", key_id)
+                    .set(signed_pre_key.signature_ed25519_base64, bytes_to_base64(new_ed))
+                    .set(signed_pre_key.signature_mldsa_base64, bytes_to_base64(new_ml))
+                    .perform();
+            } catch (GLib.Error e) {
+                warning("x3dhpq: could not re-sign signed pre-key %d: %s", key_id, e.message);
             }
         }
     }
@@ -2363,6 +2458,19 @@ public class Database : Qlite.Database {
         }
     }
 
+    // Every room this account holds a group session for. D4.1 needs it to delete a
+    // revoked device's recv chains in EVERY room, not just the one it was caught in.
+    public Gee.List<string> list_group_session_rooms(Account account) {
+        var rooms = new Gee.ArrayList<string>();
+        var seen = new Gee.HashSet<string>();
+        var rows = group_session.select().with(group_session.account_id, "=", account.id);
+        foreach (Row r in rows) {
+            string room = r[group_session.room_jid];
+            if (seen.add(room)) rooms.add(room);
+        }
+        return rooms;
+    }
+
     public void store_group_session(Account account, string room_jid, Protocol.GroupSession gs) {
         string send_state = gs.serialize_send_state();
         string member_state = gs.serialize_member_state() + gs.serialize_recv_chains();
@@ -2486,6 +2594,29 @@ public class Database : Qlite.Database {
         } catch (Error err) {
             warning("store_membership_dag_entry_blob failed for %s: %s", room_jid, err.message);
         }
+    }
+
+    // Every room this account holds v2 journal state for. D4.2 needs it to fan a
+    // DeviceSetChange entry out to every room the account is a member of.
+    public Gee.List<string> list_membership_dag_rooms(Account account) {
+        var rooms = new Gee.ArrayList<string>();
+        var seen = new Gee.HashSet<string>();
+        var rows = membership_dag.select().with(membership_dag.account_id, "=", account.id);
+        foreach (Row r in rows) {
+            string room = r[membership_dag.room_jid];
+            if (seen.add(room)) rooms.add(room);
+        }
+        return rooms;
+    }
+
+    // Reverse lookup by the DISPLAY fingerprint (the spaced 30-hex form carried on
+    // group envelopes as sender-aik-fp), which is what the group layer keys on.
+    public string? find_peer_jid_by_display_fp(Account account, string display_fp) {
+        Row? r = peer_account_identity.select()
+            .with(peer_account_identity.account_id, "=", account.id)
+            .with(peer_account_identity.aik_fingerprint, "=", display_fp)
+            .single().row().inner;
+        return r == null ? null : ((!) r)[peer_account_identity.bare_jid];
     }
 
     public Gee.List<Bytes> list_membership_dag_entry_blobs(Account account, string room_jid) {
@@ -2829,6 +2960,58 @@ public class Database : Qlite.Database {
                 error("x3dhpq migrate pairing_session: %s", e.message);
             }
         }
+        if (old_version < 22) {
+            // D1: every stored pre-key signature was made over the naked key and
+            // is now unverifiable. Empty the columns so the backfill paths re-sign
+            // over the domain-separated input on the next prekey/bundle pass; the
+            // bundle is then republished with the new signatures.
+            try {
+                exec("UPDATE signed_pre_key SET signature_ed25519_base64 = '', signature_mldsa_base64 = ''");
+                exec("UPDATE kem_pre_key SET signature_ed25519_base64 = NULL, signature_mldsa_base64 = NULL");
+                // Stale cached peer bundles carry old-input signatures too and would
+                // now fail verify(); drop the copies so they are refetched.
+                exec("UPDATE bundle SET signed_pre_key_signature_ed25519_base64 = NULL,"
+                    + " signed_pre_key_signature_mldsa_base64 = NULL, kem_pre_keys_base64 = NULL,"
+                    + " bundle_payload_base64 = NULL");
+            } catch (Error e) {
+                warning("x3dhpq migrate v22 (pre-key signature re-issue): %s", e.message);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // D6: durable ever-authorized device set.
+    // ---------------------------------------------------------------------
+
+    // Record (owner, device_id) as having appeared in an accepted manifest fold.
+    // Called for every device of every fold this install accepts. Idempotent.
+    public void record_ever_authorized_device(Account account, string owner_jid, int device_id) {
+        ever_authorized_device.upsert()
+            .value(ever_authorized_device.account_id, account.id, true)
+            .value(ever_authorized_device.owner_jid, owner_jid, true)
+            .value(ever_authorized_device.device_id, device_id, true)
+            .value(ever_authorized_device.first_seen_at, (long) new DateTime.now_utc().to_unix())
+            .perform();
+    }
+
+    public bool is_ever_authorized_device(Account account, string owner_jid, int device_id) {
+        return ever_authorized_device.select()
+            .with(ever_authorized_device.account_id, "=", account.id)
+            .with(ever_authorized_device.owner_jid, "=", owner_jid)
+            .with(ever_authorized_device.device_id, "=", device_id)
+            .count() > 0;
+    }
+
+    // True once ANY manifest fold has been accepted for this owner. Distinguishes
+    // "this device id was never authorized" (an attack, reject) from "we hold no
+    // manifest for that account at all" (unresolved, quarantine — D6 failure
+    // policy). Failing those two together would either fail open on the attack or
+    // permanently discard legitimate history.
+    public bool has_ever_authorized_devices(Account account, string owner_jid) {
+        return ever_authorized_device.select()
+            .with(ever_authorized_device.account_id, "=", account.id)
+            .with(ever_authorized_device.owner_jid, "=", owner_jid)
+            .count() > 0;
     }
 
     public void persist_pairing_session(int account_id, uint8[] sid, int role, string peer_full_jid, string code, int64 started_at, uint8[]? state_blob) {

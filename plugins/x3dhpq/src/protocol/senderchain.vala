@@ -49,6 +49,13 @@ public class PendingMessageKey : Object {
 
 public class SenderChain : Object {
     public uint32 epoch { get; set; }
+    /* D5.3: the fold this chain belongs to. Part of the recv-chain key, and
+     * checked against every incoming message's header so a message tagged with a
+     * DIFFERENT epoch_id is rejected rather than silently decrypted under a chain
+     * from another fold. Persisted below as a trailing field (local storage
+     * format only — this never goes on the wire; the wire carries it in the
+     * announcement and the message header). */
+    public uint64 epoch_id { get; set; }
     public uint8[] chain_key { get; set; }   // 32 bytes
     public uint32 next_index { get; set; }
 
@@ -63,18 +70,20 @@ public class SenderChain : Object {
     // skipped message keys: index -> mk (stored as Bytes to avoid array-as-generic-arg)
     private HashMap<uint32, Bytes> skipped = new HashMap<uint32, Bytes>();
 
-    public static SenderChain new_random(uint32 epoch) throws GLib.Error {
+    public static SenderChain new_random(uint32 epoch, uint64 epoch_id = 0) throws GLib.Error {
         SenderChain sc = new SenderChain();
         sc.epoch = epoch;
+        sc.epoch_id = epoch_id;
         sc.chain_key = bytes_to_uint8_array(global::X3dhpq.Crypto.random_bytes(32));
         sc.next_index = 0;
         return sc;
     }
 
-    public static SenderChain? restore(uint32 epoch, uint8[] ck, uint32 next_index) {
+    public static SenderChain? restore(uint32 epoch, uint8[] ck, uint32 next_index, uint64 epoch_id = 0) {
         if (ck.length != 32) return null;
         SenderChain sc = new SenderChain();
         sc.epoch = epoch;
+        sc.epoch_id = epoch_id;
         sc.chain_key = ck.copy();
         sc.next_index = next_index;
         return sc;
@@ -166,7 +175,7 @@ public class SenderChain : Object {
          * unable to sign in an epoch we have already announced ourselves for, and peers
          * hold the advertised public key and would reject everything we sent afterwards. */
         int size = 4 + 4 + 32 + 4 + 4 + (int) num_skipped * (4 + 4 + 32)
-                 + 2 + sig_priv.length + 2 + sig_pub.length;
+                 + 2 + sig_priv.length + 2 + sig_pub.length + 8;
         uint8[] buf = new uint8[size];
         int off = 0;
 
@@ -212,6 +221,12 @@ public class SenderChain : Object {
         if (sig_pub.length > 0) {
             Memory.copy((uint8*) buf + off, sig_pub, sig_pub.length);
             off += sig_pub.length;
+        }
+        /* D5.3 epoch_id, appended last so the layout stays back-compatible with the
+         * unmarshal below (a chain persisted before this field simply has no
+         * trailing 8 bytes and restores with epoch_id 0). */
+        for (int i = 7; i >= 0; i--) {
+            buf[off++] = (uint8)(epoch_id >> (i * 8));
         }
         return buf;
     }
@@ -276,6 +291,10 @@ public class SenderChain : Object {
                     Memory.copy(spub, (uint8*) b + off, spub_len);
                     sc.sig_pub = spub;
                     off += spub_len;
+                }
+                if (off + 8 <= b.length) {
+                    sc.epoch_id = uint64_from_bytes(b, off);
+                    off += 8;
                 }
             }
         }
