@@ -571,12 +571,6 @@ public SessionState new_receiving_state(Bytes root_material, uint8[] ad, Bytes m
 }
 
 public void encrypt_transport_key(SessionState state, Bytes transport_key, out MessageHeader header, out Bytes ciphertext) throws GLib.Error {
-    maybe_kem_checkpoint(state);
-    Bytes mk;
-    Bytes next_ck;
-    chain_step((!) state.chain_send_key, out mk, out next_ck);
-    state.chain_send_key = next_ck;
-
     header = new MessageHeader();
     header.dh_pub = state.sending_dh_pub;
     header.prev_chain_len = state.prev_send_count;
@@ -584,6 +578,12 @@ public void encrypt_transport_key(SessionState state, Bytes transport_key, out M
     header.kem_ciphertext = null;
     header.kem_pub_for_reply = state.kem_recv_pub;
 
+    // The checkpoint mix MUST happen BEFORE deriving this message's key, so the checkpoint
+    // message itself is protected under the post-mix chain (spec §5.3; matches the Java/Go
+    // reference and this file's own decrypt path). Deriving the key first, as an earlier
+    // version did, made a checkpoint message use the PRE-mix chain while the receiver used
+    // the post-mix chain — so a live count-triggered checkpoint never decrypted, even
+    // Dino↔Dino. No live roundtrip exercised it, so the canned single-message KAT missed it.
     if (state.kem_send_pub != null && should_do_checkpoint(state)) {
         Bytes kem_ct;
         Bytes kem_ss;
@@ -591,9 +591,12 @@ public void encrypt_transport_key(SessionState state, Bytes transport_key, out M
         Bytes new_cks;
         Bytes new_ckr;
         Bytes new_history;
+        // Unidirectional checkpoint (§5.3): mix into the SEND chain only. Rewriting the
+        // recv chain here would destroy the key for any opposite-direction message still in
+        // flight and never derived — the skipped-key cache cannot recover it. new_ckr is
+        // therefore discarded; the receiver mixes into its matching recv chain instead.
         kem_checkpoint_mix((!) state.chain_send_key, kem_ss, state.sending_dh_pub, kem_ct, state.send_count, state.kem_history, out new_cks, out new_ckr, out new_history);
         state.chain_send_key = new_cks;
-        state.chain_recv_key = new_ckr;
         state.kem_history = new_history;
         state.kem_since_checkpoint = 0;
         state.last_checkpoint_time = new DateTime.now_utc().to_unix();
@@ -605,6 +608,11 @@ public void encrypt_transport_key(SessionState state, Bytes transport_key, out M
         header.kem_ciphertext = kem_ct;
         header.kem_pub_for_reply = new_pub;
     }
+
+    Bytes mk;
+    Bytes next_ck;
+    chain_step((!) state.chain_send_key, out mk, out next_ck);
+    state.chain_send_key = next_ck;
 
     Bytes aes_key;
     Bytes nonce;
@@ -679,20 +687,25 @@ public Bytes decrypt_transport_key(SessionState state, MessageHeader header, Byt
         state.sending_dh_priv = new_send_priv;
     }
 
+    // Skip ahead (and cache) to this message's position on the current chain, keyed by the
+    // CURRENT header.dh_pub. This MUST precede the checkpoint mix below: the checkpoint
+    // fires at a fixed sender index (header.n), so the recv chain must reach that same
+    // index over the PRE-checkpoint chain — where the skipped messages live — before the
+    // mix. Mixing first desynchronised the two sides under out-of-order delivery.
+    skip_recv_keys(state, header.dh_pub, header.n);
+
     if (header.kem_ciphertext != null && state.kem_recv_priv != null && state.chain_recv_key != null) {
         Bytes kem_ss = global::X3dhpq.Crypto.mlkem768_decapsulate((!) state.kem_recv_priv, (!) header.kem_ciphertext);
         Bytes new_cks;
         Bytes new_ckr;
         Bytes new_history;
+        // Unidirectional (§5.3): mix into the RECV chain only, mirroring the sender's
+        // send-only mix. chain_recv_key is now at position header.n, so the two mixes share
+        // a salt and converge; the send chain is left untouched. new_ckr is discarded.
         kem_checkpoint_mix((!) state.chain_recv_key, kem_ss, header.dh_pub, (!) header.kem_ciphertext, header.n, state.kem_history, out new_cks, out new_ckr, out new_history);
         state.chain_recv_key = new_cks;
-        state.chain_send_key = new_ckr;
         state.kem_history = new_history;
     }
-
-    // Skip ahead (and cache) to this message's position on the current chain,
-    // keyed by the CURRENT header.dh_pub.
-    skip_recv_keys(state, header.dh_pub, header.n);
 
     Bytes mk;
     Bytes next_ck;

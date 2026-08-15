@@ -13,6 +13,7 @@ class Pairwise : Gee.TestCase {
         add_test("bundle_rejects_missing_kem_sig", test_bundle_rejects_missing_kem_sig);
         add_test("bundle_rejects_half_kem_sig", test_bundle_rejects_half_kem_sig);
         add_test("late_messages_from_abandoned_chain", test_late_messages_from_abandoned_chain);
+        add_test("checkpoint_keeps_in_flight_opposite_message", test_checkpoint_keeps_in_flight_opposite_message);
         add_test("cross_vector_from_pqonversations", test_cross_vector_from_pqonversations);
         add_test("cross_vector_ratchet_from_pqonversations", test_cross_vector_ratchet_from_pqonversations);
     }
@@ -262,6 +263,64 @@ class Pairwise : Gee.TestCase {
             Bytes got3 = decrypt_transport_key(b, headers[3], cts[3]);
             fail_if_not_eq_uint8_arr(bytes_to_array(keys[3]), bytes_to_array(got3),
                 "message stranded on the abandoned chain must still decrypt (n=3)");
+        } catch (Error e) {
+            fail_if_reached(e.message);
+        }
+    }
+
+    // A checkpoint in one direction MUST NOT strand an in-flight message in the OTHER
+    // direction. Regression test for the bidirectional-checkpoint bug: Alice sending a
+    // checkpoint used to rewrite her own recv chain, destroying the key for a Bob→Alice
+    // message already in flight. The unidirectional fix touches only the send chain.
+    private void test_checkpoint_keeps_in_flight_opposite_message() {
+        try {
+            TestIdentity alice = new TestIdentity();
+            TestIdentity bob = new TestIdentity();
+
+            PeerBundle peer_bundle = bob.to_peer_bundle();
+            SessionBootstrap a = initiate_session(alice.dik_priv_x25519, alice.dik_pub_x25519, peer_bundle);
+            SessionState b = respond_session(
+                bob.dik_priv_x25519, bob.dik_pub_x25519,
+                bob.spk_priv_x25519, bob.spk_pub_x25519,
+                bob.opk_priv_x25519, bob.kem_priv,
+                alice.device_certificate, alice.aik_pub_ed25519, alice.aik_pub_mldsa,
+                a.prekey_ephemeral_pub, a.kem_ciphertext);
+
+            // Bootstrap: Alice→Bob, then Bob→Alice so Alice learns Bob's KEM pub (needed
+            // before Alice can checkpoint).
+            Bytes k0 = Crypto.random_bytes(44);
+            MessageHeader h0; Bytes ct0;
+            encrypt_transport_key(a.state, k0, out h0, out ct0);
+            decrypt_transport_key(b, h0, ct0);
+
+            Bytes rk0 = Crypto.random_bytes(44);
+            MessageHeader rh0; Bytes rct0;
+            encrypt_transport_key(b, rk0, out rh0, out rct0);
+            decrypt_transport_key(a.state, rh0, rct0);
+
+            // Bob sends B1 on the Bob→Alice chain; DELAYED, not delivered to Alice yet.
+            Bytes b1_key = Crypto.random_bytes(44);
+            MessageHeader b1_h; Bytes b1_ct;
+            encrypt_transport_key(b, b1_key, out b1_h, out b1_ct);
+
+            // Alice sends 49 fillers + the checkpoint message. kem_since_checkpoint was 1
+            // after the bootstrap send, so the 50th send here carries the checkpoint.
+            for (int i = 0; i < 49; i++) {
+                Bytes fk = Crypto.random_bytes(44);
+                MessageHeader fh; Bytes fct;
+                encrypt_transport_key(a.state, fk, out fh, out fct);
+                decrypt_transport_key(b, fh, fct);
+            }
+            Bytes ck_key = Crypto.random_bytes(44);
+            MessageHeader ck_h; Bytes ck_ct;
+            encrypt_transport_key(a.state, ck_key, out ck_h, out ck_ct);
+            fail_if_not(ck_h.kem_ciphertext != null, "Alice's message must carry a checkpoint");
+            decrypt_transport_key(b, ck_h, ck_ct);
+
+            // The delayed Bob→Alice message finally arrives; it MUST still decrypt.
+            Bytes got_b1 = decrypt_transport_key(a.state, b1_h, b1_ct);
+            fail_if_not_eq_uint8_arr(bytes_to_array(b1_key), bytes_to_array(got_b1),
+                "in-flight opposite-direction message must survive an outbound checkpoint");
         } catch (Error e) {
             fail_if_reached(e.message);
         }
