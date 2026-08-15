@@ -1440,9 +1440,28 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         broadcast_sender_chain(conversation, (!) gs, room_jid_str, aik_ed, aik_mldsa);
 
         uint8[] plaintext = string_to_bytes((!) message_stanza.body);
+
+        // §13.1b anti-withholding: advertise our observed v2 journal DAG heads so peers can
+        // detect a withholding relay (or their own gap). Omitted when the room has no v2
+        // frontier yet (v1-only or not yet bootstrapped).
+        //
+        // Computed BEFORE the encrypt, because the advertisement is bound into the AAD —
+        // otherwise a relay can strip or forge this cleartext sibling and the tag still
+        // verifies, defeating the mechanism against the exact adversary it targets.
+        uint8[]? heads_payload = null;
+        if (is_v2_active(conversation.account, room_jid_str)) {
+            Protocol.MembershipDag? dag = get_dag(conversation.account, room_jid_str);
+            if (dag != null) {
+                Gee.ArrayList<Bytes> heads = dag.current_heads();
+                if (heads.size > 0) {
+                    heads_payload = Protocol.GroupHeads.encode(heads);
+                }
+            }
+        }
+
         Protocol.GroupMessageHeader hdr;
         uint8[] ciphertext;
-        gs.encrypt(plaintext, out hdr, out ciphertext);
+        gs.encrypt_with_heads(plaintext, heads_payload, out hdr, out ciphertext);
 
         db.store_group_session(conversation.account, room_jid_str, (!) gs);
 
@@ -1457,19 +1476,9 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             .put_node(new StanzaNode.build("ct", Protocol.NS_ENVELOPE)
                 .put_node(new StanzaNode.text(Base64.encode(ciphertext))));
 
-        // §13.1b anti-withholding: advertise our observed v2 journal DAG heads
-        // so peers can detect a withholding relay (or their own gap) over the
-        // authenticated group channel. Omitted when the room has no v2
-        // frontier yet (v1-only or not yet bootstrapped).
-        if (is_v2_active(conversation.account, room_jid_str)) {
-            Protocol.MembershipDag? dag = get_dag(conversation.account, room_jid_str);
-            if (dag != null) {
-                Gee.ArrayList<Bytes> heads = dag.current_heads();
-                if (heads.size > 0) {
-                    group_env.put_node(new StanzaNode.build("heads", Protocol.NS_ENVELOPE)
-                        .put_node(new StanzaNode.text(Base64.encode(Protocol.GroupHeads.encode(heads)))));
-                }
-            }
+        if (heads_payload != null) {
+            group_env.put_node(new StanzaNode.build("heads", Protocol.NS_ENVELOPE)
+                .put_node(new StanzaNode.text(Base64.encode((!) heads_payload))));
         }
 
         message_stanza.stanza.put_node(group_env);
@@ -2118,8 +2127,31 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         // gs.decrypt does its sender-membership check.
         rebuild_group_session_from_journal(conversation.account, room_jid_str, (!) gs);
 
+        // §13.1b: the <heads> advertisement is bound into the AAD by value and presence, so
+        // reconstruct it from the RAW received bytes — never from a decoded-then-re-encoded
+        // frontier, which would normalise away the very difference the binding detects. A
+        // stripped, blanked or substituted element yields a different AAD and the tag
+        // fails, which is the intended fail-closed outcome (a relay able to tamper could
+        // equally have dropped the stanza).
+        uint8[]? recv_heads_payload = null;
+        {
+            StanzaNode? hn = group_env.get_subnode("heads", Protocol.NS_ENVELOPE);
+            if (hn != null) {
+                string? hb64 = hn.get_string_content();
+                if (hb64 != null && hb64.strip() != "") {
+                    try {
+                        recv_heads_payload = bytes_to_uint8_array(bytes_from_base64(hb64));
+                    } catch (GLib.Error e) {
+                        // Undecodable: cannot reconstruct the sender's AAD, so let the tag
+                        // check reject the message rather than guessing.
+                        recv_heads_payload = null;
+                    }
+                }
+            }
+        }
+
         try {
-            uint8[] plaintext = gs.decrypt((!) sender_aik_fp, hdr, bytes_to_uint8_array(bytes_from_base64(ct_b64)));
+            uint8[] plaintext = gs.decrypt_with_heads((!) sender_aik_fp, hdr, bytes_to_uint8_array(bytes_from_base64(ct_b64)), recv_heads_payload);
             db.store_group_session(conversation.account, room_jid_str, gs);
             message.body = (string) plaintext;
             message.encryption = Encryption.X3DHPQ;

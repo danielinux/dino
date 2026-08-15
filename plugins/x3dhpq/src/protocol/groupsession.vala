@@ -209,6 +209,13 @@ public class GroupSession : Object {
 
     // Encrypt plaintext. Returns (header, ciphertext+tag) or throws on failure.
     public void encrypt(uint8[] plaintext, out GroupMessageHeader header_out, out uint8[] ciphertext_out) throws GLib.Error {
+        encrypt_with_heads(plaintext, null, out header_out, out ciphertext_out);
+    }
+
+    // heads_payload is the canonical <heads> advertisement (§13.1b) that will accompany
+    // this message, or null when none is sent. It is bound into the AAD, so the caller
+    // MUST pass exactly the bytes it puts on the wire.
+    public void encrypt_with_heads(uint8[] plaintext, uint8[]? heads_payload, out GroupMessageHeader header_out, out uint8[] ciphertext_out) throws GLib.Error {
         if (send_chain == null) {
             send_chain = SenderChain.new_random(epoch);
         }
@@ -224,7 +231,7 @@ public class GroupSession : Object {
         hdr.sender_device_id = my_device_id;
         hdr.chain_index = idx;
 
-        uint8[] aad_bytes = hdr.aad(room_jid);
+        uint8[] aad_bytes = hdr.aad_with_heads(room_jid, heads_payload);
         uint8[] nonce_bytes = hdr.aead_nonce();
 
         Bytes ct = global::X3dhpq.Crypto.aes256gcm_encrypt(
@@ -242,6 +249,18 @@ public class GroupSession : Object {
         string sender_aik_fp,
         GroupMessageHeader hdr,
         uint8[] ciphertext
+    ) throws GLib.Error {
+        return decrypt_with_heads(sender_aik_fp, hdr, ciphertext, null);
+    }
+
+    // heads_payload MUST be the RAW bytes of the received <heads> advertisement (or null
+    // if absent), not a re-encoding of a decoded frontier — re-encoding would normalise
+    // away exactly the difference the AAD binding is meant to detect (§13.1b).
+    public uint8[] decrypt_with_heads(
+        string sender_aik_fp,
+        GroupMessageHeader hdr,
+        uint8[] ciphertext,
+        uint8[]? heads_payload
     ) throws GLib.Error {
         if (removed_aiks.has_key(sender_aik_fp)) {
             throw new GroupSessionError.REMOVED_MEMBER(@"message from removed member $sender_aik_fp");
@@ -262,7 +281,7 @@ public class GroupSession : Object {
         if (pending == null) {
             throw new IOError.FAILED("derive_message_key_at returned null");
         }
-        uint8[] aad_bytes = hdr.aad(room_jid);
+        uint8[] aad_bytes = hdr.aad_with_heads(room_jid, heads_payload);
         uint8[] nonce_bytes = hdr.aead_nonce();
         try {
             Bytes pt = global::X3dhpq.Crypto.aes256gcm_decrypt(

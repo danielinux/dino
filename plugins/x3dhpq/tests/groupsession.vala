@@ -12,6 +12,7 @@ class GroupSessionTest : Gee.TestCase {
         add_test("senderchain_skipped_keys", test_senderchain_skipped_keys);
         add_test("groupmsg_header_roundtrip", test_groupmsg_header_roundtrip);
         add_test("groupmsg_nonce_aad", test_groupmsg_nonce_aad);
+        add_test("groupmsg_aad_binds_heads", test_groupmsg_aad_binds_heads);
         add_test("groupshare_marshal_roundtrip", test_groupshare_marshal_roundtrip);
         add_test("groupsession_encrypt_decrypt", test_groupsession_encrypt_decrypt);
         add_test("groupsession_epoch_rotation_on_add", test_groupsession_epoch_rotation_on_add);
@@ -144,7 +145,40 @@ class GroupSessionTest : Gee.TestCase {
         fail_if_not_eq_int((int) nonce[2], (int) 'S', "nonce[2] must be S");
         fail_if_not_eq_int((int) nonce[3], (int) 'G', "nonce[3] must be G");
         uint8[] aad = h.aad("room@example.org");
-        fail_if_not_eq_int(aad.length, 14 + "room@example.org".length, "aad length mismatch");
+        fail_if_not_eq_int(aad.length, 14 + "room@example.org".length + 1,
+            "aad = header + roomJID + 1-byte absent-heads marker");
+        fail_if_not_eq_int((int) aad[aad.length - 1], 0x00,
+            "absent <heads> must be encoded as a 0x00 marker");
+    }
+
+    // §13.1b: the advertisement is bound into the AAD by value AND presence, so a relay
+    // that strips it, blanks it, or substitutes another frontier produces a different AAD
+    // and the tag fails. Without the marker, "stripped" would be indistinguishable from
+    // "sender had no frontier" — exactly the forgery the binding prevents.
+    private void test_groupmsg_aad_binds_heads() {
+        GroupMessageHeader h = new GroupMessageHeader();
+        h.version = 1; h.epoch = 7; h.sender_device_id = 1; h.chain_index = 3;
+        string room = "room@example.org";
+
+        uint8[] heads_a = new uint8[34];
+        heads_a[1] = 1; // n_heads = 1
+        for (int i = 2; i < 34; i++) heads_a[i] = 0xAA;
+        uint8[] heads_b = heads_a.copy();
+        heads_b[33] = 0xBB; // same length, different frontier
+
+        uint8[] absent = h.aad_with_heads(room, null);
+        uint8[] present = h.aad_with_heads(room, heads_a);
+        uint8[] other = h.aad_with_heads(room, heads_b);
+
+        fail_if_not_eq_int(present.length, 14 + room.length + 3 + heads_a.length,
+            "present <heads> contributes marker + uint16 length + payload");
+        fail_if_not_eq_int((int) present[14 + room.length], 0x01,
+            "present <heads> must be encoded with a 0x01 marker");
+
+        fail_if(absent.length == present.length && Memory.cmp(absent, present, absent.length) == 0,
+            "stripping <heads> must change the AAD");
+        fail_if(Memory.cmp(present, other, present.length) == 0,
+            "substituting a different frontier must change the AAD");
     }
 
     private void test_groupshare_marshal_roundtrip() {

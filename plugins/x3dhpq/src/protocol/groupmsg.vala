@@ -57,11 +57,42 @@ public class GroupMessageHeader : Object {
         return n;
     }
 
-    // header.marshal() || room_jid_utf8
-    public uint8[] aad(string room_jid) {
+    // §13.3: header.marshal() || room_jid_utf8 || heads_tag
+    //
+    // heads_tag is 0x00 when no <heads> element accompanies the message, and
+    // 0x01 || uint16-be(len) || <canonical heads payload> when one does.
+    //
+    // Binding <heads> here is what makes §13.1b work at all. The advertisement is a
+    // cleartext XML sibling of the ciphertext, so without it in the AAD a malicious relay
+    // can strip it, blank it, swap in another well-formed frontier, or equivocate per
+    // recipient — and the GCM tag still verifies, defeating the very adversary the
+    // mechanism exists to detect. Encoding the ABSENT case matters as much as the value:
+    // otherwise a stripped element looks identical to a sender with no frontier.
+    //
+    // Failing closed costs nothing here: a relay that tampers now gets the message
+    // rejected, which it could equally have achieved by dropping the stanza.
+    public uint8[] aad_with_heads(string room_jid, uint8[]? heads_payload) {
         uint8[] hdr = marshal();
         uint8[] jid = string_to_bytes(room_jid);
-        return concat_byte_arrays(hdr, jid);
+        uint8[] tag;
+        if (heads_payload == null) {
+            tag = new uint8[] { 0x00 };
+        } else {
+            uint8[] hp = (!) heads_payload;
+            tag = new uint8[3 + hp.length];
+            tag[0] = 0x01;
+            tag[1] = (uint8) ((hp.length >> 8) & 0xff);
+            tag[2] = (uint8) (hp.length & 0xff);
+            for (int i = 0; i < hp.length; i++) {
+                tag[3 + i] = hp[i];
+            }
+        }
+        return concat_byte_arrays(concat_byte_arrays(hdr, jid), tag);
+    }
+
+    // Convenience overload for messages carrying no <heads> advertisement.
+    public uint8[] aad(string room_jid) {
+        return aad_with_heads(room_jid, null);
     }
 }
 
