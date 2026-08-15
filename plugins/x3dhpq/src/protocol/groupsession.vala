@@ -137,6 +137,20 @@ public class GroupSession : Object {
         members[fp] = m;
     }
 
+    // §13.6 member removal as an EPOCH-NEUTRAL member-set operation.
+    //
+    // On the v2 fold-driven path the epoch is not ours to count: the fold is
+    // authoritative and the caller applies it with apply_fold_epoch, which is
+    // where the single sender-chain rotation comes from. Bumping a local counter
+    // here as well cost a second chain rotation and a second Ed25519 keypair per
+    // removal, and — the part that actually mattered — recorded removed_aiks[fp]
+    // against a locally counted epoch that apply_fold_epoch was about to
+    // overwrite, so the removal epoch on record could disagree with the fold
+    // epoch every other check uses. The caller therefore applies the fold epoch
+    // FIRST, so `epoch` here is already the fold epoch.
+    //
+    // The v1 linear-journal path has no fold to take an epoch from — there the
+    // local rotation IS the epoch — and uses remove_member_by_fp_rotating().
     public void remove_member_by_fp(string fp) throws GLib.Error {
         members.unset(fp);
         // Clear recv chains for this AIK.
@@ -149,6 +163,15 @@ public class GroupSession : Object {
         foreach (string k in to_remove) {
             recv_chains.unset(k);
         }
+        removed_aiks[fp] = epoch;
+    }
+
+    // §13.6 removal on the v1 linear-journal path: no fold supplies an epoch, so
+    // the local rotation is the epoch and the removal is recorded at the epoch
+    // that rotation produced. Dropping this rotation would leave a removed member
+    // holding a live sender chain.
+    public void remove_member_by_fp_rotating(string fp) throws GLib.Error {
+        remove_member_by_fp(fp);
         rotate_epoch();
         removed_aiks[fp] = epoch;
     }

@@ -8,7 +8,9 @@ public class Database : Qlite.Database {
     // v22: D1 changed the pre-key signing input (domain-separated, id-bound), so
     // every stored SPK/KEM signature is stale and must be re-made; and D6 adds the
     // durable ever-authorized device set.
-    private const int VERSION = 22;
+    // v23: §9.4.2 requires the checkpoint-deferral queue to be persisted alongside
+    // the session state (deferred_pairwise_message).
+    private const int VERSION = 23;
 
     public class AccountIdentityTable : Table {
         public Column<int> id = new Column.Integer("id") { primary_key = true, auto_increment = true };
@@ -248,6 +250,41 @@ public class Database : Qlite.Database {
             base(db, "pairwise_session");
             init({ account_id, bare_jid, device_id, session_state_base64, created_at, updated_at });
             unique({ account_id, bare_jid, device_id });
+        }
+    }
+
+    // §9.4.2 checkpoint-deferral queue, persisted ALONGSIDE the session state it
+    // belongs to and keyed exactly like pairwise_session: (account_id, bare_jid,
+    // device_id). A checkpoint that is delayed long enough for the deferral queue
+    // to matter is routinely delayed across a client restart — the common case on
+    // mobile — so a purely in-memory queue drops precisely the messages the
+    // mechanism exists to save.
+    //
+    // The persisted unit is the whole received stanza, serialised with
+    // StanzaNode.to_xml(). That is what a re-run of the receive pipeline needs:
+    // Dino re-decrypts by re-injecting the original stanza (MessageProcessor.
+    // parse_message_stanza + received_pipeline), not by trial-decrypting against a
+    // ratchet snapshot, and the spec leaves that an implementation choice.
+    //
+    // `id` is an autoincrement rowid, which doubles as the FIFO order (oldest =
+    // lowest id, evicted first) and as the handle used to drop exactly one entry
+    // once the pipeline is done with it. dedup_key is the message's server_id or
+    // stanza_id ("" when it has neither) and only ever suppresses duplicates; it
+    // is deliberately NOT a UNIQUE constraint, because several id-less stanzas may
+    // legitimately be queued at once. Added at schema v23.
+    public class DeferredPairwiseMessageTable : Table {
+        public Column<int> id = new Column.Integer("id") { primary_key = true, auto_increment = true };
+        public Column<int> account_id = new Column.Integer("account_id") { not_null = true };
+        public Column<string> bare_jid = new Column.NonNullText("bare_jid");
+        public Column<int> device_id = new Column.Integer("device_id") { not_null = true };
+        public Column<string> dedup_key = new Column.NonNullText("dedup_key");
+        public Column<string> stanza_xml = new Column.NonNullText("stanza_xml");
+        public Column<long> created_at = new Column.Long("created_at") { not_null = true };
+
+        internal DeferredPairwiseMessageTable(Database db) {
+            base(db, "deferred_pairwise_message");
+            init({ id, account_id, bare_jid, device_id, dedup_key, stanza_xml, created_at });
+            index("deferred_pairwise_message_session_idx", { account_id, bare_jid, device_id });
         }
     }
 
@@ -572,6 +609,7 @@ public class Database : Qlite.Database {
     public KemPreKeyTable kem_pre_key { get; private set; }
     public OneTimePreKeyTable one_time_pre_key { get; private set; }
     public PairwiseSessionTable pairwise_session { get; private set; }
+    public DeferredPairwiseMessageTable deferred_pairwise_message { get; private set; }
     public GroupSessionTable group_session { get; private set; }
     public RoomOwnerPinTable room_owner_pin { get; private set; }
     public RoomGenesisQuarantineTable room_genesis_quarantine { get; private set; }
@@ -600,6 +638,7 @@ public class Database : Qlite.Database {
         kem_pre_key = new KemPreKeyTable(this);
         one_time_pre_key = new OneTimePreKeyTable(this);
         pairwise_session = new PairwiseSessionTable(this);
+        deferred_pairwise_message = new DeferredPairwiseMessageTable(this);
         group_session = new GroupSessionTable(this);
         room_owner_pin = new RoomOwnerPinTable(this);
         room_genesis_quarantine = new RoomGenesisQuarantineTable(this);
@@ -615,7 +654,7 @@ public class Database : Qlite.Database {
         ever_authorized_device = new EverAuthorizedDeviceTable(this);
         revoked_device = new RevokedDeviceTable(this);
         message_device = new MessageDeviceTable(this);
-        init({ account_identity, peer_account_identity, peer_device, device_list, trust_manifest, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, group_session, room_owner_pin, room_genesis_quarantine, membership_journal, membership_dag, device_audit, audit_entry, recovery_blob, pairing_session, pending_enrollment_request, device_nickname, manifest_revoked_device, ever_authorized_device, revoked_device, message_device });
+        init({ account_identity, peer_account_identity, peer_device, device_list, trust_manifest, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, deferred_pairwise_message, group_session, room_owner_pin, room_genesis_quarantine, membership_journal, membership_dag, device_audit, audit_entry, recovery_blob, pairing_session, pending_enrollment_request, device_nickname, manifest_revoked_device, ever_authorized_device, revoked_device, message_device });
     }
 
     public Row? get_local_identity(int account_id) {
@@ -1212,6 +1251,93 @@ public class Database : Qlite.Database {
             .with(pairwise_session.bare_jid, "=", bare_jid)
             .with(pairwise_session.device_id, "=", device_id)
             .perform();
+        // The deferral queue is part of this session's state (§9.4.2): when the
+        // session is torn down its pending ciphertexts can never decrypt again,
+        // so they must not outlive it as orphans.
+        delete_deferred_pairwise_messages(account, bare_jid, device_id);
+    }
+
+    // ── §9.4.2 persisted checkpoint-deferral queue ────────────────────────────
+
+    // One persisted deferral-queue entry, in FIFO (insertion) order.
+    public class DeferredPairwiseRecord : Object {
+        public int64 id { get; set; }
+        public string dedup_key { get; set; default = ""; }
+        public string stanza_xml { get; set; default = ""; }
+    }
+
+    public bool has_deferred_pairwise_messages(Account account, string bare_jid, int device_id) {
+        return deferred_pairwise_message.select()
+            .with(deferred_pairwise_message.account_id, "=", account.id)
+            .with(deferred_pairwise_message.bare_jid, "=", bare_jid)
+            .with(deferred_pairwise_message.device_id, "=", device_id)
+            .count() > 0;
+    }
+
+    // Append one entry and enforce the §9.4.2 cap of 64 per session, oldest first.
+    // Returns the new row's id, or 0 if it could not be stored (the in-memory
+    // queue still holds it in that case, so a store failure only costs durability).
+    public int64 store_deferred_pairwise_message(Account account, string bare_jid, int device_id,
+            string dedup_key, string stanza_xml, int max_entries) {
+        int64 row_id = deferred_pairwise_message.insert()
+            .value(deferred_pairwise_message.account_id, account.id)
+            .value(deferred_pairwise_message.bare_jid, bare_jid)
+            .value(deferred_pairwise_message.device_id, device_id)
+            .value(deferred_pairwise_message.dedup_key, dedup_key)
+            .value(deferred_pairwise_message.stanza_xml, stanza_xml)
+            .value(deferred_pairwise_message.created_at, (long) new DateTime.now_utc().to_unix())
+            .perform();
+        evict_deferred_pairwise_messages(account, bare_jid, device_id, max_entries);
+        return row_id;
+    }
+
+    // Oldest-first eviction down to `max_entries`. Deleting by explicit id list
+    // rather than a correlated subquery keeps this on the same Qlite surface as
+    // the rest of the schema.
+    public void evict_deferred_pairwise_messages(Account account, string bare_jid, int device_id, int max_entries) {
+        if (max_entries < 0) return;
+        Gee.List<int64?> ids = new Gee.ArrayList<int64?>();
+        foreach (Row r in deferred_pairwise_message.select({ deferred_pairwise_message.id })
+                .with(deferred_pairwise_message.account_id, "=", account.id)
+                .with(deferred_pairwise_message.bare_jid, "=", bare_jid)
+                .with(deferred_pairwise_message.device_id, "=", device_id)
+                .order_by(deferred_pairwise_message.id, "ASC")) {
+            ids.add((int64) r[deferred_pairwise_message.id]);
+        }
+        for (int i = 0; i < ids.size - max_entries; i++) {
+            delete_deferred_pairwise_message(ids.get(i));
+        }
+    }
+
+    public Gee.List<DeferredPairwiseRecord> get_deferred_pairwise_messages(Account account, string bare_jid, int device_id) {
+        Gee.List<DeferredPairwiseRecord> out_rows = new Gee.ArrayList<DeferredPairwiseRecord>();
+        foreach (Row r in deferred_pairwise_message.select()
+                .with(deferred_pairwise_message.account_id, "=", account.id)
+                .with(deferred_pairwise_message.bare_jid, "=", bare_jid)
+                .with(deferred_pairwise_message.device_id, "=", device_id)
+                .order_by(deferred_pairwise_message.id, "ASC")) {
+            DeferredPairwiseRecord rec = new DeferredPairwiseRecord();
+            rec.id = (int64) r[deferred_pairwise_message.id];
+            rec.dedup_key = r[deferred_pairwise_message.dedup_key];
+            rec.stanza_xml = r[deferred_pairwise_message.stanza_xml];
+            out_rows.add(rec);
+        }
+        return out_rows;
+    }
+
+    public void delete_deferred_pairwise_message(int64 row_id) {
+        if (row_id <= 0) return;
+        deferred_pairwise_message.delete()
+            .with(deferred_pairwise_message.id, "=", (int) row_id)
+            .perform();
+    }
+
+    public void delete_deferred_pairwise_messages(Account account, string bare_jid, int device_id) {
+        deferred_pairwise_message.delete()
+            .with(deferred_pairwise_message.account_id, "=", account.id)
+            .with(deferred_pairwise_message.bare_jid, "=", bare_jid)
+            .with(deferred_pairwise_message.device_id, "=", device_id)
+            .perform();
     }
 
     // One-shot recovery hook — drop every pairwise session for this account
@@ -1226,6 +1352,10 @@ public class Database : Qlite.Database {
             .count();
         pairwise_session.delete()
             .with(pairwise_session.account_id, "=", account.id)
+            .perform();
+        // Same reasoning as delete_session(): the deferral queue is session state.
+        deferred_pairwise_message.delete()
+            .with(deferred_pairwise_message.account_id, "=", account.id)
             .perform();
         return n;
     }

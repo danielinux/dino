@@ -20,6 +20,7 @@ endif
 sources = files(
     'src/contact_details_provider.vala',
     'src/database.vala',
+    'src/deferral_queue.vala',
     'src/encryption_list_entry.vala',
     'src/encryption_preferences_entry.vala',
     'src/file_transfer.vala',
@@ -111,6 +112,7 @@ test_sources = [
     'tests/membership_journal.vala',
     'tests/membership_dag.vala',
     'tests/membership_dag_persistence.vala',
+    'tests/deferral_queue.vala',
     'tests/device_dag.vala',
     'tests/trust_manifest.vala',
     'tests/device_tracker.vala',

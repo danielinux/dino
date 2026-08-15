@@ -25,6 +25,7 @@ class Pairwise : Gee.TestCase {
         // D3
         add_test("header_kat_and_five_field_rejection", test_header_kat_and_five_field_rejection);
         add_test("checkpoint_overtake_defers_then_recovers", test_checkpoint_overtake_defers_then_recovers);
+        add_test("deferred_queue_survives_restart_and_decrypts", test_deferred_queue_survives_restart_and_decrypts);
         add_test("failed_auth_leaves_state_unchanged", test_failed_auth_leaves_state_unchanged);
         // D2 persistence
         add_test("legacy_session_blob_is_discarded", test_legacy_session_blob_is_discarded);
@@ -445,6 +446,175 @@ class Pairwise : Gee.TestCase {
                 "the deferred message must decrypt once the checkpoint transition has been applied");
         } catch (Error e) {
             fail_if_reached(e.message);
+        }
+    }
+
+    // §9.4.2, "Deferral queue": the queue MUST be persisted alongside the session
+    // state. A checkpoint delayed long enough for deferral to matter is routinely
+    // delayed across a client restart — the common case on mobile — so this walks
+    // the whole path with nothing carried over in memory: defer N+1, persist both
+    // the session and the queued stanza, throw both objects away, reopen the
+    // database, apply the checkpoint N, and decrypt the restored N+1.
+    private void test_deferred_queue_survives_restart_and_decrypts() {
+        string db_path = GLib.Path.build_filename(GLib.Environment.get_tmp_dir(),
+            "x3dhpq-deferral-restart-%u.db".printf(Random.next_int()));
+        try {
+            TestIdentity alice = new TestIdentity();
+            TestIdentity bob = new TestIdentity();
+            SessionBootstrap a;
+            SessionState b;
+            establish(alice, bob, out a, out b);
+
+            roundtrip(a.state, b);      // A->B
+            roundtrip(b, a.state);      // B->A, so Alice learns Bob's KEM pub
+
+            // Alice checkpoints on N, then sends N+1 on the post-checkpoint chain.
+            a.state.last_checkpoint_time = 0;
+            Bytes n_key = Crypto.random_bytes(44);
+            MessageHeader n_h; Bytes n_ct;
+            encrypt_transport_key(a.state, n_key, out n_h, out n_ct);
+            fail_if(n_h.kem_ciphertext == null, "message N must carry the checkpoint");
+
+            Bytes n1_key = Crypto.random_bytes(44);
+            MessageHeader n1_h; Bytes n1_ct;
+            encrypt_transport_key(a.state, n1_key, out n1_h, out n1_ct);
+            fail_if_not(n1_h.ckpt_n == n_h.n, "N+1 must advertise the checkpoint index");
+
+            // N+1 arrives first and is deferred, leaving the ratchet untouched.
+            string before = b.serialize();
+            bool deferred = false;
+            try {
+                decrypt_transport_key(b, n1_h, n1_ct);
+            } catch (PairwiseSessionError.CHECKPOINT_DEFERRED de) {
+                deferred = true;
+            }
+            fail_if_not(deferred, "a message that overtook a checkpoint must be deferred");
+            fail_if_not_eq_str(before, b.serialize(), "deferral must not touch ratchet state");
+
+            Dino.Entities.Account account = new Dino.Entities.Account(new Xmpp.Jid("bob@example.com"), "pw");
+            account.id = 42;
+            string sender = "alice@example.com";
+            int sender_device = 1;
+            int our_device = 2;
+            string stanza_xml = deferred_message_xml(sender, sender_device, our_device, n1_h, n1_ct);
+
+            // Everything the client knew, written down and then dropped.
+            {
+                Database db = new Database(db_path);
+                db.store_session(account, sender, sender_device, b);
+                DeferralQueue queue = new DeferralQueue(db);
+                DeferredPairwiseMessage entry = new DeferredPairwiseMessage();
+                entry.dedup_key = "n1";
+                entry.stanza_xml = stanza_xml;
+                queue.enqueue(account, sender, sender_device, entry);
+            }
+
+            // ── restart ─────────────────────────────────────────────────────
+            Database restarted = new Database(db_path);
+            DeferralQueue restored_queue = new DeferralQueue(restarted);
+            fail_if_not(restored_queue.has_pending(account, sender, sender_device),
+                "the deferral queue must survive a client restart");
+            Gee.List<DeferredPairwiseMessage> restored =
+                restored_queue.restore(account, sender, sender_device);
+            if (fail_if_not_eq_int(restored.size, 1, "the deferred message must be restored")) return;
+
+            SessionState? b_after = restarted.get_session(account, sender, sender_device);
+            if (fail_if(b_after == null, "the session it belongs to must be restored too")) return;
+            fail_if_not_eq_str(before, ((!) b_after).serialize(),
+                "the restored session must be the pre-checkpoint state, untouched by the deferral");
+
+            // The missing checkpoint finally lands, after the restart.
+            Bytes got_n = decrypt_transport_key((!) b_after, n_h, n_ct);
+            fail_if_not_eq_uint8_arr(bytes_to_array(n_key), bytes_to_array(got_n),
+                "the checkpoint message must decrypt after the restart");
+
+            // Re-run the restored entry the way the drain does: re-parse the
+            // stanza that was persisted and feed it back through decryption.
+            Xmpp.StanzaNode? node = parse_stored_message(restored.get(0).stanza_xml);
+            if (fail_if(node == null, "the persisted stanza must parse back")) return;
+            MessageHeader? rh;
+            Bytes rct;
+            extract_envelope_key((!) node, our_device, out rh, out rct);
+            if (fail_if(rh == null, "the persisted stanza must still carry a usable header")) return;
+            Bytes got_n1 = decrypt_transport_key((!) b_after, (!) rh, rct);
+            fail_if_not_eq_uint8_arr(bytes_to_array(n1_key), bytes_to_array(got_n1),
+                "a deferred message restored from disk must decrypt once the checkpoint has landed");
+        } catch (Error e) {
+            fail_if_reached(e.message);
+        }
+        FileUtils.unlink(db_path);
+        FileUtils.unlink(db_path + "-shm");
+        FileUtils.unlink(db_path + "-wal");
+    }
+
+    // The <message/> exactly as the receive path saw it, which is what the queue
+    // persists. Ciphertext only — no plaintext and no key material.
+    private string deferred_message_xml(string sender_jid, int sender_device, int rid,
+            MessageHeader header, Bytes ciphertext) throws GLib.Error {
+        Xmpp.StanzaNode envelope = new Xmpp.StanzaNode.build("x3dhpq", NS_ENVELOPE)
+            .add_self_xmlns()
+            .put_attribute("sender-device", sender_device.to_string())
+            .put_attribute("sender-jid", sender_jid)
+            .put_node(new Xmpp.StanzaNode.build("key", NS_ENVELOPE)
+                .put_attribute("rid", rid.to_string())
+                .put_node(new Xmpp.StanzaNode.build("hdr", NS_ENVELOPE)
+                    .put_node(new Xmpp.StanzaNode.text(Pairwise.bytes_b64(header.marshal()))))
+                .put_node(new Xmpp.StanzaNode.build("emk", NS_ENVELOPE)
+                    .put_node(new Xmpp.StanzaNode.text(Pairwise.bytes_b64(ciphertext)))))
+            .put_node(new Xmpp.StanzaNode.build("payload", NS_ENVELOPE)
+                .put_node(new Xmpp.StanzaNode.text("AAAAAAAAAAAAAAAA")));
+        return new Xmpp.StanzaNode.build("message", "jabber:client")
+            .put_attribute("from", sender_jid + "/one")
+            .put_attribute("to", "bob@example.com/two")
+            .put_attribute("type", "chat")
+            .put_attribute("id", "n1")
+            .put_node(envelope)
+            .to_xml();
+    }
+
+    private void extract_envelope_key(Xmpp.StanzaNode message, int rid,
+            out MessageHeader? header, out Bytes ciphertext) {
+        header = null;
+        ciphertext = new Bytes(new uint8[0]);
+        Xmpp.StanzaNode? envelope = message.get_subnode("x3dhpq", NS_ENVELOPE);
+        if (envelope == null) return;
+        foreach (Xmpp.StanzaNode key in ((!) envelope).get_subnodes("key", NS_ENVELOPE)) {
+            if (key.get_attribute_int("rid") != rid) continue;
+            Xmpp.StanzaNode? hdr = key.get_subnode("hdr", NS_ENVELOPE);
+            Xmpp.StanzaNode? emk = key.get_subnode("emk", NS_ENVELOPE);
+            if (hdr == null || emk == null) return;
+            header = MessageHeader.unmarshal(new Bytes(Base64.decode(((!) hdr).get_string_content())));
+            ciphertext = new Bytes(Base64.decode(((!) emk).get_string_content()));
+            return;
+        }
+    }
+
+    // StanzaNode.to_xml() writes with the stanza namespace already current, so
+    // reading it back needs the same stream context — exactly what the manager
+    // does when it restores a persisted deferral.
+    private Xmpp.StanzaNode? parse_stored_message(string xml) {
+        Xmpp.StanzaNode? result = null;
+        bool done = false;
+        MainLoop loop = new MainLoop();
+        parse_stored_message_async.begin(xml, (obj, res) => {
+            result = parse_stored_message_async.end(res);
+            done = true;
+            loop.quit();
+        });
+        if (!done) loop.run();
+        return result;
+    }
+
+    private async Xmpp.StanzaNode? parse_stored_message_async(string xml) {
+        try {
+            Xmpp.StanzaReader reader = new Xmpp.StanzaReader.for_string(
+                "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>"
+                + xml + "</stream:stream>");
+            yield reader.read_root_node();
+            Xmpp.StanzaNode node = yield reader.read_node();
+            return node.name == "message" ? node : null;
+        } catch (GLib.Error e) {
+            return null;
         }
     }
 

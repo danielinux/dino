@@ -18,6 +18,7 @@ class GroupSessionTest : Gee.TestCase {
         add_test("groupsession_encrypt_decrypt", test_groupsession_encrypt_decrypt);
         add_test("groupsession_epoch_rotation_on_add", test_groupsession_epoch_rotation_on_add);
         add_test("groupsession_epoch_rotation_on_remove", test_groupsession_epoch_rotation_on_remove);
+        add_test("groupsession_fold_driven_removal_is_epoch_neutral", test_groupsession_fold_driven_removal_is_epoch_neutral);
         add_test("groupsession_removed_member_rejected", test_groupsession_removed_member_rejected);
         add_test("groupsession_serialize_deserialize", test_groupsession_serialize_deserialize);
         add_test("groupsession_checkpoint_bounds_history", test_groupsession_checkpoint_bounds_history);
@@ -652,9 +653,56 @@ class GroupSessionTest : Gee.TestCase {
             gs.add_member(m2);
             string fp2 = m2.fingerprint();
             uint32 epoch_after_add = gs.epoch;
-            gs.remove_member_by_fp(fp2);
+            // v1 linear journal: no fold epoch exists, so the local rotation IS
+            // the epoch and removal must still rotate.
+            gs.remove_member_by_fp_rotating(fp2);
             fail_if_not(gs.epoch > epoch_after_add, "epoch should increase after remove");
             fail_if_not(gs.is_removed(fp2), "removed member should be in removed_aiks");
+            fail_if_not_eq_int((int) gs.get_removed_aiks()[fp2], (int) gs.epoch,
+                "a v1 removal must be recorded at the epoch its own rotation produced");
+        } catch (Error e) {
+            fail_if_reached(e.message);
+        }
+    }
+
+    // §13.6 on the v2 fold-driven path: the fold owns the epoch, so a removal
+    // must be epoch-neutral. The rotation comes solely from apply_fold_epoch —
+    // exactly one, not two — and the removal is recorded at the FOLD epoch, not
+    // at a local counter that apply_fold_epoch is about to overwrite.
+    private void test_groupsession_fold_driven_removal_is_epoch_neutral() {
+        try {
+            Bytes ed1; Bytes priv1; Crypto.generate_ed25519(out ed1, out priv1);
+            Bytes ml1; Bytes mlpriv1; Crypto.generate_mldsa65(out ml1, out mlpriv1);
+            uint8[] aik1 = make_aik_bytes(bytes_to_arr(ed1), bytes_to_arr(ml1));
+            GroupSession gs = GroupSession.new_session("r@x", aik1, 1);
+
+            Bytes ed2; Bytes priv2; Crypto.generate_ed25519(out ed2, out priv2);
+            Bytes ml2; Bytes mlpriv2; Crypto.generate_mldsa65(out ml2, out mlpriv2);
+            uint8[] aik2 = make_aik_bytes(bytes_to_arr(ed2), bytes_to_arr(ml2));
+            GroupMember m2 = make_member(aik2, 2);
+            gs.add_member(m2);
+            string fp2 = m2.fingerprint();
+
+            // manager.vala's order on the fold path: apply the fold epoch first —
+            // that is the one and only rotation — then diff the member set.
+            uint32 fold_epoch = 7;
+            uint64 fold_epoch_id = (uint64) 0xA1B2C3D4E5F60718;
+            fail_if_not(gs.apply_fold_epoch(fold_epoch, fold_epoch_id),
+                "adopting the fold epoch must rotate the sender chain");
+            uint8[] sig_after_fold = gs.send_chain.sig_pub.copy();
+            uint8[] chain_after_fold = gs.send_chain.chain_key.copy();
+
+            gs.remove_member_by_fp(fp2);
+
+            fail_if_not_eq_uint8_arr(gs.send_chain.sig_pub, sig_after_fold,
+                "a fold-driven removal must not rotate the sender chain a second time");
+            fail_if_not_eq_uint8_arr(gs.send_chain.chain_key, chain_after_fold,
+                "a fold-driven removal must not rotate the sender chain a second time");
+            fail_if_not_eq_int((int) gs.epoch, (int) fold_epoch,
+                "a fold-driven removal must leave the fold epoch alone");
+            fail_if_not(gs.is_removed(fp2), "the removed member must be recorded");
+            fail_if_not_eq_int((int) gs.get_removed_aiks()[fp2], (int) fold_epoch,
+                "the removal must be recorded at the FOLD epoch, not a local counter");
         } catch (Error e) {
             fail_if_reached(e.message);
         }

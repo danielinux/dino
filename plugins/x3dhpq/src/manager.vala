@@ -56,6 +56,7 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     public Manager(Dino.Application app, Database db) {
         this.app = app;
         this.db = db;
+        this.deferral_queue = new DeferralQueue(db);
 
         app.stream_interactor.account_added.connect(on_account_added);
         app.stream_interactor.stream_negotiated.connect(on_stream_negotiated);
@@ -234,7 +235,9 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                     }
                     fp_hex = sb.str.substring(0, 30);
                     fp_hex = @"$(fp_hex.substring(0, 5)) $(fp_hex.substring(5, 5)) $(fp_hex.substring(10, 5)) $(fp_hex.substring(15, 5)) $(fp_hex.substring(20, 5)) $(fp_hex.substring(25, 5))";
-                    gs.remove_member_by_fp(fp_hex);
+                    // v1 linear journal: no fold epoch to adopt, so the local
+                    // rotation IS the epoch here.
+                    gs.remove_member_by_fp_rotating(fp_hex);
                 }
             } catch (GLib.Error err) {
                 warning("rebuild journal: failed at seq=%s: %s", e.seq.to_string(), err.message);
@@ -246,8 +249,9 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     // admin set is enforced inside the fold (signer_fp must be an admin for an
     // entry to apply). We diff the fold's member set against the session's
     // current members: additions call add_initial_member; removals call
-    // remove_member_by_fp, which rotates the sender-chain epoch so a removed
-    // member cannot read future group messages. The fold only includes entries
+    // remove_member_by_fp, which is epoch-neutral — the sender-chain rotation that
+    // stops a removed member reading future group messages comes from the single
+    // apply_fold_epoch below, which runs first. The fold only includes entries
     // whose parents are all present (canonical_order), i.e. the causally-stable
     // prefix, so rotation is bound to stable state, not a movable raw index.
     // Fold a room's membership DAG under the §13.1a.1 owner pin, pinning the owner the
@@ -308,7 +312,29 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                 }
             }
         }
-        // Removals (rotates the epoch on the way out).
+        /* D5.3: the FOLD is authoritative for both the epoch and its identity. A
+         * re-fold that changes epoch_id — including one that leaves the numeric
+         * epoch untouched, which is exactly the contradicted-epoch case — forces a
+         * sender-chain rotation here: fresh chain key, fresh per-epoch signing key,
+         * checkpoint back to index 0. Without it a contradicted epoch is stuck,
+         * because install-once forbids reusing the number for a different chain.
+         *
+         * This runs BEFORE the removals below, and it is the ONLY rotation on this
+         * path. Removing first meant remove_member_by_fp counted a local epoch that
+         * this call then overwrote: the net epoch came out right only because the
+         * fold value always wins, at the cost of a second chain rotation and a
+         * second Ed25519 keypair per removal, and with removed_aiks[fp] recorded
+         * against the throwaway counter rather than the fold epoch. */
+        try {
+            if (gs.apply_fold_epoch(st.epoch, st.epoch_id(room_jid_str))) {
+                debug("x3dhpq: %s rotated to epoch %u (epoch_id %s) after re-fold",
+                    room_jid_str, st.epoch, gs.epoch_id.to_string());
+            }
+        } catch (GLib.Error e) {
+            warning("rebuild dag: epoch rotation failed in %s: %s", room_jid_str, e.message);
+        }
+
+        // Removals: epoch-neutral, recorded at the fold epoch applied just above.
         var to_remove = new Gee.ArrayList<string>();
         foreach (string fp in gs.get_members().keys) {
             if (!target.has_key(fp)) to_remove.add(fp);
@@ -319,21 +345,6 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             } catch (GLib.Error e) {
                 warning("rebuild dag: remove member failed in %s: %s", room_jid_str, e.message);
             }
-        }
-
-        /* D5.3: the FOLD is authoritative for both the epoch and its identity. A
-         * re-fold that changes epoch_id — including one that leaves the numeric
-         * epoch untouched, which is exactly the contradicted-epoch case — forces a
-         * sender-chain rotation here: fresh chain key, fresh per-epoch signing key,
-         * checkpoint back to index 0. Without it a contradicted epoch is stuck,
-         * because install-once forbids reusing the number for a different chain. */
-        try {
-            if (gs.apply_fold_epoch(st.epoch, st.epoch_id(room_jid_str))) {
-                debug("x3dhpq: %s rotated to epoch %u (epoch_id %s) after re-fold",
-                    room_jid_str, st.epoch, gs.epoch_id.to_string());
-            }
-        } catch (GLib.Error e) {
-            warning("rebuild dag: epoch rotation failed in %s: %s", room_jid_str, e.message);
         }
     }
 
@@ -1835,55 +1846,43 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         return true;
     }
 
-    // ── D3.4: bounded pairwise deferral queue ─────────────────────────────────
+    // ── D3.4 / §9.4.2: bounded, PERSISTED pairwise deferral queue ─────────────
     //
-    // A message that overtook a checkpoint-bearing one cannot be processed yet: what
-    // is missing is a STATE TRANSITION, not a chain step, so the skipped-key cache
-    // cannot serve it. It is held here — per session, FIFO, oldest evicted first —
-    // and re-run through the receive pipeline immediately after any successful
-    // checkpoint application or DH ratchet on that session.
+    // The queue itself lives in deferral_queue.vala, which owns the FIFO, the cap
+    // of 64 per session with oldest-first eviction, and the write-through to
+    // deferred_pairwise_message. §9.4.2 requires it to be persisted alongside the
+    // session state: a checkpoint delayed long enough for deferral to matter is
+    // routinely delayed across a client restart.
     //
     // Deferral is never surfaced as a decryption failure: the pipeline is aborted so
     // the stanza is neither stored with its cleartext fallback body nor deduped away
     // before the retry, and the session is deliberately left alone (renegotiating
     // would destroy a perfectly healthy session over a mere reordering).
-    private class DeferredPairwiseMessage {
-        public Entities.Message message;
-        public Xmpp.MessageStanza stanza;
-        public Conversation conversation;
-        public string dedup_key;
-        public DeferredPairwiseMessage(Entities.Message m, Xmpp.MessageStanza s, Conversation c, string k) {
-            message = m; stanza = s; conversation = c; dedup_key = k;
-        }
-    }
-    private HashMap<string, Gee.ArrayList<DeferredPairwiseMessage>> deferred_pairwise_msgs =
-        new HashMap<string, Gee.ArrayList<DeferredPairwiseMessage>>();
-    // D3.4 cap: 64 messages per session.
-    private const int MAX_DEFERRED_PAIRWISE_MSGS = 64;
+    private DeferralQueue deferral_queue;
 
-    private static string pairwise_session_key(Account account, string sender_jid, int device_id) {
-        return "%d/%s/%d".printf(account.id, sender_jid, device_id);
-    }
+    // to_xml() writes with the stanza namespace already current, so reading it
+    // back needs the same stream context — otherwise an unprefixed <message>
+    // would land in the XML namespace instead of jabber:client.
+    private const string DEFERRED_STREAM_PROLOG =
+        "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>";
+    private const string DEFERRED_STREAM_EPILOG = "</stream:stream>";
 
     private void queue_deferred_pairwise_message(Conversation conversation, Entities.Message message,
             Xmpp.MessageStanza stanza, string sender_jid, int device_id) {
-        string key = pairwise_session_key(conversation.account, sender_jid, device_id);
-        string dedup = message.server_id ?? (message.stanza_id ?? "");
-        Gee.ArrayList<DeferredPairwiseMessage>? q = deferred_pairwise_msgs.has_key(key)
-            ? deferred_pairwise_msgs.get(key) : null;
-        if (q == null) {
-            q = new Gee.ArrayList<DeferredPairwiseMessage>();
-            deferred_pairwise_msgs.set(key, q);
+        DeferredPairwiseMessage entry = new DeferredPairwiseMessage();
+        entry.dedup_key = message.server_id ?? (message.stanza_id ?? "");
+        entry.message = message;
+        entry.stanza = stanza;
+        entry.conversation = conversation;
+        try {
+            // The stanza as it arrived: ciphertext only, no plaintext and no keys.
+            entry.stanza_xml = stanza.stanza.to_xml();
+        } catch (GLib.Error e) {
+            // Not fatal — the entry still works for this run, it just will not
+            // survive a restart.
+            warning("x3dhpq: cannot serialise a deferred stanza for persistence: %s", e.message);
         }
-        if (dedup != "") {
-            foreach (DeferredPairwiseMessage p in q) {
-                if (p.dedup_key == dedup) return;
-            }
-        }
-        if (q.size >= MAX_DEFERRED_PAIRWISE_MSGS) {
-            q.remove_at(0);   // oldest evicted first
-        }
-        q.add(new DeferredPairwiseMessage(message, stanza, conversation, dedup));
+        deferral_queue.enqueue(conversation.account, sender_jid, device_id, entry);
     }
 
     // Re-run every deferred message for one session. Entries that still cannot be
@@ -1891,23 +1890,79 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     // transition (or eviction). Deferred to an idle callback so the message that
     // caused the transition has already stored its session state.
     private void schedule_pairwise_drain(Account account, string sender_jid, int device_id) {
-        string key = pairwise_session_key(account, sender_jid, device_id);
-        if (!deferred_pairwise_msgs.has_key(key)) return;
+        // Checks the database too, so a checkpoint that only lands after a
+        // restart still finds the queue it is supposed to release.
+        if (!deferral_queue.has_pending(account, sender_jid, device_id)) return;
         Idle.add(() => {
-            drain_deferred_pairwise_messages(key);
+            drain_deferred_pairwise_messages.begin(account, sender_jid, device_id);
             return false;
         });
     }
 
-    private void drain_deferred_pairwise_messages(string key) {
-        if (!deferred_pairwise_msgs.has_key(key)) return;
-        Gee.ArrayList<DeferredPairwiseMessage> q = deferred_pairwise_msgs.get(key);
-        deferred_pairwise_msgs.unset(key);
-        if (q.size == 0) return;
+    private async void drain_deferred_pairwise_messages(Account account, string sender_jid, int device_id) {
         MessageProcessor? mp = app.stream_interactor.get_module(MessageProcessor.IDENTITY);
         if (mp == null) return;
-        foreach (DeferredPairwiseMessage p in q) {
-            mp.received_pipeline.run.begin(p.message, p.stanza, p.conversation);
+        yield rehydrate_deferred_pairwise_messages(account, sender_jid, device_id, (!) mp);
+        deferral_queue.drain(account, sender_jid, device_id, (entry) => {
+            if (!entry.is_runnable()) return;
+            ((!) mp).received_pipeline.run.begin(entry.message, entry.stanza, entry.conversation, (obj, res) => {
+                ((!) mp).received_pipeline.run.end(res);
+                // Only now is the pipeline finished with this entry. If it
+                // deferred again, queue_deferred_pairwise_message has already
+                // written a fresh row, so dropping THIS row cannot lose the
+                // message — and until this point a crash would have left it
+                // queued rather than lost.
+                deferral_queue.forget(entry);
+            });
+        });
+    }
+
+    // Entries restored from disk after a restart carry only the stanza XML.
+    // Rebuild the Message/Conversation pair the receive pipeline needs, exactly
+    // the way MessageProcessor.run_pipeline_announce would have.
+    private async void rehydrate_deferred_pairwise_messages(Account account, string sender_jid,
+            int device_id, MessageProcessor mp) {
+        deferral_queue.restore(account, sender_jid, device_id);
+        // Snapshot: parse_message_stanza yields, and a concurrent deferral may
+        // append to the live queue while we are suspended.
+        DeferredPairwiseMessage[] pending = {};
+        foreach (DeferredPairwiseMessage entry in deferral_queue.entries(account, sender_jid, device_id)) {
+            if (!entry.is_runnable()) pending += entry;
+        }
+        foreach (DeferredPairwiseMessage entry in pending) {
+            Xmpp.MessageStanza? stanza = yield parse_persisted_deferred_stanza(account, entry.stanza_xml);
+            Conversation? conversation = null;
+            Entities.Message? message = null;
+            if (stanza != null) {
+                message = yield mp.parse_message_stanza(account, (!) stanza);
+                conversation = app.stream_interactor.get_module(ConversationManager.IDENTITY)
+                    .get_conversation_for_message((!) message);
+            }
+            if (stanza == null || conversation == null) {
+                // Nothing will ever make this entry runnable; leaving it would
+                // pin a queue slot forever.
+                warning("x3dhpq: dropping an unrestorable deferred entry for %s/%d", sender_jid, device_id);
+                deferral_queue.discard(entry, account, sender_jid, device_id);
+                continue;
+            }
+            entry.stanza = stanza;
+            entry.message = message;
+            entry.conversation = conversation;
+        }
+    }
+
+    private async Xmpp.MessageStanza? parse_persisted_deferred_stanza(Account account, string stanza_xml) {
+        if (stanza_xml == "") return null;
+        try {
+            StanzaReader reader = new StanzaReader.for_string(
+                DEFERRED_STREAM_PROLOG + stanza_xml + DEFERRED_STREAM_EPILOG);
+            yield reader.read_root_node();
+            StanzaNode node = yield reader.read_node();
+            if (node.name != "message") return null;
+            return new Xmpp.MessageStanza.from_stanza(node, account.bare_jid);
+        } catch (GLib.Error e) {
+            warning("x3dhpq: cannot re-parse a persisted deferred stanza: %s", e.message);
+            return null;
         }
     }
 
@@ -3128,7 +3183,7 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         db.store_membership_journal_entry(account, room_jid_str, stored_entry);
 
         // Apply the removal locally: rebuild the group session from the journal
-        // (the REMOVE entry runs remove_member_by_fp -> rotate_epoch), persist,
+        // (the REMOVE entry runs remove_member_by_fp_rotating), persist,
         // then re-announce the new send chain to the remaining members. The
         // removed member is excluded from the broadcast so the rotation holds.
         int? local_device_id = db.get_local_device_id(account);
