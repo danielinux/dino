@@ -467,12 +467,32 @@ public class MembershipDag : Object {
                 genesis_established = true;
                 continue;
             }
-            st.epoch = (uint32) i;
             if (!st.admins.contains(signer_hex)) continue;
 
+            /* §13.5: the epoch is a MONOTONE COUNT of accepted rotation-causing entries —
+             * never the entry's index in the canonical order.
+             *
+             * Canonical order breaks ties among concurrent entries on
+             * (lamport, signer_fp, entry_hash), so indices are not prefix-stable: a client
+             * holding only B (parent G) folds it at index 1, and when a concurrent A that
+             * sorts ahead of B arrives, B's index silently becomes 2. Deriving a live
+             * encryption epoch from a rank a later-arriving sibling can renumber means a
+             * sender can be asked to rotate to an epoch number it already used for a
+             * different chain, which install-once-per-epoch (§13.4a.2) then discards —
+             * making those messages permanently undecryptable. Counting accepted rotations
+             * only ever moves forward as the DAG grows.
+             *
+             * The count advances for every AUTHORIZED rotation-causing entry, including one
+             * whose effect the fail-closed re-admission rules suppress, so that the epoch
+             * never depends on subtle re-admission outcomes. Unauthorized entries are
+             * skipped above and never count. */
             uint8[] subject;
             JournalEntryV2.parse_subject_fp(e.payload, out subject);
             string subj_hex = (e.payload.length >= 20) ? hex_of(subject) : "";
+
+            if (is_rotation_causing(e.action)) {
+                st.epoch = st.epoch + 1;
+            }
 
             switch (e.action) {
                 case (uint8) MemberAuditActionV2.ADD_MEMBER:
@@ -507,6 +527,15 @@ public class MembershipDag : Object {
         }
         return st;
     }
+    /* §13.5 rotation triggers. Genesis establishes epoch 0 and does not rotate; a Snapshot
+     * is a passive checkpoint and does not rotate on its own. */
+    private static bool is_rotation_causing(uint8 action) {
+        return action == (uint8) MemberAuditActionV2.ADD_MEMBER
+            || action == (uint8) MemberAuditActionV2.REMOVE_MEMBER
+            || action == (uint8) MemberAuditActionV2.ADD_ADMIN
+            || action == (uint8) MemberAuditActionV2.REMOVE_ADMIN;
+    }
+
 
     private bool can_readd(DagState st, Gee.HashMap<string, string> removal_node, string fp_hex, JournalEntryV2 add_entry) {
         if (st.banned.contains(fp_hex)) return false;

@@ -33,6 +33,7 @@ class MembershipDagTest : Gee.TestCase {
         add_test("pinned_owner_survives_hostile_root", test_pinned_owner_survives_hostile_root);
         add_test("unverifiable_first_entry_does_not_consume_genesis", test_unverifiable_first_entry);
         add_test("group_heads_kat_vector", test_group_heads_kat);
+        add_test("concurrent_late_entry_does_not_renumber_epoch", test_epoch_monotone);
     }
 
     // §13.1b anti-withholding KAT — the <heads> wire vector. MUST stay
@@ -386,6 +387,45 @@ class MembershipDagTest : Gee.TestCase {
             int survivors = (st.admins.contains(a1.fp_hex) ? 1 : 0) + (st.admins.contains(a2.fp_hex) ? 1 : 0);
             fail_if_not_eq_int(survivors, 1, "exactly one admin must survive mutual removal");
             fail_if_not(st.admins.contains(owner.fp_hex), "owner always admin");
+        } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    /* §13.5: a concurrent entry arriving LATE must not renumber the epoch of work already
+     * done. Under the old "epoch = index in canonical order" rule, a client holding only B
+     * folded it at index 1, and when concurrent A (which sorts ahead of B) arrived, B's
+     * epoch silently became 2 — so a sender could be asked to rotate to a number it had
+     * already used for a different chain, and install-once-per-epoch would then discard the
+     * new chain, making those messages permanently undecryptable. Mirrors
+     * PQonversations' MembershipDagTest.concurrentLateEntryDoesNotRenumberEpoch. */
+    private void test_epoch_monotone() {
+        try {
+            Id owner = make_id(); Id m1 = make_id(); Id m2 = make_id();
+            var g = sign(owner, 0, heads(null), (uint8) MemberAuditActionV2.ADD_ADMIN, mp(owner.fp), 1000);
+            /* A and B are CONCURRENT: both name genesis as their only parent, same lamport. */
+            var a = sign(owner, 1, heads(g.compute_hash()), (uint8) MemberAuditActionV2.ADD_MEMBER, mp(m1.fp), 1001);
+            var b = sign(owner, 1, heads(g.compute_hash()), (uint8) MemberAuditActionV2.ADD_MEMBER, mp(m2.fp), 1002);
+
+            /* Carol sees only genesis + B. */
+            var partial = new MembershipDag();
+            partial.ingest(g.marshal());
+            partial.ingest(b.marshal());
+            uint64 epoch_b_only = partial.recompute(resolver()).epoch;
+            fail_if_not_eq_int((int) epoch_b_only, 1, "one accepted rotation so far");
+
+            /* The concurrent sibling finally arrives. */
+            partial.ingest(a.marshal());
+            uint64 epoch_both = partial.recompute(resolver()).epoch;
+            fail_if_not_eq_int((int) epoch_both, 2, "two accepted rotations now");
+            fail_if(epoch_both <= epoch_b_only, "epoch must be monotone as the DAG grows");
+
+            /* A client that received both in the other order converges on the same value,
+             * so the epoch is still a function of the entry SET, not of delivery order. */
+            var other = new MembershipDag();
+            other.ingest(g.marshal());
+            other.ingest(a.marshal());
+            other.ingest(b.marshal());
+            fail_if_not_eq_int((int) other.recompute(resolver()).epoch, (int) epoch_both,
+                "epoch must converge regardless of arrival order");
         } catch (Error e) { fail_if_reached(e.message); }
     }
 
