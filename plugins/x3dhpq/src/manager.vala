@@ -259,7 +259,8 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     private Protocol.DagState recompute_dag_pinned(Account account, string room_jid_str,
                                                    Protocol.MembershipDag dag) {
         string? pin = db.get_pinned_room_owner(account, room_jid_str);
-        Protocol.DagState st = dag.recompute_pinned(make_aik_resolver(account), pin);
+        Protocol.DagState st = dag.recompute_checked(
+            make_aik_resolver(account), pin, make_revocation_checker(account));
         if (pin == null && st.owner_fp != null) {
             db.pin_room_owner(account, room_jid_str, ((!) st.owner_fp).down());
         } else if (pin != null && st.owner_fp == null) {
@@ -398,6 +399,52 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         return false;
     }
 
+
+    /* §13.1a: rejects journal entries authored by a device this receiver has revoked.
+     *
+     * Backed by the same durable tombstone table the Trust Manifest fold consults (§11.4),
+     * so revoking a device removes its room-administration authority through the same user
+     * action that removes it from the account. Without this the entry's certificate chain
+     * would only prove the account certified the device at some point — and a revoked
+     * device keeps a valid DC, plus (under §11.8) the account root. */
+    private Protocol.DeviceRevocationChecker make_revocation_checker(Account account) {
+        return (signer_fp_hex, device_id) => {
+            try {
+                uint8[] fp_raw = hex_to_raw20(signer_fp_hex);
+                if (fp_raw.length != 20) return false;
+                string? owner_jid = db.find_peer_jid_by_aik_fp(account, fp_raw);
+                if (owner_jid == null) {
+                    /* Our own account's entries: the peer table holds contacts only. */
+                    string? own_fp = db.get_aik_fingerprint(account);
+                    if (own_fp != null && own_fp.replace(" ", "").down() == signer_fp_hex.down()) {
+                        return db.is_device_revoked(account, (int) device_id);
+                    }
+                    return false;
+                }
+                return db.get_manifest_revoked_devices(account, (!) owner_jid).contains(device_id);
+            } catch (GLib.Error e) {
+                /* Fail OPEN on a lookup error rather than silently discarding an
+                 * administrator's entries: a resolver fault must not be able to erase a
+                 * room's membership history. A genuinely revoked device is still contained
+                 * by the account-level manifest rules (§11.3/§11.4). */
+                return false;
+            }
+        };
+    }
+
+    private static uint8[] hex_to_raw20(string hex_in) {
+        string h = hex_in.replace(" ", "").down();
+        if (h.length != 40) return new uint8[0];
+        uint8[] outb = new uint8[20];
+        for (int i = 0; i < 20; i++) {
+            int hi = hex_nibble(h[2 * i]);
+            int lo = hex_nibble(h[2 * i + 1]);
+            if (hi < 0 || lo < 0) return new uint8[0];
+            outb[i] = (uint8) ((hi << 4) | lo);
+        }
+        return outb;
+    }
+
     private Protocol.AikResolver make_aik_resolver(Account account) {
         return (fp_hex, out ed, out ml) => {
             return resolve_aik(account, fp_hex, out ed, out ml);
@@ -411,18 +458,36 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             uint8 action, uint8[] payload) {
         uint8[] my_ed, my_ml, my_canon, my_fp;
         if (!local_aik(account, out my_ed, out my_ml, out my_canon, out my_fp)) return null;
+
+        /* §13.1a: entries are authored by a DEVICE, not by the bare account. The entry
+         * names this device and carries its AIK-issued certificate, and the signatures
+         * below are made with the device's DIK — so revoking this device revokes its
+         * ability to administer rooms. Signing with the account AIK (as v2 did) left a
+         * revoked device that kept AIK_priv able to administer forever. */
+        int? my_device_id = db.get_local_device_id(account);
+        if (my_device_id == null) return null;
+        string my_dc_b64;
+        try {
+            my_dc_b64 = db.ensure_local_device_certificate(account);
+        } catch (GLib.Error e) {
+            warning("x3dhpq: cannot load local device certificate to author a journal entry: %s", e.message);
+            return null;
+        }
+
         Protocol.MembershipDag dag = get_or_create_dag(account, room_jid_str);
         var entry = new Protocol.JournalEntryV2();
         entry.lamport = dag.next_lamport();
         entry.signer_fp = my_fp;
+        entry.issuer_device_id = (uint32) (!) my_device_id;
+        entry.issuer_dc = bytes_to_uint8_array(bytes_from_base64(my_dc_b64));
         entry.parents = dag.current_heads();
         entry.action = action;
         entry.payload = payload;
         entry.timestamp = new DateTime.now_utc().to_unix();
         try {
             uint8[] sp = entry.signed_part();
-            Bytes aik_priv_ed = bytes_from_base64((!) db.get_local_identity_string(account, db.account_identity.aik_priv_ed25519_base64));
-            Bytes aik_priv_mldsa = bytes_from_base64((!) db.get_local_identity_string(account, db.account_identity.aik_priv_mldsa_base64));
+            Bytes aik_priv_ed = bytes_from_base64((!) db.get_local_identity_string(account, db.account_identity.dik_priv_ed25519_base64));
+            Bytes aik_priv_mldsa = bytes_from_base64((!) db.get_local_identity_string(account, db.account_identity.dik_priv_mldsa_base64));
             entry.signature = bytes_to_uint8_array(global::X3dhpq.Crypto.ed25519_sign(aik_priv_ed, new Bytes(sp)));
             entry.mldsa_signature = bytes_to_uint8_array(global::X3dhpq.Crypto.mldsa65_sign(aik_priv_mldsa, new Bytes(sp)));
         } catch (GLib.Error e) {

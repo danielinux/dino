@@ -8,11 +8,18 @@ using Dino.Plugins.X3dhpq.Protocol;
 class MembershipDagTest : Gee.TestCase {
 
     // A signing identity with its AIK fingerprint (raw 20 bytes) as fp_hex.
+    /* An ACCOUNT (its AIK) plus one DEVICE of that account: a DIK and the AIK-issued
+     * certificate binding it. §13.1a entries are signed by the DIK and carry the DC, so a
+     * test author needs both halves. */
     private class Id {
         public Bytes ed_pub; public Bytes ed_priv;
         public Bytes ml_pub; public Bytes ml_priv;
         public uint8[] fp;      // 20 raw bytes
         public string fp_hex;
+        public uint32 device_id;
+        public Bytes dik_ed_pub; public Bytes dik_ed_priv;
+        public Bytes dik_ml_pub; public Bytes dik_ml_priv;
+        public uint8[] dc;      // marshalled DeviceCertificate, AIK-signed
     }
 
     private Gee.HashMap<string, Id> registry = new Gee.HashMap<string, Id>();
@@ -34,6 +41,7 @@ class MembershipDagTest : Gee.TestCase {
         add_test("unverifiable_first_entry_does_not_consume_genesis", test_unverifiable_first_entry);
         add_test("group_heads_kat_vector", test_group_heads_kat);
         add_test("concurrent_late_entry_does_not_renumber_epoch", test_epoch_monotone);
+        add_test("revoked_device_cannot_author_entries", test_revoked_device_cannot_author);
     }
 
     // §13.1b anti-withholding KAT — the <heads> wire vector. MUST stay
@@ -155,8 +163,22 @@ class MembershipDagTest : Gee.TestCase {
         Crypto.generate_mldsa65(out id.ml_pub, out id.ml_priv);
         id.fp = bytes_to_arr(Crypto.random_bytes(20));
         id.fp_hex = hex(id.fp);
+        id.device_id = 1;
+        Crypto.generate_ed25519(out id.dik_ed_pub, out id.dik_ed_priv);
+        Crypto.generate_mldsa65(out id.dik_ml_pub, out id.dik_ml_priv);
+        id.dc = issue_dc(id.device_id, id.dik_ed_pub, id.dik_ml_pub, id.ed_priv, id.ml_priv);
         registry.set(id.fp_hex, id);
         return id;
+    }
+
+    /* Mint a DC for the given DIK, signed by the account AIK private halves (§7.3.1). */
+    private uint8[] issue_dc(uint32 device_id, Bytes dik_ed_pub, Bytes dik_ml_pub,
+                             Bytes aik_ed_priv, Bytes aik_ml_priv) throws GLib.Error {
+        Bytes dik_x_pub; Bytes dik_x_priv;
+        Crypto.generate_x25519(out dik_x_pub, out dik_x_priv);
+        var cert = DeviceCertificate.issue(
+            device_id, dik_ed_pub, dik_x_pub, dik_ml_pub, aik_ed_priv, aik_ml_priv, 0);
+        return cert.marshal();
     }
 
     private AikResolver resolver() {
@@ -169,16 +191,26 @@ class MembershipDagTest : Gee.TestCase {
 
     private JournalEntryV2 sign(Id signer, uint64 lamport, Gee.ArrayList<Bytes> parents,
             uint8 action, uint8[] payload, int64 ts) throws GLib.Error {
+        return sign_as_device(signer, signer.device_id, signer.dc,
+            signer.dik_ed_priv, signer.dik_ml_priv, lamport, parents, action, payload, ts);
+    }
+
+    /* Author an entry as a specific device of the account (§13.1a). */
+    private JournalEntryV2 sign_as_device(Id account, uint32 device_id, uint8[] dc,
+            Bytes dik_ed_priv, Bytes dik_ml_priv, uint64 lamport,
+            Gee.ArrayList<Bytes> parents, uint8 action, uint8[] payload, int64 ts) throws GLib.Error {
         JournalEntryV2 e = new JournalEntryV2();
         e.lamport = lamport;
-        e.signer_fp = signer.fp;
+        e.signer_fp = account.fp;
+        e.issuer_device_id = device_id;
+        e.issuer_dc = dc;
         e.parents = parents;
         e.action = action;
         e.payload = payload;
         e.timestamp = ts;
         uint8[] sp = e.signed_part();
-        e.signature = bytes_to_arr(Crypto.ed25519_sign(signer.ed_priv, new Bytes(sp)));
-        e.mldsa_signature = bytes_to_arr(Crypto.mldsa65_sign(signer.ml_priv, new Bytes(sp)));
+        e.signature = bytes_to_arr(Crypto.ed25519_sign(dik_ed_priv, new Bytes(sp)));
+        e.mldsa_signature = bytes_to_arr(Crypto.mldsa65_sign(dik_ml_priv, new Bytes(sp)));
         return e;
     }
 
@@ -224,6 +256,11 @@ class MembershipDagTest : Gee.TestCase {
             Crypto.generate_mldsa65(out unknown.ml_pub, out unknown.ml_priv);
             unknown.fp = bytes_to_arr(Crypto.random_bytes(20));
             unknown.fp_hex = hex(unknown.fp);
+            unknown.device_id = 1;
+            Crypto.generate_ed25519(out unknown.dik_ed_pub, out unknown.dik_ed_priv);
+            Crypto.generate_mldsa65(out unknown.dik_ml_pub, out unknown.dik_ml_priv);
+            unknown.dc = issue_dc(unknown.device_id, unknown.dik_ed_pub, unknown.dik_ml_pub,
+                unknown.ed_priv, unknown.ml_priv);
 
             JournalEntryV2 g = sign(owner, 5, heads(null), (uint8) MemberAuditActionV2.ADD_ADMIN, mp(owner.fp), 1000);
             JournalEntryV2 add = sign(owner, 6, heads(g.compute_hash()), (uint8) MemberAuditActionV2.ADD_MEMBER, mp(member.fp), 1001);
@@ -252,14 +289,17 @@ class MembershipDagTest : Gee.TestCase {
     // Fixed, deterministic v2 signed_part vector — identical to the Java engine's
     // MembershipDagTest.V2_SIGNEDPART_VECTOR, so the two clients are byte-compatible.
     private const string V2_SIGNEDPART_VECTOR =
-        "5833444850512d41756469742d763200" +
-        "0000000000000001" +
-        "abababababababababababababababababababab" +
-        "0000" +
-        "05" +
-        "00000018" +
-        "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd00000000" +
-        "0000000000000000";
+        "5833444850512d41756469742d763300" +   // "X3DHPQ-Audit-v3\0"
+        "0000000000000001" +                   // lamport
+        "abababababababababababababababababababab" + // signer_fp (account AIK)
+        "11223344" +                           // issuer_device_id
+        "0004" +                               // issuer_dc_len
+        "dcdcdcdc" +                           // issuer_dc
+        "0000" +                               // parent_count
+        "05" +                                 // action = AddMember
+        "00000018" +                           // payload_len = 24
+        "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd00000000" + // payload
+        "0000000000000000";                    // timestamp
 
     private void test_signed_part_vector() {
         uint8[] fp = new uint8[20]; for (int i = 0; i < 20; i++) fp[i] = 0xAB;
@@ -267,6 +307,10 @@ class MembershipDagTest : Gee.TestCase {
         var e = new JournalEntryV2();
         e.lamport = 1;
         e.signer_fp = fp;
+        /* A fixed 4-byte stand-in for the issuer DC: this vector pins the FRAMING of the v3
+         * signed_part (field order, lengths, endianness), not certificate contents. */
+        e.issuer_device_id = 0x11223344;
+        e.issuer_dc = new uint8[] { 0xDC, 0xDC, 0xDC, 0xDC };
         e.parents = new Gee.ArrayList<Bytes>();
         e.action = (uint8) MemberAuditActionV2.ADD_MEMBER;
         e.payload = JournalEntryV2.build_member_payload(subj, 0);
@@ -426,6 +470,59 @@ class MembershipDagTest : Gee.TestCase {
             other.ingest(b.marshal());
             fail_if_not_eq_int((int) other.recompute(resolver()).epoch, (int) epoch_both,
                 "epoch must converge regardless of arrival order");
+        } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    /* §13.1a — THE revocation test. Mirrors PQonversations'
+     * MembershipDagTest.revokedDeviceCannotAuthorJournalEntries.
+     *
+     * Under v2, entries were signed by the account AIK and named no device. Combined with
+     * §11.8 (which replicates AIK_priv to every authorized device), a phone revoked from
+     * the account manifest still held the account root and could keep administering every
+     * room its account administered, forever. v3 names a device actor, so revoking the
+     * device revokes the authority. */
+    private void test_revoked_device_cannot_author() {
+        try {
+            Id owner = make_id(); Id victim = make_id();
+
+            /* The owner account has a second device, 7, with a legitimate AIK-signed
+             * certificate — nothing here is forged. */
+            Bytes c_ed_pub, c_ed_priv, c_ml_pub, c_ml_priv;
+            Crypto.generate_ed25519(out c_ed_pub, out c_ed_priv);
+            Crypto.generate_mldsa65(out c_ml_pub, out c_ml_priv);
+            uint8[] compromised_dc = issue_dc(7, c_ed_pub, c_ml_pub, owner.ed_priv, owner.ml_priv);
+
+            var g = sign(owner, 0, heads(null), (uint8) MemberAuditActionV2.ADD_ADMIN, mp(owner.fp), 1000);
+            var by_revoked = sign_as_device(owner, 7, compromised_dc, c_ed_priv, c_ml_priv,
+                1, heads(g.compute_hash()), (uint8) MemberAuditActionV2.ADD_MEMBER, mp(victim.fp), 1001);
+
+            /* Its certificate chain is perfectly valid — that is exactly the problem. */
+            fail_if_not(by_revoked.verify(owner.ed_pub, owner.ml_pub),
+                "the revoked device's entry is cryptographically valid on its own terms");
+
+            var dag = new MembershipDag();
+            dag.ingest(g.marshal());
+            dag.ingest(by_revoked.marshal());
+
+            /* With no revocation knowledge the entry folds (pre-fix behaviour). */
+            fail_if_not(dag.recompute(resolver()).members.contains(victim.fp_hex),
+                "without revocation state the entry is accepted");
+
+            /* Once the receiver knows device 7 is revoked, the entry is skipped. */
+            DagState st = dag.recompute_checked(resolver(), null,
+                (fp_hex, dev) => fp_hex.down() == owner.fp_hex.down() && dev == 7);
+            fail_if(st.members.contains(victim.fp_hex),
+                "an entry authored by a revoked device must not fold");
+
+            /* A surviving device of the SAME account is unaffected — revocation is
+             * per-device, so revoking one must not silence the whole admin. */
+            var by_survivor = sign(owner, 2, heads(g.compute_hash()),
+                (uint8) MemberAuditActionV2.ADD_MEMBER, mp(victim.fp), 1002);
+            dag.ingest(by_survivor.marshal());
+            DagState st2 = dag.recompute_checked(resolver(), null,
+                (fp_hex, dev) => fp_hex.down() == owner.fp_hex.down() && dev == 7);
+            fail_if_not(st2.members.contains(victim.fp_hex),
+                "a surviving device of the same account must still be able to administer");
         } catch (Error e) { fail_if_reached(e.message); }
     }
 

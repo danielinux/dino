@@ -9,11 +9,13 @@
 // (NOT the server/MAM delivery order), so a malicious relay cannot change the
 // derived member/admin set by reordering.
 //
-// v2 signed_part layout (all integers big-endian):
-//   "X3DHPQ-Audit-v2\0" (16)
-//   lamport        uint64            (> max(parent.lamport), enforced)
-//   signer_fp      20 bytes          (raw BLAKE2b-160 of the signing AIK)
-//   parent_count   uint16
+// v3 signed_part layout (all integers big-endian):
+//   "X3DHPQ-Audit-v3\0" (16)
+//   lamport          uint64          (> max(parent.lamport), enforced)
+//   signer_fp        20 bytes        (raw BLAKE2b-160 of the AUTHOR'S ACCOUNT AIK)
+//   issuer_device_id uint32          (the device that actually authored this entry)
+//   issuer_dc_len    uint16 | issuer_dc  (that device's AIK-signed DeviceCertificate)
+//   parent_count     uint16
 //   parents[N]     32 bytes each     (SHA-256(marshal(parent)))
 //   action         uint8
 //   payload_len    uint32
@@ -21,6 +23,16 @@
 //   timestamp      int64 (as uint64)
 // marshal = signed_part | uint16 sigEdLen | sigEd | uint16 sigMlLen | sigMl
 // entry_hash = SHA-256(marshal)
+//
+// Why entries name a device (v3): through v2 an entry was signed directly by the account
+// AIK and carried no device identity. Combined with §11.8 — which replicates AIK_priv to
+// every authorized device — that made room administration unrevokable: a phone revoked
+// from the account manifest still held the account root, so it could keep minting valid
+// AddMember/RemoveMember/AddAdmin entries forever, and no verifier could distinguish its
+// entries from a surviving device's. §7.5's containment argument covers the device-manifest
+// subsystem only; the group journal is independent and was never covered by it. v3 proves
+// account AIK -> currently authorized device DIK -> journal action, so revoking the DIK
+// revokes its ability to administer rooms.
 //
 // Actions: AddMember=5, RemoveMember=6 (+optional ban flag byte), AddAdmin=7,
 // RemoveAdmin=8, Snapshot=10. Payload for 5/7/8 reuses the v1 24-byte
@@ -44,6 +56,13 @@ public enum MemberAuditActionV2 {
 // if the AIK is not (yet) known, in which case the entry is skipped in the fold.
 public delegate bool AikResolver(string signer_fp_hex, out Bytes ed, out Bytes mldsa);
 
+/* §13.1a: asks whether a device is currently revoked for an account, so the fold can reject
+ * entries authored by a device that has since lost authority. Verifying an entry's
+ * certificate chain only proves the account certified that device at some point; a revoked
+ * phone keeps a valid DC (and, under §11.8, the account root), so without this it could keep
+ * administering rooms forever. */
+public delegate bool DeviceRevocationChecker(string signer_fp_hex, uint32 device_id);
+
 public static string hex_of(uint8[] b) {
     StringBuilder sb = new StringBuilder();
     foreach (uint8 x in b) sb.append_printf("%02x", x);
@@ -52,7 +71,9 @@ public static string hex_of(uint8[] b) {
 
 public class JournalEntryV2 : Object {
     public uint64 lamport { get; set; }
-    public uint8[] signer_fp { get; set; }            // 20 bytes
+    public uint8[] signer_fp { get; set; }            // 20 bytes (author's ACCOUNT AIK fp)
+    public uint32 issuer_device_id { get; set; }      // device that authored this entry
+    public uint8[] issuer_dc { get; set; default = new uint8[0]; }  // its AIK-signed DC
     public Gee.ArrayList<Bytes> parents { get; set; default = new Gee.ArrayList<Bytes>(); } // each 32 bytes
     public uint8 action { get; set; }
     public uint8[] payload { get; set; }
@@ -61,12 +82,13 @@ public class JournalEntryV2 : Object {
     public uint8[] mldsa_signature { get; set; }
 
     private static uint8[] v2_prefix() {
-        return { 'X','3','D','H','P','Q','-','A','u','d','i','t','-','v','2', 0x00 };
+        return { 'X','3','D','H','P','Q','-','A','u','d','i','t','-','v','3', 0x00 };
     }
 
     public uint8[] signed_part() {
         uint8[] PREFIX = v2_prefix();
-        int size = PREFIX.length + 8 + 20 + 2 + parents.size * 32 + 1 + 4 + payload.length + 8;
+        int size = PREFIX.length + 8 + 20 + 4 + 2 + issuer_dc.length
+                 + 2 + parents.size * 32 + 1 + 4 + payload.length + 8;
         uint8[] buf = new uint8[size];
         int off = 0;
         Memory.copy(buf, PREFIX, PREFIX.length);
@@ -74,6 +96,12 @@ public class JournalEntryV2 : Object {
         put_u64(buf, ref off, lamport);
         Memory.copy((uint8*) buf + off, signer_fp, 20);
         off += 20;
+        put_u32(buf, ref off, issuer_device_id);
+        put_u16(buf, ref off, (uint16) issuer_dc.length);
+        if (issuer_dc.length > 0) {
+            Memory.copy((uint8*) buf + off, issuer_dc, issuer_dc.length);
+            off += issuer_dc.length;
+        }
         put_u16(buf, ref off, (uint16) parents.size);
         foreach (Bytes p in parents) {
             Memory.copy((uint8*) buf + off, p.get_data(), 32);
@@ -115,11 +143,37 @@ public class JournalEntryV2 : Object {
         return hex_of(compute_hash());
     }
 
+    /* Verifies the full chain: the account AIK certified the issuing device, and that
+     * device's DIK signed this entry.
+     *   1. the embedded DC parses and verifies under the author's ACCOUNT AIK;
+     *   2. the DC's device id equals issuer_device_id, so one device's certificate cannot
+     *      be replayed to author as a different device of the same account;
+     *   3. both hybrid signatures verify under the DC's DIK public keys.
+     * Signing with the DIK rather than the AIK is the point: it is what lets revoking a
+     * device revoke its room-administration authority. Whether the device is CURRENTLY
+     * authorized is a separate fold-level check, since only the fold knows the receiver's
+     * revocation state. */
     public bool verify(Bytes signer_ed, Bytes signer_mldsa) throws GLib.Error {
         if (signature.length == 0 || mldsa_signature.length == 0) return false;
+        if (issuer_dc.length == 0) return false;
+
+        DeviceCertificate? dc = DeviceCertificate.unmarshal(new Bytes(issuer_dc));
+        if (dc == null) return false;
+        if (((!) dc).device_id != issuer_device_id) return false;
+        try {
+            if (!((!) dc).verify(signer_ed, signer_mldsa)) return false;
+        } catch (GLib.Error e) {
+            return false;
+        }
+
         uint8[] sp = signed_part();
-        if (!global::X3dhpq.Crypto.ed25519_verify(signer_ed, new Bytes(sp), new Bytes(signature))) return false;
-        return global::X3dhpq.Crypto.mldsa65_verify(signer_mldsa, new Bytes(sp), new Bytes(mldsa_signature));
+        try {
+            if (!global::X3dhpq.Crypto.ed25519_verify(((!) dc).dik_pub_ed25519, new Bytes(sp), new Bytes(signature))) return false;
+            return global::X3dhpq.Crypto.mldsa65_verify(((!) dc).dik_pub_mldsa, new Bytes(sp), new Bytes(mldsa_signature));
+        } catch (GLib.Error e) {
+            /* wolfSSL raises SIG_VERIFY_E rather than returning false. */
+            return false;
+        }
     }
 
     public static bool is_v2(uint8[] b) {
@@ -131,7 +185,7 @@ public class JournalEntryV2 : Object {
 
     public static JournalEntryV2? unmarshal(uint8[] b) {
         uint8[] PREFIX = v2_prefix();
-        int min = PREFIX.length + 8 + 20 + 2 + 1 + 4 + 8 + 2 + 2;
+        int min = PREFIX.length + 8 + 20 + 4 + 2 + 2 + 1 + 4 + 8 + 2 + 2;
         if (b.length < min) return null;
         int off = 0;
         for (int i = 0; i < PREFIX.length; i++) if (b[off + i] != PREFIX[i]) return null;
@@ -142,6 +196,15 @@ public class JournalEntryV2 : Object {
         e.signer_fp = new uint8[20];
         Memory.copy(e.signer_fp, (uint8*) b + off, 20);
         off += 20;
+        e.issuer_device_id = get_u32(b, ref off);
+        int dc_len = (int) get_u16(b, ref off);
+        if (dc_len < 0) return null;
+        if ((int64) off + (int64) dc_len + 2 + 1 + 4 + 8 + 2 + 2 > (int64) b.length) return null;
+        e.issuer_dc = new uint8[dc_len];
+        if (dc_len > 0) {
+            Memory.copy(e.issuer_dc, (uint8*) b + off, dc_len);
+            off += dc_len;
+        }
         int pc = (int) get_u16(b, ref off);
         if (pc < 0 || pc > 4096) return null;
         if ((int64) off + (int64) pc * 32 + 1 + 4 + 8 + 2 + 2 > (int64) b.length) return null;
@@ -393,6 +456,11 @@ public class MembershipDag : Object {
     // §13.1a.1. Without the pin the genesis is trust-on-first-FOLD rather than
     // trust-on-first-use, and the window re-opens on every recompute.
     public DagState recompute_pinned(AikResolver resolver, string? pinned_owner_fp) {
+        return recompute_checked(resolver, pinned_owner_fp, null);
+    }
+
+    public DagState recompute_checked(AikResolver resolver, string? pinned_owner_fp,
+                                      DeviceRevocationChecker? revocation_checker) {
         var st = new DagState();
         var order = canonical_order();
         var removal_node = new Gee.HashMap<string, string>();
@@ -412,6 +480,16 @@ public class MembershipDag : Object {
             try {
                 if (!e.verify(ed, ml)) continue;
             } catch (GLib.Error err) { continue; }
+
+            /* §13.1a: the certificate chain proves the account certified this device at
+             * SOME point, not that it is still authorized. Rejecting entries from a revoked
+             * device is what makes room administration actually revocable; without it,
+             * revoking a device removes it from the account manifest while leaving it able
+             * to add, remove and promote members in every room its account administers. */
+            if (revocation_checker != null
+                    && revocation_checker(signer_hex, e.issuer_device_id)) {
+                continue;
+            }
 
             if (!genesis_established) {
                 // A genesis must be a root: an entry descending from another entry
