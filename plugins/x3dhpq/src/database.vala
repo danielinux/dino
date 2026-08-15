@@ -1036,17 +1036,29 @@ public class Database : Qlite.Database {
             .perform();
     }
 
-    /* §9.1.2: retire a consumed ONE-TIME ML-KEM prekey. The private half is erased, not
-     * merely flagged: the whole point is that a later compromise of this device must not
-     * decapsulate the recorded kem-ct of past handshakes. The last_resort key is reusable
-     * by design and is excluded by the WHERE clause. */
+    /* §9.1.2: retire a ONE-TIME ML-KEM prekey — it stops being published, so it is handed
+     * out at most once.
+     *
+     * The private half is deliberately RETAINED. Erasing it (which an earlier revision did,
+     * and which is what pure forward secrecy wants) breaks session establishment on this
+     * transport: a bundle is one PEP item read by every peer, so there is no serve-once
+     * behaviour, and peers cache the bundle they fetched. An initiator working from a cached
+     * bundle encapsulates to a key id we may already have consumed; with the private half
+     * gone that handshake can never complete and the peer is locked out until it happens to
+     * re-fetch. Observed here as "Failed to prepare ML-KEM-768 decapsulation (wolfSSL
+     * rc=-173)" while the sender's messages sat undecryptable.
+     *
+     * What survives from the one-time model is that a key leaves the published pool after
+     * one use. What is given up is immediate deletion; recovering that needs a serve-once
+     * server, or a bounded retention window plus bundle re-fetch on decap failure (§9.1.2).
+     *
+     * The last_resort key is reusable by design and is excluded by the WHERE clause. */
     public void mark_local_kem_pre_key_consumed(Account account, int key_id) {
         kem_pre_key.update()
             .with(kem_pre_key.account_id, "=", account.id)
             .with(kem_pre_key.key_id, "=", key_id)
             .with(kem_pre_key.last_resort, "=", false)
             .set(kem_pre_key.consumed, true)
-            .set(kem_pre_key.private_base64, "")
             .perform();
     }
 
