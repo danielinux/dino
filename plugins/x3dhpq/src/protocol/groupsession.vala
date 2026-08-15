@@ -44,6 +44,13 @@ public errordomain GroupSessionError {
     /* D4.1: the sending (account, device) is not currently in the receiver's
      * accepted Trust Manifest fold. */
     UNAUTHORIZED_DEVICE,
+    /* §13.3a: <gsig> missing, malformed, unverifiable, or the selected recv chain
+     * carries no verification key. Kept DISTINCT from AEAD_FAILURE: the corpus
+     * (§19.2.0) pins them as separate decisions because they fire at different
+     * points in the order — a signature failure must occur BEFORE any message key
+     * is derived, so conflating the two hides an implementation that derives first
+     * and verifies second. */
+    SIGNATURE_INVALID,
 }
 
 // D5.3: recv chains are keyed by the 4-TUPLE (aik_fp, device_id, epoch, epoch_id).
@@ -396,6 +403,11 @@ public class GroupSession : Object {
     // heads_payload MUST be the RAW bytes of the received <heads> advertisement (or null
     // if absent), not a re-encoding of a decoded frontier — re-encoding would normalise
     // away exactly the difference the AAD binding is meant to detect (§13.1b).
+    //
+    // Throwing adapter over receive(). Callers that already know the sender device is
+    // authorized — the test suite, and anything holding a session it just folded — get
+    // the historical exception-shaped API; the live receive path in Manager calls
+    // receive() directly so that it sees the side-effect flags.
     public uint8[] decrypt_with_heads(
         string sender_aik_fp,
         GroupMessageHeader hdr,
@@ -403,12 +415,91 @@ public class GroupSession : Object {
         uint8[]? heads_payload,
         uint8[]? sig
     ) throws GLib.Error {
+        GroupReceiveOutcome outcome = receive(
+            sender_aik_fp, hdr, ciphertext, heads_payload, sig,
+            GroupDeviceAuthorization.AUTHORIZED);
+        switch (outcome.decision) {
+            case GroupDecision.ACCEPT:
+                return (!) outcome.plaintext;
+            case GroupDecision.REJECT_UNAUTHORIZED_DEVICE:
+                throw new GroupSessionError.UNAUTHORIZED_DEVICE(outcome.detail);
+            case GroupDecision.REJECT_REMOVED_MEMBER:
+                throw new GroupSessionError.REMOVED_MEMBER(outcome.detail);
+            case GroupDecision.REJECT_STALE_EPOCH:
+                throw new GroupSessionError.STALE_EPOCH(outcome.detail);
+            case GroupDecision.REJECT_EPOCH_ID_MISMATCH:
+                throw new GroupSessionError.EPOCH_ID_MISMATCH(outcome.detail);
+            case GroupDecision.DEFER_NO_CHAIN:
+                throw new GroupSessionError.UNKNOWN_SENDER(outcome.detail);
+            case GroupDecision.REJECT_SIGNATURE:
+                throw new GroupSessionError.SIGNATURE_INVALID(outcome.detail);
+            default:
+                throw new GroupSessionError.AEAD_FAILURE(outcome.detail);
+        }
+    }
+
+    /* THE receive-side decision point (§19.2.0, conformance/v1/group-accept.json).
+     *
+     * Every check the specification places on an inbound group message runs here, in
+     * this order, and nowhere else:
+     *
+     *   1. device_authorization  §13.5b — supplied by the caller (see `auth`)
+     *   2. membership            §13.6
+     *   3. stale_epoch           §13.7a
+     *   4. chain_selection       §13.5a
+     *   5. sender_signature      §13.3a
+     *   6. aead                  §13.3
+     *
+     * The order is normative, not incidental, because checks 1, 3 and 4 carry side
+     * effects. The one that motivates the whole arrangement: an UNAUTHORIZED device
+     * whose message is ALSO stale must still trigger the chain drop. Testing
+     * staleness first reaches the same verdict — rejected — while leaving the revoked
+     * device's installed chains in place, which is exactly the state §13.5b exists to
+     * remove. Keeping the sequence in one function is what makes that observable.
+     *
+     * `auth` is an input rather than a lookup: resolving it needs the Trust Manifest
+     * fold and the account database, neither of which belongs in the protocol layer.
+     *
+     * Never throws — every path, including an internal crypto error, resolves to a
+     * decision. A partial evaluation that escaped as an exception would be a hole in
+     * the ordering guarantee above.
+     */
+    public GroupReceiveOutcome receive(
+        string sender_aik_fp,
+        GroupMessageHeader hdr,
+        uint8[] ciphertext,
+        uint8[]? heads_payload,
+        uint8[]? sig,
+        GroupDeviceAuthorization auth
+    ) {
+        /* 1. §13.5b device authorization. FIRST, ahead of everything that could
+         * short-circuit it, because the rejection carries the chain-drop side effect
+         * and that side effect is the operative half of the rule. */
+        if (auth != GroupDeviceAuthorization.AUTHORIZED) {
+            bool no_manifest = (auth == GroupDeviceAuthorization.NO_MANIFEST);
+            return new GroupReceiveOutcome.unauthorized_device(no_manifest,
+                no_manifest
+                    ? @"no trust manifest held for the sender account (§13.5b)"
+                    : @"sending device is not currently in its account's manifest fold (§13.5b)");
+        }
+
+        // 2. §13.6 membership: a removed member's traffic is refused at any epoch.
         if (removed_aiks.has_key(sender_aik_fp)) {
-            throw new GroupSessionError.REMOVED_MEMBER(@"message from removed member $sender_aik_fp");
+            return new GroupReceiveOutcome(GroupDecision.REJECT_REMOVED_MEMBER,
+                "message from a removed member (§13.6)");
         }
+
+        /* 3. §13.7a stale epoch. One-directional: a sender AHEAD of our fold is
+         * legitimate (we are the ones lagging) and falls through to chain selection.
+         * Stashed rather than discarded — the message must never surface as a
+         * decryption failure — though §13.7a is explicit that this is a presentation
+         * choice and not a path to eventual decryption. */
         if (hdr.epoch < epoch) {
-            throw new GroupSessionError.STALE_EPOCH("header epoch behind session epoch");
+            return new GroupReceiveOutcome.stashed(GroupDecision.REJECT_STALE_EPOCH,
+                "header epoch is behind this room's fold epoch (§13.7a)");
         }
+
+        // 4. §13.5a chain selection by the 4-tuple (aik_fp, device_id, epoch, epoch_id).
         string rk = recv_key(sender_aik_fp, hdr.sender_device_id, hdr.epoch, hdr.epoch_id);
         SenderChain? sc = recv_chains[rk];
         if (sc == null) {
@@ -421,24 +512,21 @@ public class GroupSession : Object {
             string epoch_prefix = @"$sender_aik_fp:$(hdr.sender_device_id):$(hdr.epoch):";
             foreach (string k in recv_chains.keys) {
                 if (k.has_prefix(epoch_prefix)) {
-                    throw new GroupSessionError.EPOCH_ID_MISMATCH(
-                        @"epoch_id $(hdr.epoch_id) does not match the installed chain for epoch $(hdr.epoch)");
+                    return new GroupReceiveOutcome(GroupDecision.REJECT_EPOCH_ID_MISMATCH,
+                        "a chain exists at this epoch but under a different fold (§13.5a)");
                 }
             }
-            throw new GroupSessionError.UNKNOWN_SENDER(@"no recv chain for $rk");
+            /* §13.4a.3: a ciphertext arriving before its announcement is pending
+             * state, not a fault. Discarding it loses the message for good — MAM
+             * de-duplicates and will not re-deliver. */
+            return new GroupReceiveOutcome.stashed(GroupDecision.DEFER_NO_CHAIN,
+                "no recv chain installed for this sender at this epoch yet (§13.4a.3)");
         }
-        // §13.7: derive the key WITHOUT mutating the chain, authenticate, and only then
-        // commit. The header (including chain_index) is unauthenticated until the AEAD
-        // tag verifies, so ratcheting first would let anyone able to place a group
-        // stanza in the room push this recv chain permanently past the real sender.
-        PendingMessageKey? pending = sc.derive_message_key_at(hdr.chain_index);
-        if (pending == null) {
-            throw new IOError.FAILED("derive_message_key_at returned null");
-        }
+
         uint8[] aad_bytes = hdr.aad_with_heads(room_jid, heads_payload);
         uint8[] nonce_bytes = hdr.aead_nonce();
 
-        /* §13.3a: verify the SENDER SIGNATURE first.
+        /* 5. §13.3a: verify the SENDER SIGNATURE, BEFORE any message key is derived.
          *
          * The AEAD tag alone cannot attribute a group message: the sender chain key it
          * derives from is symmetric and was handed to every member, so any member could
@@ -449,12 +537,16 @@ public class GroupSession : Object {
          *
          * An absent signature is a failure, not an exemption: treating "no <gsig>" as
          * "this sender doesn't sign" would let a relay strip the element and restore the
-         * forgery hole wholesale. */
+         * forgery hole wholesale. Likewise a chain carrying no verification key: it
+         * produces messages that can never be attributed, and being otherwise valid does
+         * not rescue it. */
         if (sc.sig_pub.length == 0) {
-            throw new GroupSessionError.AEAD_FAILURE("no sender verification key for this epoch (§13.3a)");
+            return new GroupReceiveOutcome(GroupDecision.REJECT_SIGNATURE,
+                "no sender verification key installed for this epoch (§13.3a)");
         }
         if (sig == null || ((!) sig).length == 0) {
-            throw new GroupSessionError.AEAD_FAILURE("group message carries no sender signature (§13.3a)");
+            return new GroupReceiveOutcome(GroupDecision.REJECT_SIGNATURE,
+                "group message carries no sender signature (§13.3a)");
         }
         uint8[] signed_bytes = concat_byte_arrays(aad_bytes, ciphertext);
         bool sig_ok;
@@ -468,7 +560,25 @@ public class GroupSession : Object {
             sig_ok = false;
         }
         if (!sig_ok) {
-            throw new GroupSessionError.AEAD_FAILURE("group sender signature invalid (§13.3a)");
+            return new GroupReceiveOutcome(GroupDecision.REJECT_SIGNATURE,
+                "group sender signature did not verify (§13.3a)");
+        }
+
+        /* 6. §13.3 AEAD. Derive WITHOUT mutating the chain, authenticate, and only then
+         * commit. The header (including chain_index) is unauthenticated until the tag
+         * verifies, so ratcheting first would let anyone able to place a group stanza in
+         * the room push this recv chain permanently past the real sender. */
+        PendingMessageKey? pending;
+        try {
+            pending = sc.derive_message_key_at(hdr.chain_index);
+        } catch (GLib.Error e) {
+            /* Index already ratcheted past (overwhelmingly a duplicate delivery), or
+             * beyond the skipped-key bound. Nothing was mutated getting here. */
+            pending = null;
+        }
+        if (pending == null) {
+            return new GroupReceiveOutcome(GroupDecision.REJECT_AEAD,
+                "no message key available for this chain index (§13.7)");
         }
 
         try {
@@ -478,9 +588,12 @@ public class GroupSession : Object {
                 new Bytes(ciphertext),
                 new Bytes(aad_bytes));
             ((!) pending).commit();
-            return bytes_to_uint8_array(pt);
+            return new GroupReceiveOutcome.accepted(bytes_to_uint8_array(pt));
         } catch (GLib.Error e) {
-            throw new GroupSessionError.AEAD_FAILURE("AEAD authentication failed");
+            /* Tag failed: chain key, next index and skipped-key cache are exactly as
+             * they were, because nothing was committed. */
+            return new GroupReceiveOutcome(GroupDecision.REJECT_AEAD,
+                "AEAD authentication failed");
         }
     }
 

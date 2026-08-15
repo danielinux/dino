@@ -2317,19 +2317,25 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
      * issuers: this is LIVE traffic, not a historical record, so an unavailable
      * manifest is treated as NOT authorized and the manifest is fetched. Failing
      * open here would leave the revoked device fully served.
+     *
+     * Returns a THREE-valued answer, and performs no I/O of its own. It is the
+     * step-1 input to Protocol.GroupSession.receive(), which is the single point
+     * where the receive-side checks are ordered (§19.2.0); the caller carries out
+     * whatever side effects that evaluator asks for, including the manifest fetch.
+     * "No manifest held" and "the manifest says no" both reject, but only the first
+     * is worth a fetch, and the corpus pins that distinction.
      */
-    private bool group_sender_currently_authorized(Account account, string sender_display_fp, uint32 device_id) {
+    private Protocol.GroupDeviceAuthorization group_sender_authorization(Account account, string sender_display_fp, uint32 device_id) {
         string? owner = owner_jid_for_display_fp(account, sender_display_fp);
         if (owner == null) {
-            return false;
+            // Unknown fingerprint: there is no account to fetch a manifest for.
+            return Protocol.GroupDeviceAuthorization.NOT_AUTHORIZED;
         }
         string owner_jid = (!) owner;
         string? blob = db.get_trust_manifest_payload(account, owner_jid);
         if (blob == null || blob == "") {
             // No manifest held: reject and fetch. Not fail-open (see above).
-            pending_manifest_fetch.add(owner_jid);
-            flush_pending_manifest_fetches(account);
-            return false;
+            return Protocol.GroupDeviceAuthorization.NO_MANIFEST;
         }
         // Folding verifies a hybrid (Ed25519 + ML-DSA-65) signature per entry, and
         // this runs on EVERY group message — a MAM catch-up burst would otherwise
@@ -2359,7 +2365,7 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             } catch (GLib.Error e) {
                 m = null;
             }
-            if (m == null) return false;
+            if (m == null) return Protocol.GroupDeviceAuthorization.NOT_AUTHORIZED;
             authorized = new Gee.HashSet<string>();
             foreach (var en in ((!) m).fold_with_tombstones(tombstones).entries) {
                 ((!) authorized).add(en.key);
@@ -2367,7 +2373,19 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             if (authorized_device_cache.size > 32) authorized_device_cache.clear();
             authorized_device_cache.set(cache_key, (!) authorized);
         }
-        return ((!) authorized).contains(device_id.to_string());
+        return ((!) authorized).contains(device_id.to_string())
+            ? Protocol.GroupDeviceAuthorization.AUTHORIZED
+            : Protocol.GroupDeviceAuthorization.NOT_AUTHORIZED;
+    }
+
+    /* §13.5b "no manifest held → reject AND fetch". Split out of the authorization
+     * lookup so that lookup stays a pure query and the fetch happens only when the
+     * decision evaluator actually asks for it. */
+    private void fetch_manifest_for_display_fp(Account account, string sender_display_fp) {
+        string? owner = owner_jid_for_display_fp(account, sender_display_fp);
+        if (owner == null) return;
+        pending_manifest_fetch.add((!) owner);
+        flush_pending_manifest_fetches(account);
     }
 
     // Memoised D4.1 folds, keyed by (owner, stored manifest blob, tombstone set).
@@ -2416,7 +2434,12 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         } catch (GLib.Error e) {
             return;
         }
-        if (!group_sender_currently_authorized(account, ann_fp, ann.sender_device_id)) {
+        Protocol.GroupDeviceAuthorization ann_auth =
+            group_sender_authorization(account, ann_fp, ann.sender_device_id);
+        if (ann_auth != Protocol.GroupDeviceAuthorization.AUTHORIZED) {
+            if (ann_auth == Protocol.GroupDeviceAuthorization.NO_MANIFEST) {
+                fetch_manifest_for_display_fp(account, ann_fp);
+            }
             warning("x3dhpq: rejecting sender-chain announcement from %s/%u — not currently authorized in that account's trust manifest (§D4.1)",
                 sender_jid_value, ann.sender_device_id);
             drop_recv_chains_everywhere(account, ann_fp, ann.sender_device_id);
@@ -2612,20 +2635,6 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             return false;
         }
 
-        /* D4.1: current authorization is required for LIVE group traffic. A device
-         * revoked from its account's Trust Manifest keeps holding every member's
-         * current sender chain key, and no epoch rotation fires from its removal
-         * (room membership is at account level). Reject its messages AND delete
-         * every recv chain we hold for it, in every room — the deletion is the part
-         * that actually stops a mid-epoch revocation being served by state we
-         * already installed. */
-        if (!group_sender_currently_authorized(conversation.account, (!) sender_aik_fp, hdr.sender_device_id)) {
-            warning("x3dhpq: dropping group message in %s from device %u of %s — not currently authorized"
-                + " in that account's trust manifest (§D4.1)", room_jid_str, hdr.sender_device_id, sender_aik_fp);
-            drop_recv_chains_everywhere(conversation.account, (!) sender_aik_fp, hdr.sender_device_id);
-            return true;
-        }
-
         Protocol.GroupSession? gs = db.load_group_session(conversation.account, room_jid_str, canonical_aik, (uint32)(!) local_device_id);
         if (gs == null) {
             try {
@@ -2634,8 +2643,8 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                 return false;
             }
         }
-        // Replay journal so members + removed_aiks are populated before
-        // gs.decrypt does its sender-membership check.
+        // Replay journal so the fold epoch, members and removed_aiks are populated
+        // before receive() runs its §13.6 membership and §13.7a staleness checks.
         rebuild_group_session_from_journal(conversation.account, room_jid_str, (!) gs);
 
         // §13.1b: the <heads> advertisement is bound into the AAD by value and presence, so
@@ -2679,79 +2688,94 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             }
         }
 
-        try {
-            uint8[] plaintext = gs.decrypt_with_heads((!) sender_aik_fp, hdr, bytes_to_uint8_array(bytes_from_base64(ct_b64)), recv_heads_payload, recv_gsig);
-            db.store_group_session(conversation.account, room_jid_str, gs);
-            message.body = (string) plaintext;
-            message.encryption = Encryption.X3DHPQ;
-            // If this group message was authored by one of our OWN account's
-            // devices — given the Gap-2 guard above, necessarily a SIBLING, not
-            // this device — render it as our own outgoing message and attribute
-            // the authoring device ("from Device N", task #45 infra).
-            if (my_fp == sender_aik_fp) {
-                message.direction = Dino.Entities.Message.DIRECTION_SENT;
-                message.real_jid = conversation.account.bare_jid;
-                if (message.stanza_id != null) {
-                    db.store_message_source_device(conversation.account, (!) message.stanza_id, (int) hdr.sender_device_id);
-                }
-            }
-            // §13.1b: check the sender's advertised journal heads against our
-            // frontier (never fails the message — the payload is already
-            // authenticated; a missing/malformed element is just ignored).
-            check_advertised_heads(conversation, room_jid_str, group_env);
-            // Decrypted → let the pipeline continue and store it (return value is
-            // "abort pipeline?", see DecryptMessageListener).
-            return false;
-        } catch (Protocol.GroupSessionError.UNKNOWN_SENDER e) {
-            // We do not have this sender's recv chain YET — their sender-chain
-            // announcement (checkpoint) hasn't arrived, e.g. a MUC MAM catch-up on
-            // join raced ahead of it. Stash the message and re-decrypt it once the
-            // chain is installed, instead of storing it unreadable: Dino's
-            // history_sync dedupes by server id and would never re-deliver it. We
-            // ABORT the pipeline (return true) so it is not stored/deduped now.
-            warning("x3dhpq group decrypt deferred (no recv chain yet) from %s in %s", sender_aik_fp, room_jid_str);
+        /* THE decision. Every receive-side check runs inside receive(), in the order
+         * §19.2.0 pins, and this function does nothing but supply the step-1 input and
+         * carry out the side effects it asks for. Splitting any check back out — most
+         * temptingly the device-authorization one, which used to sit above the session
+         * load — reintroduces exactly the ordering bug the corpus exists to catch: an
+         * unauthorized device sending a STALE message must still lose its chains, and
+         * only a single ordered evaluation makes that observable.
+         *
+         * D4.1/§13.5b: current authorization is required for LIVE group traffic. A
+         * device revoked from its account's Trust Manifest keeps holding every member's
+         * current sender chain key, and no epoch rotation fires from its removal (room
+         * membership is at account level). */
+        Protocol.GroupDeviceAuthorization auth =
+            group_sender_authorization(conversation.account, (!) sender_aik_fp, hdr.sender_device_id);
+        Protocol.GroupReceiveOutcome outcome = gs.receive(
+            (!) sender_aik_fp, hdr, bytes_to_uint8_array(bytes_from_base64(ct_b64)),
+            recv_heads_payload, recv_gsig, auth);
+
+        if (outcome.fetch_manifest) {
+            fetch_manifest_for_display_fp(conversation.account, (!) sender_aik_fp);
+        }
+        if (outcome.drop_recv_chains_all_rooms) {
+            /* Rejecting the message is not on its own enough — deleting the chain
+             * state we already installed is the part that stops a mid-epoch
+             * revocation being served by material we are still holding. */
+            drop_recv_chains_everywhere(conversation.account, (!) sender_aik_fp, hdr.sender_device_id);
+        }
+        if (outcome.stash_for_retry) {
+            /* No recv chain yet (§13.4a.3), or a stale epoch (§13.7a). Either way the
+             * message must not surface as a decryption failure and must not be stored
+             * unreadable: Dino's history_sync dedupes by server id and would never
+             * re-deliver it. ABORT the pipeline so it is not stored/deduped now. */
+            debug("x3dhpq: stashing group message from %s in %s: %s",
+                sender_aik_fp, room_jid_str, outcome.detail);
             queue_undecryptable_group_message(conversation, message, stanza);
             return true;
-        } catch (Protocol.GroupSessionError.AEAD_FAILURE e) {
-            /* Authentication failed. Overwhelmingly this is a DUPLICATE: the same stanza
-             * reached us twice (live delivery plus MUC MAM catch-up after being offline),
-             * the first copy already consumed that chain index, and the ratchet is one-way
-             * (§13.7), so the second copy can never authenticate. The first copy was
-             * displayed correctly, so dropping this one is exactly right.
-             *
-             * The remainder are tampering or a forged sender signature (§13.3a) — also not
-             * something to render. Either way we MUST NOT fall through to the pipeline:
-             * doing so stores the stanza with the sender's cleartext fallback body
-             * ("[This message is x3dhpq group-encrypted]"), which the UI then shows as an
-             * ordinary UNENCRYPTED message beside the real one. That is both visual debris
-             * and actively misleading — an open padlock on content the peer never sent in
-             * the clear.
-             *
-             * Not stashed: unlike the no-recv-chain case below, retrying cannot help. */
-            debug("x3dhpq: dropping group message from %s in %s that did not authenticate"
-                + " (duplicate delivery, or tampered): %s", sender_aik_fp, room_jid_str, e.message);
-            return true;
-        } catch (Protocol.GroupSessionError.REMOVED_MEMBER e) {
-            debug("x3dhpq: dropping group message from removed member %s in %s",
-                sender_aik_fp, room_jid_str);
-            return true;
-        } catch (Protocol.GroupSessionError.EPOCH_ID_MISMATCH e) {
-            /* D5.3: we hold a chain for this sender at this numeric epoch, but it was
-             * installed under a DIFFERENT fold. Decrypting under it would accept a
-             * message produced from a membership fold this receiver never accepted. */
-            warning("x3dhpq: dropping group message from %s in %s — epoch_id does not match the"
-                + " installed chain for that epoch (§D5.3)", sender_aik_fp, room_jid_str);
-            return true;
-        } catch (Protocol.GroupSessionError.STALE_EPOCH e) {
-            debug("x3dhpq: dropping group message from %s in %s with a stale epoch",
-                sender_aik_fp, room_jid_str);
-            return true;
-        } catch (GLib.Error e) {
-            /* Anything else (malformed header, chain index already ratcheted past, ...).
-             * Same rule: never let an undecryptable group stanza reach the pipeline with
-             * its cleartext fallback body. */
-            warning("x3dhpq group decrypt failed from %s in %s: %s", sender_aik_fp, room_jid_str, e.message);
-            return true;
+        }
+
+        switch (outcome.decision) {
+            case Protocol.GroupDecision.ACCEPT:
+                db.store_group_session(conversation.account, room_jid_str, gs);
+                message.body = (string) (!) outcome.plaintext;
+                message.encryption = Encryption.X3DHPQ;
+                // If this group message was authored by one of our OWN account's
+                // devices — given the Gap-2 guard above, necessarily a SIBLING, not
+                // this device — render it as our own outgoing message and attribute
+                // the authoring device ("from Device N", task #45 infra).
+                if (my_fp == sender_aik_fp) {
+                    message.direction = Dino.Entities.Message.DIRECTION_SENT;
+                    message.real_jid = conversation.account.bare_jid;
+                    if (message.stanza_id != null) {
+                        db.store_message_source_device(conversation.account, (!) message.stanza_id, (int) hdr.sender_device_id);
+                    }
+                }
+                // §13.1b: check the sender's advertised journal heads against our
+                // frontier (never fails the message — the payload is already
+                // authenticated; a missing/malformed element is just ignored).
+                check_advertised_heads(conversation, room_jid_str, group_env);
+                // Decrypted → let the pipeline continue and store it (return value is
+                // "abort pipeline?", see DecryptMessageListener).
+                return false;
+
+            case Protocol.GroupDecision.REJECT_AEAD:
+                /* Authentication failed. Overwhelmingly this is a DUPLICATE: the same
+                 * stanza reached us twice (live delivery plus MUC MAM catch-up after
+                 * being offline), the first copy already consumed that chain index, and
+                 * the ratchet is one-way (§13.7), so the second copy can never
+                 * authenticate. The first copy was displayed correctly, so dropping this
+                 * one is exactly right. The remainder are tampering. Not stashed: unlike
+                 * the no-recv-chain case, retrying cannot help. */
+                debug("x3dhpq: dropping group message from %s in %s that did not authenticate"
+                    + " (duplicate delivery, or tampered)", sender_aik_fp, room_jid_str);
+                return true;
+
+            default:
+                /* Rejected — unauthorized device, removed member, epoch_id from a fold
+                 * we never accepted, or a sender signature that did not verify.
+                 *
+                 * We MUST NOT fall through to the pipeline: doing so stores the stanza
+                 * with the sender's cleartext fallback body ("[This message is x3dhpq
+                 * group-encrypted]"), which the UI then shows as an ordinary UNENCRYPTED
+                 * message beside the real one. That is both visual debris and actively
+                 * misleading — an open padlock on content the peer never sent in the
+                 * clear. */
+                warning("x3dhpq: rejecting group message from %s/%u in %s: %s [%s]",
+                    sender_aik_fp, hdr.sender_device_id, room_jid_str,
+                    outcome.detail, outcome.decision.to_name());
+                return true;
         }
     }
 

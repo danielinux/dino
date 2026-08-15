@@ -26,6 +26,7 @@ sources = files(
     'src/file_transfer.vala',
     'src/manager.vala',
     'src/plugin.vala',
+    'src/protocol/group_decision.vala',
     'src/protocol/groupmsg.vala',
     'src/protocol/groupsession.vala',
     'src/protocol/groupshare.vala',
@@ -121,6 +122,7 @@ test_sources = [
     'tests/pairing_msg.vala',
     'tests/cpace.vala',
     'tests/pairing.vala',
+    'tests/conformance.vala',
 ]
 
 exe_x3dhpq_test = executable(
@@ -133,4 +135,10 @@ exe_x3dhpq_test = executable(
     build_rpath: '$ORIGIN',
     install: false,
 )
-test('Tests for x3dhpq', exe_x3dhpq_test)
+# The shared conformance corpus (§19.2.0) lives in the PARENT repository — this
+# client is a submodule of it. The test also walks upward from the working directory
+# and from its own binary, so running the executable directly still finds it; this
+# just removes the guesswork under `meson test`. It is deliberately not optional:
+# if the corpus cannot be located the suite FAILS rather than skipping.
+test('Tests for x3dhpq', exe_x3dhpq_test,
+    env: ['X3DHPQ_CONFORMANCE_DIR=' + meson.project_source_root() / '..' / '..' / 'conformance'])
