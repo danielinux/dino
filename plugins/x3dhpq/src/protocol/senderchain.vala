@@ -51,6 +51,15 @@ public class SenderChain : Object {
     public uint32 epoch { get; set; }
     public uint8[] chain_key { get; set; }   // 32 bytes
     public uint32 next_index { get; set; }
+
+    /* §13.3a per-epoch sender authentication.
+     *  - On our SEND chain, sig_priv is the Ed25519 private key we sign every outgoing
+     *    group message with, and sig_pub is the half we advertise in the announcement.
+     *  - On a RECV chain only sig_pub is set: the key we verify that sender against.
+     * Deliberately NOT derivable from the chain key, which every member holds — that
+     * asymmetry is the entire point. */
+    public uint8[] sig_priv { get; set; default = new uint8[0]; }
+    public uint8[] sig_pub { get; set; default = new uint8[0]; }
     // skipped message keys: index -> mk (stored as Bytes to avoid array-as-generic-arg)
     private HashMap<uint32, Bytes> skipped = new HashMap<uint32, Bytes>();
 
@@ -152,7 +161,12 @@ public class SenderChain : Object {
     // Wire format matching senderchain.go Marshal.
     public uint8[] marshal() {
         uint32 num_skipped = (uint32) skipped.size;
-        int size = 4 + 4 + 32 + 4 + 4 + (int) num_skipped * (4 + 4 + 32);
+        /* Trailing: uint16 sig_priv_len | sig_priv | uint16 sig_pub_len | sig_pub (§13.3a).
+         * Persisting the signing key matters: losing it across a restart would leave us
+         * unable to sign in an epoch we have already announced ourselves for, and peers
+         * hold the advertised public key and would reject everything we sent afterwards. */
+        int size = 4 + 4 + 32 + 4 + 4 + (int) num_skipped * (4 + 4 + 32)
+                 + 2 + sig_priv.length + 2 + sig_pub.length;
         uint8[] buf = new uint8[size];
         int off = 0;
 
@@ -185,6 +199,19 @@ public class SenderChain : Object {
             buf[off++] = 0; buf[off++] = 0; buf[off++] = 0; buf[off++] = 32;
             Memory.copy((uint8*) buf + off, mk, 32);
             off += 32;
+        }
+
+        buf[off++] = (uint8)((sig_priv.length >> 8) & 0xff);
+        buf[off++] = (uint8)(sig_priv.length & 0xff);
+        if (sig_priv.length > 0) {
+            Memory.copy((uint8*) buf + off, sig_priv, sig_priv.length);
+            off += sig_priv.length;
+        }
+        buf[off++] = (uint8)((sig_pub.length >> 8) & 0xff);
+        buf[off++] = (uint8)(sig_pub.length & 0xff);
+        if (sig_pub.length > 0) {
+            Memory.copy((uint8*) buf + off, sig_pub, sig_pub.length);
+            off += sig_pub.length;
         }
         return buf;
     }
@@ -225,6 +252,32 @@ public class SenderChain : Object {
             Memory.copy(mk, (uint8*) b + off, 32);
             off += 32;
             sc.skipped[idx] = new Bytes(mk);
+        }
+
+        /* §13.3a signing key. A chain persisted before this field existed simply has no
+         * trailing bytes; it is restored without a key and the caller must re-key or
+         * re-announce before sending, rather than emitting unsigned messages. */
+        if (off + 2 <= b.length) {
+            int spriv_len = (int) uint16_from_bytes(b, off);
+            off += 2;
+            if (spriv_len < 0 || off + spriv_len > b.length) return null;
+            if (spriv_len > 0) {
+                uint8[] spriv = new uint8[spriv_len];
+                Memory.copy(spriv, (uint8*) b + off, spriv_len);
+                sc.sig_priv = spriv;
+                off += spriv_len;
+            }
+            if (off + 2 <= b.length) {
+                int spub_len = (int) uint16_from_bytes(b, off);
+                off += 2;
+                if (spub_len < 0 || off + spub_len > b.length) return null;
+                if (spub_len > 0) {
+                    uint8[] spub = new uint8[spub_len];
+                    Memory.copy(spub, (uint8*) b + off, spub_len);
+                    sc.sig_pub = spub;
+                    off += spub_len;
+                }
+            }
         }
         return sc;
     }

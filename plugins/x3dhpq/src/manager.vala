@@ -1467,7 +1467,8 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
 
         Protocol.GroupMessageHeader hdr;
         uint8[] ciphertext;
-        gs.encrypt_with_heads(plaintext, heads_payload, out hdr, out ciphertext);
+        uint8[] gsig;
+        gs.encrypt_with_heads(plaintext, heads_payload, out hdr, out ciphertext, out gsig);
 
         db.store_group_session(conversation.account, room_jid_str, (!) gs);
 
@@ -1486,6 +1487,11 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             group_env.put_node(new StanzaNode.build("heads", Protocol.NS_ENVELOPE)
                 .put_node(new StanzaNode.text(Base64.encode((!) heads_payload))));
         }
+
+        /* §13.3a: the per-message sender signature. Without it a group message is
+         * attributable only by the header, which any member can forge. */
+        group_env.put_node(new StanzaNode.build("gsig", Protocol.NS_ENVELOPE)
+            .put_node(new StanzaNode.text(Base64.encode(gsig))));
 
         message_stanza.stanza.put_node(group_env);
         ExplicitEncryption.add_encryption_tag_to_message(message_stanza, Protocol.NS_X3DHPQ, "x3dhpq");
@@ -2166,8 +2172,26 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             }
         }
 
+        /* §13.3a: the sender signature. Passed as raw bytes; an absent or undecodable
+         * element yields null, which decrypt_with_heads treats as a verification failure
+         * rather than as "this sender does not sign". */
+        uint8[]? recv_gsig = null;
+        {
+            StanzaNode? sn = group_env.get_subnode("gsig", Protocol.NS_ENVELOPE);
+            if (sn != null) {
+                string? sb64 = sn.get_string_content();
+                if (sb64 != null && sb64.strip() != "") {
+                    try {
+                        recv_gsig = bytes_to_uint8_array(bytes_from_base64(sb64));
+                    } catch (GLib.Error e) {
+                        recv_gsig = null;
+                    }
+                }
+            }
+        }
+
         try {
-            uint8[] plaintext = gs.decrypt_with_heads((!) sender_aik_fp, hdr, bytes_to_uint8_array(bytes_from_base64(ct_b64)), recv_heads_payload);
+            uint8[] plaintext = gs.decrypt_with_heads((!) sender_aik_fp, hdr, bytes_to_uint8_array(bytes_from_base64(ct_b64)), recv_heads_payload, recv_gsig);
             db.store_group_session(conversation.account, room_jid_str, gs);
             message.body = (string) plaintext;
             message.encryption = Encryption.X3DHPQ;

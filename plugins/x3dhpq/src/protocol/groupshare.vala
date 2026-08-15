@@ -1,12 +1,20 @@
 // SenderChainAnnouncement wire format matching groupshare.go byte-for-byte.
 // Layout:
-//   uint16 version(=1)
+//   uint16 version(=2)
 //   uint16 aik_pub_len | <aik_pub bytes>
 //   uint32 sender_device_id
 //   uint16 room_jid_len | <room_jid UTF-8>
 //   uint32 epoch
 //   uint32 chain_key_len(=32) | <chain_key 32 bytes>
 //   uint32 next_index
+//   uint16 sig_pub_len(=32) | <Ed25519 sender signing public key 32 bytes>   [v2+]
+//
+// §13.3a: sig_pub is the public half of a per-(room, epoch) signing key the sender uses
+// on every group message it emits in that epoch. It is what makes group messages
+// attributable at all — the chain key in this same announcement is symmetric and goes to
+// EVERY member, so any recipient can derive any other member's future message keys and
+// forge under their identity. A verification key recipients can check but cannot sign
+// with is the missing asymmetry.
 //
 // The aik_pub bytes are the canonical AccountIdentityPub.Marshal() encoding:
 //   uint16 version(=1) | uint8 has_mldsa | 32-byte ed25519_pub | variable mldsa_pub.
@@ -22,6 +30,8 @@ public class SenderChainAnnouncement : Object {
     public uint32 epoch { get; set; }
     public uint8[] chain_key { get; set; }  // 32 bytes
     public uint32 next_index { get; set; }
+    // §13.3a: 32-byte Ed25519 verification key for this sender's messages in this epoch.
+    public uint8[] sig_pub { get; set; }
 
     // Returns the AIK fingerprint string via blake2b-160 of the AIK bytes
     // encoded as described in account_fingerprint() in util.vala.
@@ -47,14 +57,21 @@ public class SenderChainAnnouncement : Object {
         return account_fingerprint(new Bytes(ed), new Bytes(mldsa_bytes));
     }
 
-    public uint8[] marshal() {
+    public uint8[] marshal() throws GLib.Error {
+        /* §13.3a: refuse to emit an announcement with no verification key. Recipients would
+         * install a chain they can never authenticate messages against, which is exactly
+         * the unattributable state this field exists to prevent. */
+        if (sig_pub.length != 32) {
+            throw new IOError.FAILED("SenderChainAnnouncement: sig_pub must be 32 bytes (§13.3a)");
+        }
         uint8[] room_bytes = string_to_bytes(room_jid);
-        int size = 2 + 2 + sender_aik_pub_bytes.length + 4 + 2 + room_bytes.length + 4 + 4 + 32 + 4;
+        int size = 2 + 2 + sender_aik_pub_bytes.length + 4 + 2 + room_bytes.length + 4 + 4 + 32 + 4
+                 + 2 + 32;
         uint8[] buf = new uint8[size];
         int off = 0;
 
-        // version = 1
-        buf[off++] = 0; buf[off++] = 1;
+        // version = 2
+        buf[off++] = 0; buf[off++] = 2;
 
         // uint16 aik_pub_len
         uint16 aik_len = (uint16) sender_aik_pub_bytes.length;
@@ -93,6 +110,11 @@ public class SenderChainAnnouncement : Object {
         buf[off++] = (uint8)(next_index >> 8);
         buf[off++] = (uint8) next_index;
 
+        // uint16 sig_pub_len = 32 | sig_pub (§13.3a)
+        buf[off++] = 0; buf[off++] = 32;
+        Memory.copy((uint8*) buf + off, sig_pub, 32);
+        off += 32;
+
         return buf;
     }
 
@@ -102,7 +124,9 @@ public class SenderChainAnnouncement : Object {
 
         uint16 version = uint16_from_bytes(b, off);
         off += 2;
-        if (version != 1) return null;
+        /* v1 carried no signing key, so a v1 announcement cannot produce verifiable group
+         * messages. Accepting one would silently reinstate the forgery hole §13.3a closes. */
+        if (version != 2) return null;
 
         if (off + 2 > b.length) return null;
         int aik_len = (int) uint16_from_bytes(b, off);
@@ -139,6 +163,15 @@ public class SenderChainAnnouncement : Object {
         off += 32;
         if (off + 4 > b.length) return null;
         uint32 ni = uint32_from_bytes(b, off);
+        off += 4;
+
+        if (off + 2 > b.length) return null;
+        uint16 sig_len = uint16_from_bytes(b, off);
+        off += 2;
+        if (sig_len != 32 || off + 32 > b.length) return null;
+        uint8[] sp = new uint8[32];
+        Memory.copy(sp, (uint8*) b + off, 32);
+        off += 32;
 
         SenderChainAnnouncement ann = new SenderChainAnnouncement();
         ann.sender_aik_pub_bytes = aik_bytes;
@@ -147,6 +180,7 @@ public class SenderChainAnnouncement : Object {
         ann.epoch = ep;
         ann.chain_key = ck;
         ann.next_index = ni;
+        ann.sig_pub = sp;
         return ann;
     }
 }

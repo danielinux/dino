@@ -20,6 +20,7 @@ class GroupSessionTest : Gee.TestCase {
         add_test("groupsession_removed_member_rejected", test_groupsession_removed_member_rejected);
         add_test("groupsession_serialize_deserialize", test_groupsession_serialize_deserialize);
         add_test("groupsession_checkpoint_bounds_history", test_groupsession_checkpoint_bounds_history);
+        add_test("member_cannot_forge_another_senders_signature", test_member_cannot_forge_signature);
     }
 
     private static uint8[] make_aik_bytes(uint8[] ed32, uint8[] mldsa) {
@@ -194,6 +195,9 @@ class GroupSessionTest : Gee.TestCase {
             uint8[] aik_bytes = make_aik_bytes(ed, mldsa);
 
             SenderChainAnnouncement ann = new SenderChainAnnouncement();
+            uint8[] test_sig_pub = new uint8[32];
+            for (int i = 0; i < 32; i++) test_sig_pub[i] = 0x5A;
+            ann.sig_pub = test_sig_pub;
             ann.sender_aik_pub_bytes = aik_bytes;
             ann.sender_device_id = 99;
             ann.room_jid = "test@conference.example.org";
@@ -246,12 +250,67 @@ class GroupSessionTest : Gee.TestCase {
             uint8[] plaintext = string_to_bytes("hello group");
             GroupMessageHeader hdr;
             uint8[] ciphertext;
-            alice_gs.encrypt(plaintext, out hdr, out ciphertext);
+            uint8[] gsig;
+            alice_gs.encrypt(plaintext, out hdr, out ciphertext, out gsig);
 
-            // Bob decrypts.
+            // Bob decrypts, verifying Alice's §13.3a sender signature.
             string alice_fp = ann.aik_fingerprint();
-            uint8[] decrypted = bob_gs.decrypt(alice_fp, hdr, ciphertext);
+            uint8[] decrypted = bob_gs.decrypt(alice_fp, hdr, ciphertext, gsig);
             fail_if_not_eq_uint8_arr(plaintext, decrypted, "group encrypt/decrypt mismatch");
+        } catch (Error e) {
+            fail_if_reached(e.message);
+        }
+    }
+
+    /* §13.3a — THE forgery test. Mirrors PQonversations'
+     * GroupSessionTest.memberHoldingAnotherSenderChainCannotForgeTheirSignature.
+     *
+     * Alice announces her sender chain. Mallory is an ordinary member, so she legitimately
+     * receives Alice's chain key and can derive every future message key on Alice's chain —
+     * she can produce a ciphertext that decrypts cleanly and whose header names Alice. What
+     * she cannot do is sign it: the per-epoch signing key stays private to Alice and only
+     * its public half is distributed. That asymmetry is the entire mechanism. */
+    private void test_member_cannot_forge_signature() {
+        try {
+            Bytes ed1; Bytes priv1; Crypto.generate_ed25519(out ed1, out priv1);
+            Bytes ml1; Bytes mlpriv1; Crypto.generate_mldsa65(out ml1, out mlpriv1);
+            uint8[] alice_aik = make_aik_bytes(bytes_to_arr(ed1), bytes_to_arr(ml1));
+
+            GroupSession alice = GroupSession.new_session("r@x", alice_aik, 1);
+            SenderChainAnnouncement ann = alice.announce_sender_chain();
+
+            /* The announcement really does hand over the symmetric chain key — Mallory is a
+             * full member and nothing here is stolen. */
+            fail_if_not_eq_uint8_arr(alice.send_chain.chain_key, ann.chain_key,
+                "the announcement carries the symmetric chain key");
+            /* ...but only the PUBLIC half of the signing key travels. */
+            fail_if_not_eq_uint8_arr(alice.send_chain.sig_pub, ann.sig_pub,
+                "the announcement carries the public verification key");
+            fail_if_not_eq_int(alice.send_chain.sig_priv.length, 64,
+                "Alice retains a signing private key");
+
+            uint8[] msg = string_to_bytes("forged group message");
+
+            /* A signature made with any key Mallory can construct does not verify under
+             * Alice's advertised key. */
+            Bytes m_pub; Bytes m_priv;
+            Crypto.generate_ed25519(out m_pub, out m_priv);
+            Bytes forged = Crypto.ed25519_sign(m_priv, new Bytes(msg));
+            /* wolfSSL raises SIG_VERIFY_E rather than returning false, so a rejected
+             * forgery may arrive as either shape. Both count as "not verified". */
+            bool forged_verified;
+            try {
+                forged_verified = Crypto.ed25519_verify(new Bytes(ann.sig_pub), new Bytes(msg), forged);
+            } catch (GLib.Error e) {
+                forged_verified = false;
+            }
+            fail_if(forged_verified,
+                "a member holding the chain key must not be able to sign as the chain owner");
+
+            /* And the genuine sender's signature does verify, so the scheme is usable. */
+            Bytes genuine = Crypto.ed25519_sign(new Bytes(alice.send_chain.sig_priv), new Bytes(msg));
+            fail_if_not(Crypto.ed25519_verify(new Bytes(ann.sig_pub), new Bytes(msg), genuine),
+                "the real sender's signature must verify under the advertised key");
         } catch (Error e) {
             fail_if_reached(e.message);
         }
@@ -313,6 +372,9 @@ class GroupSessionTest : Gee.TestCase {
 
             // Install a recv chain for m2 so we can test rejection.
             SenderChainAnnouncement ann = new SenderChainAnnouncement();
+            uint8[] test_sig_pub = new uint8[32];
+            for (int i = 0; i < 32; i++) test_sig_pub[i] = 0x5A;
+            ann.sig_pub = test_sig_pub;
             ann.sender_aik_pub_bytes = aik2.copy();
             ann.sender_device_id = 2;
             ann.room_jid = "r@x";
@@ -333,7 +395,7 @@ class GroupSessionTest : Gee.TestCase {
             hdr.version = 1; hdr.epoch = ann.epoch; hdr.sender_device_id = 2; hdr.chain_index = 0;
             bool got_error = false;
             try {
-                gs.decrypt(fp2, hdr, new uint8[32]);
+                gs.decrypt(fp2, hdr, new uint8[32], new uint8[64]);
             } catch (GLib.Error e) {
                 got_error = true;
             }
@@ -387,8 +449,8 @@ class GroupSessionTest : Gee.TestCase {
 
             // Advance the send chain past a few messages.
             for (int i = 0; i < 3; i++) {
-                GroupMessageHeader hh; uint8[] cc;
-                alice.encrypt(string_to_bytes("m"), out hh, out cc);
+                GroupMessageHeader hh; uint8[] cc; uint8[] ss;
+                alice.encrypt(string_to_bytes("m"), out hh, out cc, out ss);
             }
 
             // Stamp the checkpoint start (t=1000), then elapse the 100s window.
@@ -407,9 +469,9 @@ class GroupSessionTest : Gee.TestCase {
             string alice_fp = a1.aik_fingerprint();
 
             // Post-checkpoint message (index 3) decrypts.
-            GroupMessageHeader h3; uint8[] ct3;
-            alice.encrypt(string_to_bytes("after"), out h3, out ct3);
-            uint8[] dec = bob.decrypt(alice_fp, h3, ct3);
+            GroupMessageHeader h3; uint8[] ct3; uint8[] sig3;
+            alice.encrypt(string_to_bytes("after"), out h3, out ct3, out sig3);
+            uint8[] dec = bob.decrypt(alice_fp, h3, ct3, sig3);
             fail_if_not_eq_uint8_arr(string_to_bytes("after"), dec, "post-checkpoint message must decrypt");
 
             // Pre-checkpoint message (index 1) must NOT be decryptable.
@@ -417,7 +479,7 @@ class GroupSessionTest : Gee.TestCase {
             hpre.version = 1; hpre.epoch = a1.epoch; hpre.sender_device_id = 1; hpre.chain_index = 1;
             bool pre_failed = false;
             try {
-                bob.decrypt(alice_fp, hpre, new uint8[32]);
+                bob.decrypt(alice_fp, hpre, new uint8[32], new uint8[64]);
             } catch (GLib.Error e) {
                 pre_failed = true;
             }

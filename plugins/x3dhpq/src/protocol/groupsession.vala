@@ -81,6 +81,13 @@ public class GroupSession : Object {
         gs.my_device_id = my_device_id;
         gs.epoch = 0;
         gs.send_chain = SenderChain.new_random(0);
+        /* §13.3a: every epoch gets its own sender signing key, so a compromised device
+         * cannot retroactively sign for an epoch it has left. */
+        Bytes sig_pub0;
+        Bytes sig_priv0;
+        global::X3dhpq.Crypto.generate_ed25519(out sig_pub0, out sig_priv0);
+        gs.send_chain.sig_pub = bytes_to_uint8_array(sig_pub0);
+        gs.send_chain.sig_priv = bytes_to_uint8_array(sig_priv0);
         gs.send_ckpt_key = gs.send_chain.chain_key.copy();
         gs.send_ckpt_index = 0;
         gs.send_ckpt_time = 0;
@@ -124,6 +131,13 @@ public class GroupSession : Object {
     private void rotate_epoch() throws GLib.Error {
         epoch++;
         send_chain = SenderChain.new_random(epoch);
+        /* §13.3a: a new epoch means a new signing key, so authority to sign as us in this
+         * room never outlives the epoch it was issued for. */
+        Bytes rot_sig_pub;
+        Bytes rot_sig_priv;
+        global::X3dhpq.Crypto.generate_ed25519(out rot_sig_pub, out rot_sig_priv);
+        send_chain.sig_pub = bytes_to_uint8_array(rot_sig_pub);
+        send_chain.sig_priv = bytes_to_uint8_array(rot_sig_priv);
         // Fresh epoch → the checkpoint restarts at the new chain's index 0, so
         // early members of the new epoch still get it whole; it then slides
         // forward again via maybe_advance_checkpoint.
@@ -160,6 +174,7 @@ public class GroupSession : Object {
     // checkpoints existed (no stored checkpoint key).
     public SenderChainAnnouncement announce_sender_chain() {
         SenderChainAnnouncement ann = new SenderChainAnnouncement();
+        ann.sig_pub = send_chain != null ? send_chain.sig_pub.copy() : new uint8[32];
         ann.sender_aik_pub_bytes = my_aik_pub_bytes.copy();
         ann.sender_device_id = my_device_id;
         ann.room_jid = room_jid;
@@ -192,6 +207,10 @@ public class GroupSession : Object {
             throw new GroupSessionError.ANNOUNCEMENT_UNKNOWN_SENDER(@"sender AIK $fp not a current member");
         }
         SenderChain? sc = SenderChain.restore(ann.epoch, ann.chain_key, ann.next_index);
+        if (sc != null) {
+            /* §13.3a: the verification key for everything this sender emits in this epoch. */
+            ((!) sc).sig_pub = ann.sig_pub.copy();
+        }
         if (sc == null) {
             throw new IOError.FAILED("senderchain restore failed");
         }
@@ -208,16 +227,26 @@ public class GroupSession : Object {
     }
 
     // Encrypt plaintext. Returns (header, ciphertext+tag) or throws on failure.
-    public void encrypt(uint8[] plaintext, out GroupMessageHeader header_out, out uint8[] ciphertext_out) throws GLib.Error {
-        encrypt_with_heads(plaintext, null, out header_out, out ciphertext_out);
+    /* Convenience wrapper for a message with no <heads> advertisement. It still returns
+     * the §13.3a signature: an API that quietly dropped it would produce group messages no
+     * conforming receiver can attribute, which is precisely the state this design removes. */
+    public void encrypt(uint8[] plaintext, out GroupMessageHeader header_out, out uint8[] ciphertext_out, out uint8[] sig_out) throws GLib.Error {
+        encrypt_with_heads(plaintext, null, out header_out, out ciphertext_out, out sig_out);
     }
 
     // heads_payload is the canonical <heads> advertisement (§13.1b) that will accompany
     // this message, or null when none is sent. It is bound into the AAD, so the caller
     // MUST pass exactly the bytes it puts on the wire.
-    public void encrypt_with_heads(uint8[] plaintext, uint8[]? heads_payload, out GroupMessageHeader header_out, out uint8[] ciphertext_out) throws GLib.Error {
+    public void encrypt_with_heads(uint8[] plaintext, uint8[]? heads_payload, out GroupMessageHeader header_out, out uint8[] ciphertext_out, out uint8[] sig_out) throws GLib.Error {
         if (send_chain == null) {
             send_chain = SenderChain.new_random(epoch);
+            /* §13.3a: a lazily created send chain still needs a signing key, or we would
+             * emit unsigned (and therefore unattributable) group messages. */
+            Bytes lazy_sig_pub;
+            Bytes lazy_sig_priv;
+            global::X3dhpq.Crypto.generate_ed25519(out lazy_sig_pub, out lazy_sig_priv);
+            send_chain.sig_pub = bytes_to_uint8_array(lazy_sig_pub);
+            send_chain.sig_priv = bytes_to_uint8_array(lazy_sig_priv);
         }
         uint32 idx;
         uint8[]? mk = send_chain.step(out idx);
@@ -242,15 +271,27 @@ public class GroupSession : Object {
 
         header_out = hdr;
         ciphertext_out = bytes_to_uint8_array(ct);
+
+        /* §13.3a: sign the message so recipients can attribute it. Every member holds this
+         * sender chain key, so the AEAD tag proves only "someone in the room"; without this
+         * signature any member could derive our future message keys and emit messages
+         * cryptographically attributed to us. */
+        if (send_chain.sig_priv.length == 0) {
+            throw new IOError.FAILED("send chain has no signing key; refusing to emit an unauthenticated group message (§13.3a)");
+        }
+        uint8[] signed = concat_byte_arrays(aad_bytes, ciphertext_out);
+        Bytes sig = global::X3dhpq.Crypto.ed25519_sign(new Bytes(send_chain.sig_priv), new Bytes(signed));
+        sig_out = bytes_to_uint8_array(sig);
     }
 
     // Decrypt a group message.
     public uint8[] decrypt(
         string sender_aik_fp,
         GroupMessageHeader hdr,
-        uint8[] ciphertext
+        uint8[] ciphertext,
+        uint8[]? sig
     ) throws GLib.Error {
-        return decrypt_with_heads(sender_aik_fp, hdr, ciphertext, null);
+        return decrypt_with_heads(sender_aik_fp, hdr, ciphertext, null, sig);
     }
 
     // heads_payload MUST be the RAW bytes of the received <heads> advertisement (or null
@@ -260,7 +301,8 @@ public class GroupSession : Object {
         string sender_aik_fp,
         GroupMessageHeader hdr,
         uint8[] ciphertext,
-        uint8[]? heads_payload
+        uint8[]? heads_payload,
+        uint8[]? sig
     ) throws GLib.Error {
         if (removed_aiks.has_key(sender_aik_fp)) {
             throw new GroupSessionError.REMOVED_MEMBER(@"message from removed member $sender_aik_fp");
@@ -283,6 +325,40 @@ public class GroupSession : Object {
         }
         uint8[] aad_bytes = hdr.aad_with_heads(room_jid, heads_payload);
         uint8[] nonce_bytes = hdr.aead_nonce();
+
+        /* §13.3a: verify the SENDER SIGNATURE first.
+         *
+         * The AEAD tag alone cannot attribute a group message: the sender chain key it
+         * derives from is symmetric and was handed to every member, so any member could
+         * ratchet another member's chain forward and produce a message that decrypts
+         * cleanly under that member's identity. Only this signature — verifiable with the
+         * per-epoch key from the sender's announcement, but not forgeable by someone
+         * holding merely the chain key — makes attribution sound.
+         *
+         * An absent signature is a failure, not an exemption: treating "no <gsig>" as
+         * "this sender doesn't sign" would let a relay strip the element and restore the
+         * forgery hole wholesale. */
+        if (sc.sig_pub.length == 0) {
+            throw new GroupSessionError.AEAD_FAILURE("no sender verification key for this epoch (§13.3a)");
+        }
+        if (sig == null || ((!) sig).length == 0) {
+            throw new GroupSessionError.AEAD_FAILURE("group message carries no sender signature (§13.3a)");
+        }
+        uint8[] signed_bytes = concat_byte_arrays(aad_bytes, ciphertext);
+        bool sig_ok;
+        try {
+            /* wolfSSL raises SIG_VERIFY_E (rc=-229) on a bad signature rather than
+             * returning false, so a forgery arrives as an exception. Normalise both shapes
+             * to one rejection: any outcome other than an explicit "valid" is a failure. */
+            sig_ok = global::X3dhpq.Crypto.ed25519_verify(
+                new Bytes(sc.sig_pub), new Bytes(signed_bytes), new Bytes((!) sig));
+        } catch (GLib.Error e) {
+            sig_ok = false;
+        }
+        if (!sig_ok) {
+            throw new GroupSessionError.AEAD_FAILURE("group sender signature invalid (§13.3a)");
+        }
+
         try {
             Bytes pt = global::X3dhpq.Crypto.aes256gcm_decrypt(
                 new Bytes(((!) pending).message_key),
