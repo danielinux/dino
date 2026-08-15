@@ -1093,8 +1093,8 @@ public class StreamModule : XmppStreamModule {
         } else {
             // Surface the actual server error (item-too-large, forbidden, precondition, …)
             // under the x3dhpq log domain — a bare "publish failed" left the cause invisible.
-            warning("publish_trust_manifest_blob: publish failed for %s (manifest v%llu, %d bytes): %s",
-                account.bare_jid.to_string(), m.version, b64.length,
+            warning("publish_trust_manifest_blob: publish failed for %s (manifest v%s, %d bytes): %s",
+                account.bare_jid.to_string(), m.version.to_string(), b64.length,
                 pubsub_mod.last_publish_error ?? "no response (timeout / lost ACK)");
         }
         return ok;
@@ -1166,13 +1166,13 @@ public class StreamModule : XmppStreamModule {
             }
             attempt++;
             if (attempt >= delays.length) {
-                warning("publish_manifest_with_retry: version %llu for %s NOT confirmed after retries; will reconcile on next connect",
-                    target.version, account.bare_jid.to_string());
+                warning("publish_manifest_with_retry: version %s for %s NOT confirmed after retries; will reconcile on next connect",
+                    target.version.to_string(), account.bare_jid.to_string());
                 pending_publish = null;   // drop; reconcile handles it later
                 break;
             }
-            warning("publish_manifest_with_retry: version %llu for %s not confirmed (attempt %d) — retrying",
-                target.version, account.bare_jid.to_string(), attempt);
+            warning("publish_manifest_with_retry: version %s for %s not confirmed (attempt %d) — retrying",
+                target.version.to_string(), account.bare_jid.to_string(), attempt);
         }
         publish_loop_running = false;
     }
@@ -1289,13 +1289,24 @@ public class StreamModule : XmppStreamModule {
             if (db.get_peer_aik_pubs(account, bare, out pin_ed, out pin_ml)) {
                 if (!manifest_bytes_equal(m_aik_ed, bytes_to_uint8_array(pin_ed))
                         || !manifest_bytes_equal(m_aik_ml, bytes_to_uint8_array(pin_ml))) {
-                    // Same JID, different AIK (peer account reset / reconstruction).
-                    // STRICT: never auto-accept — route to the existing "same-JID,
-                    // different-AIK" re-verify UX (flag_peer_devicelist_fork drives
-                    // contact_details_provider's Review / Accept-new-identity flow)
-                    // and refuse traffic under the new AIK until the user re-verifies.
-                    warning("x3dhpq: trust manifest from %s rejected — AIK != pinned AIK (account reset / reconstruction); flagged for manual re-verify (STRICT)", bare);
-                    db.flag_peer_devicelist_fork(account, bare);
+                    // Same JID, different AIK. STRICT: never auto-accept — refuse it.
+                    //
+                    // Refuse QUIETLY though: do NOT raise the "accept new identity" UX from
+                    // here. A trust manifest is an assertion any single device of the peer
+                    // can publish alone, so a device that has not re-paired since the peer's
+                    // account reset keeps republishing under the DEAD AIK. Prompting on that
+                    // asks the user to downgrade to an identity strictly older than the
+                    // working pin, on every connect — and accepting drops the good pin and
+                    // blocks traffic until the real identity is re-pinned by hand.
+                    //
+                    // A genuine reset is still caught by the guards anchored to material the
+                    // peer must publish to communicate at all: the devicelist gate (signature
+                    // fails against the pinned AIK) and the bundle/prekey AIK-mismatch checks.
+                    // Those cannot be tripped by a stale device that is merely still online.
+                    warning("x3dhpq: trust manifest from %s REFUSED — AIK != pinned AIK; keeping the"
+                        + " pinned identity. Expected when one of that peer's devices has not"
+                        + " re-paired since an account reset; a real identity change is reported"
+                        + " by the devicelist/bundle guards instead (STRICT)", bare);
                     return false;
                 }
             } else {
@@ -1440,8 +1451,8 @@ public class StreamModule : XmppStreamModule {
                         var snap = build_snapshot_manifest(members, ((!) local_m).version + 1, ph);
                         verify_and_apply_manifest(account.bare_jid, snap.marshal());
                         publish_manifest_with_retry.begin(stream, snap);
-                        warning("ensure_trust_manifest: compacted manifest %d entries → %d members (version %llu)",
-                            ((!) local_m).entries.size, members.size, snap.version);
+                        warning("ensure_trust_manifest: compacted manifest %d entries → %d members (version %s)",
+                            ((!) local_m).entries.size, members.size, snap.version.to_string());
                         return;
                     } catch (GLib.Error e) {
                         warning("ensure_trust_manifest: compaction failed: %s", e.message);
@@ -1499,7 +1510,7 @@ public class StreamModule : XmppStreamModule {
                 db.demote_to_pending(account);
                 return;
             }
-            warning("ensure_trust_manifest: server manifest for %s failed to apply (broken genesis) — republishing a fresh genesis at version %llu", own_bare, ((!) existing).version + 1);
+            warning("ensure_trust_manifest: server manifest for %s failed to apply (broken genesis) — republishing a fresh genesis at version %s", own_bare, (((!) existing).version + 1).to_string());
             try {
                 yield build_and_publish_genesis_manifest(stream, ((!) existing).version + 1, false);
             } catch (GLib.Error e) {
@@ -1719,8 +1730,8 @@ public class StreamModule : XmppStreamModule {
         try {
             var snap = build_snapshot_manifest(members, base_ver + 1, prev_hash);
             bool applied = verify_and_apply_manifest(account.bare_jid, snap.marshal());
-            warning("X3DHPQ-PAIR: append_device_add applied=%s version=%llu members=%d",
-                    applied.to_string(), snap.version, members.size);
+            warning("X3DHPQ-PAIR: append_device_add applied=%s version=%s members=%d",
+                    applied.to_string(), snap.version.to_string(), members.size);
             publish_manifest_with_retry.begin(stream, snap);
             return applied;
         } catch (GLib.Error e) {
@@ -1759,8 +1770,8 @@ public class StreamModule : XmppStreamModule {
         try {
             var snap = build_snapshot_manifest(members, ((!) m).version + 1, prev_hash);
             bool applied = verify_and_apply_manifest(account.bare_jid, snap.marshal());
-            warning("x3dhpq: revoke %u — republished snapshot version=%llu members=%d",
-                    target_device_id, snap.version, members.size);
+            warning("x3dhpq: revoke %u — republished snapshot version=%s members=%d",
+                    target_device_id, snap.version.to_string(), members.size);
             publish_manifest_with_retry.begin(stream, snap);
             return applied;
         } catch (GLib.Error e) {
