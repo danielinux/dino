@@ -94,7 +94,11 @@ public class EncryptionListEntry : Plugins.EncryptionListEntry, Object {
             }
         } else if (conversation.type_ == Conversation.Type.GROUPCHAT) {
             string room_jid = conversation.counterpart.bare_jid.to_string();
-            if (!plugin.db.has_membership_journal(conversation.account, room_jid)) {
+            // Journal OR v2 DAG: rooms bootstrapped since the §13.1d switch carry a v2
+            // genesis and no v1 journal at all, so a has_membership_journal()-only test
+            // reports every newly created group as missing its membership state and
+            // blocks sending into it. is_secret_pq_group covers both engines.
+            if (!plugin.manager.is_secret_pq_group(conversation.account, conversation.counterpart)) {
                 input_status_callback(new Plugins.InputFieldStatus("This private channel is missing x3dhpq membership state.", Plugins.InputFieldStatus.MessageType.ERROR, Plugins.InputFieldStatus.InputState.NO_SEND));
                 return;
             }
@@ -153,30 +157,11 @@ public class EncryptionListEntry : Plugins.EncryptionListEntry, Object {
         return mm.get_affiliation(conversation.counterpart, own, conversation.account) == Xmpp.Xep.Muc.Affiliation.OWNER;
     }
 
+    // Delegates to the Manager so the v2 fold is consulted for rooms on the v2
+    // engine; walking the v1 journal here reported every member of a v2 room as
+    // absent (see Manager.is_active_group_member).
     private bool is_active_member(Account account, string room_jid, uint8[] member_aik_fp_raw) {
-        bool is_active_member = false;
-        foreach (Protocol.MemberAuditEntry entry in plugin.db.list_membership_journal_entries(account, room_jid)) {
-            uint8[] aik_fp_raw;
-            uint32 epoch_after;
-            if (!Protocol.MemberAuditEntry.parse_member_payload(entry.payload, out aik_fp_raw, out epoch_after)) {
-                continue;
-            }
-            bool same_member = aik_fp_raw.length == member_aik_fp_raw.length;
-            for (int i = 0; same_member && i < aik_fp_raw.length; i++) {
-                if (aik_fp_raw[i] != member_aik_fp_raw[i]) {
-                    same_member = false;
-                }
-            }
-            if (!same_member) {
-                continue;
-            }
-            if (entry.action == (uint8) Protocol.MemberAuditAction.ADD_MEMBER) {
-                is_active_member = true;
-            } else if (entry.action == (uint8) Protocol.MemberAuditAction.REMOVE_MEMBER) {
-                is_active_member = false;
-            }
-        }
-        return is_active_member;
+        return plugin.manager.is_active_group_member(account, room_jid, member_aik_fp_raw);
     }
 }
 

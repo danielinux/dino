@@ -5,7 +5,7 @@ using Xmpp;
 namespace Dino.Plugins.X3dhpq {
 
 public class Database : Qlite.Database {
-    private const int VERSION = 19;
+    private const int VERSION = 20;
 
     public class AccountIdentityTable : Table {
         public Column<int> id = new Column.Integer("id") { primary_key = true, auto_increment = true };
@@ -279,6 +279,26 @@ public class Database : Qlite.Database {
         }
     }
 
+    // §13.1a genesis quarantine. A room lands here when its membership journal names a
+    // genesis owner whose AIK cannot be resolved — in practice a room created before that
+    // owner reset their account identity. The MUC archive keeps serving those entries
+    // forever and no future key exchange can make a discarded key resolvable, so the room
+    // is recorded once and then skipped instead of being re-fetched and re-failed on every
+    // join. The fingerprint is stored (not a bare flag) so a later entry authored by a
+    // DIFFERENT identity cannot quietly claim the vacant genesis slot.
+    public class RoomGenesisQuarantineTable : Table {
+        public Column<int> account_id = new Column.Integer("account_id") { not_null = true };
+        public Column<string> room_jid = new Column.NonNullText("room_jid");
+        public Column<string> owner_fp_hex = new Column.NonNullText("owner_fp_hex");
+        public Column<long> created_at = new Column.Long("created_at") { not_null = true };
+
+        internal RoomGenesisQuarantineTable(Database db) {
+            base(db, "room_genesis_quarantine");
+            init({ account_id, room_jid, owner_fp_hex, created_at });
+            unique({ account_id, room_jid });
+        }
+    }
+
     public class MembershipJournalTable : Table {
         public Column<int> account_id = new Column.Integer("account_id") { not_null = true };
         public Column<string> room_jid = new Column.NonNullText("room_jid");
@@ -516,6 +536,7 @@ public class Database : Qlite.Database {
     public PairwiseSessionTable pairwise_session { get; private set; }
     public GroupSessionTable group_session { get; private set; }
     public RoomOwnerPinTable room_owner_pin { get; private set; }
+    public RoomGenesisQuarantineTable room_genesis_quarantine { get; private set; }
     public MembershipJournalTable membership_journal { get; private set; }
     public MembershipDagTable membership_dag { get; private set; }
     public DeviceAuditTable device_audit { get; private set; }
@@ -542,6 +563,7 @@ public class Database : Qlite.Database {
         pairwise_session = new PairwiseSessionTable(this);
         group_session = new GroupSessionTable(this);
         room_owner_pin = new RoomOwnerPinTable(this);
+        room_genesis_quarantine = new RoomGenesisQuarantineTable(this);
         membership_journal = new MembershipJournalTable(this);
         membership_dag = new MembershipDagTable(this);
         device_audit = new DeviceAuditTable(this);
@@ -553,7 +575,7 @@ public class Database : Qlite.Database {
         manifest_revoked_device = new ManifestRevokedDeviceTable(this);
         revoked_device = new RevokedDeviceTable(this);
         message_device = new MessageDeviceTable(this);
-        init({ account_identity, peer_account_identity, peer_device, device_list, trust_manifest, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, group_session, room_owner_pin, membership_journal, membership_dag, device_audit, audit_entry, recovery_blob, pairing_session, pending_enrollment_request, device_nickname, manifest_revoked_device, revoked_device, message_device });
+        init({ account_identity, peer_account_identity, peer_device, device_list, trust_manifest, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, group_session, room_owner_pin, room_genesis_quarantine, membership_journal, membership_dag, device_audit, audit_entry, recovery_blob, pairing_session, pending_enrollment_request, device_nickname, manifest_revoked_device, revoked_device, message_device });
     }
 
     public Row? get_local_identity(int account_id) {
@@ -841,6 +863,37 @@ public class Database : Qlite.Database {
             .value(room_owner_pin.room_jid, room_jid, true)
             .value(room_owner_pin.owner_fp_hex, owner_fp_hex)
             .value(room_owner_pin.created_at, (long) new DateTime.now_utc().to_unix())
+            .perform();
+    }
+
+    // §13.1a genesis quarantine: the fingerprint this room's genesis owner was quarantined
+    // under, or null when the room is healthy.
+    public string? get_quarantined_genesis_fp(Account account, string room_jid) {
+        Row? row = room_genesis_quarantine.select()
+            .with(room_genesis_quarantine.account_id, "=", account.id)
+            .with(room_genesis_quarantine.room_jid, "=", room_jid)
+            .single().row().inner;
+        return row == null ? null : ((!) row)[room_genesis_quarantine.owner_fp_hex];
+    }
+
+    // Quarantine a room whose genesis owner cannot be resolved. First writer wins, for the
+    // same reason the owner pin does: the record exists so a later unverifiable entry
+    // cannot redefine who the room's owner was.
+    public void quarantine_room_genesis(Account account, string room_jid, string owner_fp_hex) {
+        if (get_quarantined_genesis_fp(account, room_jid) != null) return;
+        room_genesis_quarantine.upsert()
+            .value(room_genesis_quarantine.account_id, account.id, true)
+            .value(room_genesis_quarantine.room_jid, room_jid, true)
+            .value(room_genesis_quarantine.owner_fp_hex, owner_fp_hex)
+            .value(room_genesis_quarantine.created_at, (long) new DateTime.now_utc().to_unix())
+            .perform();
+    }
+
+    // Lift the quarantine — only correct once the owner's AIK is actually resolvable again.
+    public void clear_room_genesis_quarantine(Account account, string room_jid) {
+        room_genesis_quarantine.delete()
+            .with(room_genesis_quarantine.account_id, "=", account.id)
+            .with(room_genesis_quarantine.room_jid, "=", room_jid)
             .perform();
     }
 

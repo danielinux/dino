@@ -167,8 +167,8 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             if (epoch_after != expected_epoch) {
                 // SHOULD-level: log and keep going (interop robustness); the
                 // replay-derived epoch is authoritative, not the wire value.
-                warning("rebuild journal: epoch_after mismatch at seq=%llu: wire=%u derived=%u",
-                    e.seq, epoch_after, expected_epoch);
+                warning("rebuild journal: epoch_after mismatch at seq=%s: wire=%u derived=%u",
+                    e.seq.to_string(), epoch_after, expected_epoch);
             }
             derived_epoch = expected_epoch;
             entry_index++;
@@ -237,7 +237,7 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                     gs.remove_member_by_fp(fp_hex);
                 }
             } catch (GLib.Error err) {
-                warning("rebuild journal: failed at seq=%llu: %s", e.seq, err.message);
+                warning("rebuild journal: failed at seq=%s: %s", e.seq.to_string(), err.message);
             }
         }
     }
@@ -632,6 +632,22 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             warning("membership-entry: bad payload for %s", room_jid.to_string());
             return;
         }
+        // Quarantined room: drop v1 entries silently. Self-heals first — if the owner's AIK
+        // has since become resolvable (their bundle finally arrived) the room is released
+        // and this entry is processed normally.
+        string? quarantined_fp = db.get_quarantined_genesis_fp(account, room_jid.bare_jid.to_string());
+        if (quarantined_fp != null) {
+            uint8[] q_ed, q_mldsa;
+            uint8[] q_fp_raw = hex_to_bytes_20((!) quarantined_fp);
+            if (q_fp_raw.length > 0
+                    && db.find_peer_account_identity_by_aik_fp(account, q_fp_raw, out q_ed, out q_mldsa)) {
+                db.clear_room_genesis_quarantine(account, room_jid.bare_jid.to_string());
+                warning("membership-entry: genesis owner %s for %s is resolvable again — quarantine lifted",
+                    (!) quarantined_fp, room_jid.to_string());
+            } else {
+                return;
+            }
+        }
         // Per XEP §13.8 the owner's AIK signs every entry; resolve it from
         // the genesis (seq=0) entry's own fp via TOFU.
         uint8[] owner_aik_ed;
@@ -640,10 +656,18 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             // Genesis adds the owner themselves: aik_fp_raw IS the owner's fp.
             if (!db.find_peer_account_identity_by_aik_fp(account, aik_fp_raw,
                     out owner_aik_ed, out owner_aik_mldsa)) {
-                warning("membership-entry seq=0 in %s references unknown AIK fp; storing unverified",
-                    room_jid.to_string());
-                // Best-effort store anyway so subsequent rebuild can proceed.
-                db.store_membership_journal_entry(account, room_jid.bare_jid.to_string(), entry);
+                // Quarantine instead of storing it unverified. Persisting an unverifiable
+                // genesis was an identity-injection hole: first_stored_owner_fp() then
+                // treats whatever fingerprint that entry named as the room's owner, so any
+                // party able to inject a seq=0 entry naming an fp we cannot check would
+                // define the owner for every later entry. It is also futile — the archive
+                // re-serves this same entry on every join, so it produced one warning per
+                // entry per startup forever, which reads exactly like a live identity fault.
+                db.quarantine_room_genesis(account, room_jid.bare_jid.to_string(),
+                    Protocol.hex_of(aik_fp_raw));
+                warning("membership-entry seq=0 in %s names unresolvable AIK fp %s — room quarantined"
+                    + " (created before an identity reset?); not storing, no further ingest",
+                    room_jid.to_string(), Protocol.hex_of(aik_fp_raw));
                 return;
             }
         } else {
@@ -651,14 +675,16 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             // from any prior stored entry's payload.
             uint8[]? prior_owner_fp = first_stored_owner_fp(account, room_jid.bare_jid.to_string());
             if (prior_owner_fp == null) {
-                warning("membership-entry seq=%llu arrived before genesis in %s; skipping",
-                    entry.seq, room_jid.to_string());
+                warning("membership-entry seq=%s arrived before genesis in %s; skipping",
+                    entry.seq.to_string(), room_jid.to_string());
                 return;
             }
             if (!db.find_peer_account_identity_by_aik_fp(account, prior_owner_fp,
                     out owner_aik_ed, out owner_aik_mldsa)) {
-                warning("membership-entry seq=%llu in %s: prior owner fp not resolvable",
-                    entry.seq, room_jid.to_string());
+                db.quarantine_room_genesis(account, room_jid.bare_jid.to_string(),
+                    Protocol.hex_of(prior_owner_fp));
+                warning("membership-entry seq=%s in %s: owner fp %s not resolvable — room quarantined",
+                    entry.seq.to_string(), room_jid.to_string(), Protocol.hex_of(prior_owner_fp));
                 return;
             }
         }
@@ -670,8 +696,8 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             return;
         }
         if (!ok) {
-            warning("membership-entry signature INVALID for %s seq=%llu",
-                room_jid.to_string(), entry.seq);
+            warning("membership-entry signature INVALID for %s seq=%s",
+                room_jid.to_string(), entry.seq.to_string());
             return;
         }
         db.store_membership_journal_entry(account, room_jid.bare_jid.to_string(), entry);
@@ -2198,36 +2224,75 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         } catch (GLib.Error e) {
             return false;
         }
-        try {
-            Protocol.MemberAuditEntry entry = new Protocol.MemberAuditEntry();
-            entry.seq = 0;
-            entry.prev_hash = new uint8[32];
-            entry.action = (uint8) Protocol.MemberAuditAction.ADD_MEMBER;
-            // Genesis AddMember establishes epoch 0 and does NOT rotate (§13.1a).
-            entry.payload = Protocol.MemberAuditEntry.build_member_payload(aik_fp_raw, 0);
-            entry.timestamp = new DateTime.now_utc().to_unix();
-            try {
-                uint8[] sp = entry.signed_part();
-                Bytes aik_priv_ed = bytes_from_base64((!) db.get_local_identity_string(account, db.account_identity.aik_priv_ed25519_base64));
-                Bytes aik_priv_mldsa = bytes_from_base64((!) db.get_local_identity_string(account, db.account_identity.aik_priv_mldsa_base64));
-                entry.signature = bytes_to_uint8_array(
-                    global::X3dhpq.Crypto.ed25519_sign(aik_priv_ed, new Bytes(sp)));
-                entry.mldsa_signature = bytes_to_uint8_array(
-                    global::X3dhpq.Crypto.mldsa65_sign(aik_priv_mldsa, new Bytes(sp)));
-            } catch (GLib.Error e) {
-                return false;
-            }
-            // WS1: broadcast genesis as a <journal-entry> groupchat message; the
-            // room archives it (MAM) for every future joiner. We also store it
-            // locally so the owner's own session has the member set immediately.
-            if (!yield module.publish_membership_audit_entry(stream, room_jid.bare_jid, entry)) {
-                return false;
-            }
-            db.store_membership_journal_entry(account, room_jid_str, entry);
-            return true;
-        } catch (GLib.Error e) {
+        // §13.1a/§13.1d: bootstrap the room directly onto the v2 multi-admin DAG.
+        //
+        // The genesis is a ROOT entry (no parents) whose SIGNER the fold adopts as
+        // owner/admin/member — both clients implement that rule identically, and both
+        // ignore a plain genesis's payload, so the AddMember body below is carried
+        // only for symmetry with the v1 entry it replaces.
+        //
+        // Emitting a v1 MemberAuditEntry here instead left new rooms on the legacy
+        // linear journal. PQonversations ingests those happily — it can read the room
+        // — but it only latches Conversation.ATTRIBUTE_X3DHPQ_GROUP once the v2 DAG
+        // folds to an authenticated owner, and the fallback heuristic behind that
+        // (isPrivateAndNonAnonymous) is false for our open-transport rooms. The room
+        // therefore did not register as a secret group there and outgoing messages
+        // went out in plaintext.
+        //
+        // Nothing else needs changing: add/remove/promote all dispatch on
+        // is_v2_active(), which is true as soon as any v2 entry exists.
+        uint8[] payload = Protocol.JournalEntryV2.build_member_payload(aik_fp_raw, 0);
+        Protocol.JournalEntryV2? entry = build_signed_v2(account, room_jid_str,
+            (uint8) Protocol.MemberAuditActionV2.ADD_MEMBER, payload);
+        if (entry == null) {
             return false;
         }
+        uint8[] entry_bytes = ((!) entry).marshal();
+        // Broadcast genesis as a <journal-entry> groupchat message; the room archives
+        // it (MAM) for every future joiner. ingest_and_store_v2 then applies it
+        // locally so the owner's own session has the member set immediately.
+        if (!yield module.publish_membership_blob(stream, room_jid.bare_jid,
+                ((!) entry).hash_hex(), entry_bytes)) {
+            return false;
+        }
+        ingest_and_store_v2(account, room_jid_str, entry_bytes);
+        return true;
+    }
+
+    // Whether `member_aik_fp_raw` is an active member of the room, reading the v2
+    // fold when the room runs the v2 engine and the legacy linear journal otherwise.
+    //
+    // The UI must go through here rather than walking list_membership_journal_entries
+    // itself: rooms bootstrapped since the §13.1d switch carry a v2 genesis and no v1
+    // entries at all, so a v1-only test reports every member as absent — which blocks
+    // non-owners from sending outright, and makes the owner re-author an AddMember on
+    // every input-status refresh.
+    public bool is_active_group_member(Dino.Entities.Account account, string room_jid_str,
+            uint8[] member_aik_fp_raw) {
+        string want = Protocol.hex_of(member_aik_fp_raw).down();
+        Protocol.MembershipDag? dag = get_dag(account, room_jid_str);
+        if (dag != null && dag.size > 0) {
+            Protocol.DagState st = recompute_dag_pinned(account, room_jid_str, (!) dag);
+            foreach (string fp_hex in st.members) {
+                if (fp_hex.down() == want) return true;
+            }
+            return false;
+        }
+        bool active = false;
+        foreach (Protocol.MemberAuditEntry entry in db.list_membership_journal_entries(account, room_jid_str)) {
+            uint8[] fp;
+            uint32 epoch_after;
+            if (!Protocol.MemberAuditEntry.parse_member_payload(entry.payload, out fp, out epoch_after)) {
+                continue;
+            }
+            if (Protocol.hex_of(fp).down() != want) continue;
+            if (entry.action == (uint8) Protocol.MemberAuditAction.ADD_MEMBER) {
+                active = true;
+            } else if (entry.action == (uint8) Protocol.MemberAuditAction.REMOVE_MEMBER) {
+                active = false;
+            }
+        }
+        return active;
     }
 
     // Whether the JID publishes a usable x3dhpq devicelist (at least one active
