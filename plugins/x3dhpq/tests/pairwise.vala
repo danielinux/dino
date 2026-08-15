@@ -12,6 +12,9 @@ class Pairwise : Gee.TestCase {
         add_test("bundle_rejects_bad_kem_sig", test_bundle_rejects_bad_kem_sig);
         add_test("bundle_rejects_missing_kem_sig", test_bundle_rejects_missing_kem_sig);
         add_test("bundle_rejects_half_kem_sig", test_bundle_rejects_half_kem_sig);
+        add_test("late_messages_from_abandoned_chain", test_late_messages_from_abandoned_chain);
+        add_test("cross_vector_from_pqonversations", test_cross_vector_from_pqonversations);
+        add_test("cross_vector_ratchet_from_pqonversations", test_cross_vector_ratchet_from_pqonversations);
     }
 
     // A KEM pre-key signed by a foreign key (not the bundle's DIK) MUST be
@@ -90,6 +93,175 @@ class Pairwise : Gee.TestCase {
             fail_if(restored == null, "device cert roundtrip failed");
             fail_if_not(((!) restored).verify(aik_pub_ed, aik_pub_m), "device cert verify failed");
             fail_if_not_eq_int((int) ((!) restored).device_id, 23, "device id mismatch");
+        } catch (Error e) {
+            fail_if_reached(e.message);
+        }
+    }
+
+    // Late delivery across a DH ratchet step.
+    //
+    // Observed against a live peer: the sender emits four messages while this side is
+    // offline, this side comes back and takes only the first two, replies (which makes
+    // the sender DH-ratchet), and the sender writes again on the new chain. The two
+    // still in flight from the OLD chain then arrive and MUST still decrypt. They are
+    // recoverable only from the skipped keys derived when this side ratchets, and those
+    // are derived purely from the sender's prev_chain_len — so if either the field or
+    // the skip is wrong, the messages are lost for good.
+    // Cross-implementation vector across a DH RATCHET STEP.
+    //
+    // Companion to test_cross_vector_from_pqonversations, which stays inside one chain
+    // and therefore proves only that the symmetric half agrees. This one loads a
+    // receiver state captured BEFORE the peer minted a new sending DH, then decrypts a
+    // message bearing that new key — so it runs dh_ratchet_step against inputs produced
+    // by the other implementation. If the two derive different root/chain keys from the
+    // same (rk, our send priv, their new pub, kem_history), this is where it shows.
+    // Cross-implementation vector, same chain.
+    //
+    // Session state and wire bytes produced by PQonversations' x3dhpq-core
+    // (CrossVectorGeneratorTest): a receiving session mid-chain plus the next two
+    // messages it emitted. Both clients pass their own round-trip tests, so a
+    // divergence could only live in something crossing the boundary — the chain KDF,
+    // the AAD, or the header encoding. This asserts THIS implementation derives the
+    // same message keys the other one used. No DH ratchet here; see the companion test.
+    private void test_cross_vector_from_pqonversations() {
+        try {
+            string blob = ""
+            + "rk=BMiHjdKK7qH1ygGpNigfUw4iDcVrbRahiQSV/0qZHlU=\n"
+            + "chain_send_key=\n"
+            + "chain_recv_key=3DbaBA2d9n+2y/D1VhagoVTAaJ3/V6chER7ntRcinLM=\n"
+            + "sending_dh_pub=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+            + "sending_dh_priv=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+            + "remote_dh_pub=T9p8wpNGwvqy1Xz0TmPVeGIhSKPBP3FfJg3Qnok+v08=\n"
+            + "send_count=0\n"
+            + "recv_count=1\n"
+            + "prev_send_count=0\n"
+            + "kem_send_pub=\n"
+            + "kem_recv_priv=\n"
+            + "kem_recv_pub=\n"
+            + "kem_since_checkpoint=0\n"
+            + "last_checkpoint_time=0\n"
+            + "ad=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==\n"
+            + "kem_history=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+            ;
+            SessionState? st = SessionState.deserialize(blob);
+            fail_if(st == null, "could not load the cross-vector session state");
+            check_cross_vector_message((!) st, "000000204fda7cc29346c2fab2d57cf44e63d578622148a3c13f715f260dd09e893ebf4f000000040000000000000004000000010000000000000000", "4c83931b8c6f519b0bfe486044b9d05e2c71d0075b202f50192ff8d074d9f5063b7050a890f62bb7ff6c3921ad4cff0ddf33eba31c585ccf2c34d69e", "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1", "msg1");
+            check_cross_vector_message((!) st, "000000204fda7cc29346c2fab2d57cf44e63d578622148a3c13f715f260dd09e893ebf4f000000040000000000000004000000020000000000000000", "840925e301560f289475e0c445eadd4a1f30f5bf00435c5a073bb0af2a18e2a7e41aeccb8ca41a69d38fb4a3fa7226707d1155996ecc3f2a791d725d", "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2", "msg2");
+        } catch (Error e) {
+            fail_if_reached(e.message);
+        }
+    }
+
+    private void test_cross_vector_ratchet_from_pqonversations() {
+        try {
+            string blob = ""
+            + "rk=SoTv9My+zY6BqNvwdATGNoEk4QLVQHX1meV9hXmUtaQ=\n"
+            + "chain_send_key=cmGzf1IgNYAzNzu7KJLsbeB9Q/Lutvv6RUODDG6bwL0=\n"
+            + "chain_recv_key=dEZVPTfh2TAO+BpretB1SPKwbHDKxEyItMIH9K/FWQA=\n"
+            + "sending_dh_pub=pr6PddEokZB4PJG1woIi3ehl+iC4u4/yHXPQQ6igQyQ=\n"
+            + "sending_dh_priv=MKIvVnLYiFnZ3RgQlWPbnQkmygv9W8AMomC5m/1wDlE=\n"
+            + "remote_dh_pub=ffrTsmauG5rMmPwWLnOP/VHVsFbgksFVIxt1n8jrZmk=\n"
+            + "send_count=1\n"
+            + "recv_count=3\n"
+            + "prev_send_count=0\n"
+            + "kem_send_pub=\n"
+            + "kem_recv_priv=\n"
+            + "kem_recv_pub=\n"
+            + "kem_since_checkpoint=1\n"
+            + "last_checkpoint_time=0\n"
+            + "ad=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==\n"
+            + "kem_history=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+            ;
+            SessionState? st = SessionState.deserialize(blob);
+            fail_if(st == null, "could not load the ratchet cross-vector session state");
+            check_cross_vector_message((!) st, "0000002054c90785341bc0b756c1d06570ced5b5975dea1498f1855c3c29544071998a57000000040000000300000004000000000000000000000000", "f5a6886c0144e6e7a6ac61df68a08f0db8c6c05cf92ef4b9b65570fc7457055bc52b954c73b7e56c1250aa054596d83e90e424d5ca7cce72f6b209b0", "e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4", "ratchet");
+        } catch (Error e) {
+            fail_if_reached(e.message);
+        }
+    }
+
+    private void check_cross_vector_message(SessionState st, string hdr_hex, string ct_hex,
+                                            string want_hex, string label) throws Error {
+        MessageHeader? h = MessageHeader.unmarshal(new Bytes(hex_to_bin(hdr_hex)));
+        fail_if(h == null, label + ": header failed to unmarshal");
+        Bytes got = decrypt_transport_key(st, (!) h, new Bytes(hex_to_bin(ct_hex)));
+        fail_if_not_eq_uint8_arr(hex_to_bin(want_hex), bytes_to_array(got),
+            label + ": decrypted transport key does not match the other implementation");
+    }
+
+    private static uint8[] hex_to_bin(string hex) {
+        uint8[] outb = new uint8[hex.length / 2];
+        for (int i = 0; i < outb.length; i++) {
+            outb[i] = (uint8) ("0123456789abcdef".index_of_char(hex[i * 2]) * 16
+                             + "0123456789abcdef".index_of_char(hex[i * 2 + 1]));
+        }
+        return outb;
+    }
+
+    private void test_late_messages_from_abandoned_chain() {
+        try {
+            TestIdentity alice = new TestIdentity();
+            TestIdentity bob = new TestIdentity();
+
+            PeerBundle peer_bundle = bob.to_peer_bundle();
+            SessionBootstrap a = initiate_session(alice.dik_priv_x25519, alice.dik_pub_x25519, peer_bundle);
+            SessionState b = respond_session(
+                bob.dik_priv_x25519, bob.dik_pub_x25519,
+                bob.spk_priv_x25519, bob.spk_pub_x25519,
+                bob.opk_priv_x25519, bob.kem_priv,
+                alice.device_certificate, alice.aik_pub_ed25519, alice.aik_pub_mldsa,
+                a.prekey_ephemeral_pub, a.kem_ciphertext);
+
+            // Alice sends four; Bob is "offline" and takes none of them yet.
+            Bytes[] keys = new Bytes[4];
+            MessageHeader[] headers = new MessageHeader[4];
+            Bytes[] cts = new Bytes[4];
+            for (int i = 0; i < 4; i++) {
+                keys[i] = Crypto.random_bytes(44);
+                MessageHeader h;
+                Bytes ct;
+                encrypt_transport_key(a.state, keys[i], out h, out ct);
+                headers[i] = h;
+                cts[i] = ct;
+            }
+            fail_if_not_eq_int((int) headers[0].n, 0, "first message of the chain is n=0");
+            fail_if_not_eq_int((int) headers[3].n, 3, "fourth message of the chain is n=3");
+
+            // Bob comes online far enough to take the first two.
+            Bytes got0 = decrypt_transport_key(b, headers[0], cts[0]);
+            fail_if_not_eq_uint8_arr(bytes_to_array(keys[0]), bytes_to_array(got0), "n=0 mismatch");
+            Bytes got1 = decrypt_transport_key(b, headers[1], cts[1]);
+            fail_if_not_eq_uint8_arr(bytes_to_array(keys[1]), bytes_to_array(got1), "n=1 mismatch");
+
+            // Bob replies; Alice processes it and DH-ratchets, ending the chain above.
+            Bytes reply_key = Crypto.random_bytes(44);
+            MessageHeader reply_h;
+            Bytes reply_ct;
+            encrypt_transport_key(b, reply_key, out reply_h, out reply_ct);
+            decrypt_transport_key(a.state, reply_h, reply_ct);
+
+            // Alice's next message opens a new chain and must declare the abandoned
+            // chain's length, or Bob cannot know how many keys to retain for it.
+            Bytes fresh_key = Crypto.random_bytes(44);
+            MessageHeader fresh_h;
+            Bytes fresh_ct;
+            encrypt_transport_key(a.state, fresh_key, out fresh_h, out fresh_ct);
+            fail_if_not_eq_int((int) fresh_h.n, 0, "new chain restarts at n=0");
+            fail_if_not_eq_int((int) fresh_h.prev_chain_len, 4,
+                "prev_chain_len must be the number of messages sent on the chain just ended");
+
+            // Bob takes the ratchet message — the point at which it must stash the
+            // remaining keys of the chain being abandoned.
+            Bytes got_fresh = decrypt_transport_key(b, fresh_h, fresh_ct);
+            fail_if_not_eq_uint8_arr(bytes_to_array(fresh_key), bytes_to_array(got_fresh), "new-chain n=0 mismatch");
+
+            // The two that were in flight finally arrive. This is the regression.
+            Bytes got2 = decrypt_transport_key(b, headers[2], cts[2]);
+            fail_if_not_eq_uint8_arr(bytes_to_array(keys[2]), bytes_to_array(got2),
+                "message stranded on the abandoned chain must still decrypt (n=2)");
+            Bytes got3 = decrypt_transport_key(b, headers[3], cts[3]);
+            fail_if_not_eq_uint8_arr(bytes_to_array(keys[3]), bytes_to_array(got3),
+                "message stranded on the abandoned chain must still decrypt (n=3)");
         } catch (Error e) {
             fail_if_reached(e.message);
         }
