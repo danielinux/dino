@@ -32,6 +32,68 @@ class MembershipDagTest : Gee.TestCase {
         add_test("snapshot_virtual_genesis_import", test_snapshot_genesis);
         add_test("pinned_owner_survives_hostile_root", test_pinned_owner_survives_hostile_root);
         add_test("unverifiable_first_entry_does_not_consume_genesis", test_unverifiable_first_entry);
+        add_test("group_heads_kat_vector", test_group_heads_kat);
+    }
+
+    // §13.1b anti-withholding KAT — the <heads> wire vector. MUST stay
+    // byte-for-byte in sync with PQonversations' GroupHeadsTest (same
+    // canonical vector, same base64).
+    private void test_group_heads_kat() {
+        try {
+            uint8[] zero = new uint8[32]; // 0x00 * 32
+            uint8[] one = new uint8[32];  for (int i = 0; i < 32; i++) one[i] = 1;
+            uint8[] ff = new uint8[32];   for (int i = 0; i < 32; i++) ff[i] = 0xFF;
+            var heads = new Gee.ArrayList<Bytes>();
+            heads.add(new Bytes(ff));
+            heads.add(new Bytes(zero));
+            heads.add(new Bytes(one));
+
+            uint8[] wire = GroupHeads.encode(heads);
+            fail_if_not_eq_int(wire.length, 98, "wire length = 2 + 3*32");
+            fail_if_not_eq_int(wire[0], 0x00, "n high byte");
+            fail_if_not_eq_int(wire[1], 0x03, "n low byte");
+            string b64 = Base64.encode(wire);
+            fail_if_not_eq_str(b64,
+                "AAMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBAQEBAQEBAQEBAQEBAQ"
+              + "EBAQEBAQEBAQEBAQEBAQEB//////////////////////////////////////////8=",
+                "canonical KAT base64 (shared with PQonversations)");
+
+            // Round-trip: decode restores the three heads in sorted order.
+            Gee.ArrayList<Bytes> dec = GroupHeads.decode(wire);
+            fail_if_not_eq_int(dec.size, 3, "decode count");
+            fail_if(hex(bytes_to_arr(dec.get(0))) != hex(zero), "first head sorted first");
+            fail_if(hex(bytes_to_arr(dec.get(1))) != hex(one), "second head");
+            fail_if(hex(bytes_to_arr(dec.get(2))) != hex(ff), "third head");
+
+            // Deterministic across input orderings.
+            var heads2 = new Gee.ArrayList<Bytes>();
+            heads2.add(new Bytes(one)); heads2.add(new Bytes(ff)); heads2.add(new Bytes(zero));
+            fail_if(hex(GroupHeads.encode(heads2)) != hex(wire), "order-independent encoding");
+
+            // Malformed payloads must be rejected.
+            bool rejected = false;
+            try { GroupHeads.decode(new uint8[1]); } catch (Error e) { rejected = true; }
+            fail_if_not(rejected, "short payload rejected");
+            uint8[] bad_len = new uint8[35]; bad_len[1] = 1;
+            rejected = false;
+            try { GroupHeads.decode(bad_len); } catch (Error e) { rejected = true; }
+            fail_if_not(rejected, "length-mismatch payload rejected");
+            rejected = false;
+            var bad_entry = new Gee.ArrayList<Bytes>();
+            bad_entry.add(new Bytes(new uint8[31]));
+            try { GroupHeads.encode(bad_entry); } catch (Error e) { rejected = true; }
+            fail_if_not(rejected, "non-32-byte head rejected");
+
+            // covers(): a peer subset is not a divergence; an unknown head is.
+            fail_if_not(GroupHeads.covers(heads, heads), "covers(self)");
+            var unknown = new Gee.ArrayList<Bytes>();
+            uint8[] k = new uint8[32]; k[0] = 0x42;
+            unknown.add(new Bytes(k));
+            fail_if(GroupHeads.covers(unknown, heads), "unknown head → divergence");
+            var subset = new Gee.ArrayList<Bytes>();
+            subset.add(new Bytes(zero));
+            fail_if_not(GroupHeads.covers(subset, heads), "peer behind us is not withholding");
+        } catch (Error e) { fail_if_reached(e.message); }
     }
 
     // v1->v2 bridge Snapshot payload marshals/parses byte-for-byte.

@@ -1431,6 +1431,21 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             .put_node(new StanzaNode.build("ct", Protocol.NS_ENVELOPE)
                 .put_node(new StanzaNode.text(Base64.encode(ciphertext))));
 
+        // §13.1b anti-withholding: advertise our observed v2 journal DAG heads
+        // so peers can detect a withholding relay (or their own gap) over the
+        // authenticated group channel. Omitted when the room has no v2
+        // frontier yet (v1-only or not yet bootstrapped).
+        if (is_v2_active(conversation.account, room_jid_str)) {
+            Protocol.MembershipDag? dag = get_dag(conversation.account, room_jid_str);
+            if (dag != null) {
+                Gee.ArrayList<Bytes> heads = dag.current_heads();
+                if (heads.size > 0) {
+                    group_env.put_node(new StanzaNode.build("heads", Protocol.NS_ENVELOPE)
+                        .put_node(new StanzaNode.text(Base64.encode(Protocol.GroupHeads.encode(heads)))));
+                }
+            }
+        }
+
         message_stanza.stanza.put_node(group_env);
         ExplicitEncryption.add_encryption_tag_to_message(message_stanza, Protocol.NS_X3DHPQ, "x3dhpq");
         message_stanza.body = "[This message is x3dhpq group encrypted]";
@@ -1890,6 +1905,31 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
     // several sender-chain announcements land in quick succession.
     private Gee.HashSet<string> group_mam_catchup_in_flight = new Gee.HashSet<string>();
 
+    // §13.1b anti-withholding: rooms where a peer advertised journal heads we
+    // lack. In-memory only — the durable truth is the journal itself; this
+    // set exists so the UI can show a warning until the frontiers converge.
+    private Gee.HashSet<string> divergent_rooms = new Gee.HashSet<string>();
+    // Rate limit for divergence-triggered MAM catch-ups, per room.
+    private HashMap<string, int64?> divergence_last_catchup = new HashMap<string, int64?>();
+    private const int64 DIVERGENCE_CATCHUP_INTERVAL_US = 30 * 1000 * 1000; // 30 s
+
+    private string divergent_key(Conversation conversation) {
+        return "%d/%s".printf(conversation.account.id, conversation.counterpart.bare_jid.to_string());
+    }
+
+    /** @return true if the given room currently has an unresolved §13.1b divergence. */
+    public bool is_frontier_divergent(Conversation conversation) {
+        return divergent_rooms.contains(divergent_key(conversation));
+    }
+
+    /** Clears the §13.1b divergence flag for a room (converged or dismissed). */
+    public void clear_frontier_divergent(Conversation conversation) {
+        string k = divergent_key(conversation);
+        if (divergent_rooms.remove(k)) {
+            warning("x3dhpq: journal frontier converged for %s", k);
+        }
+    }
+
     // Kick off a MUC (XEP-0313) MAM catch-up for the given room via Dino core's
     // HistorySync. Idempotent per (account, room): a query already in flight is
     // not re-issued.
@@ -2045,6 +2085,10 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                     db.store_message_source_device(conversation.account, (!) message.stanza_id, (int) hdr.sender_device_id);
                 }
             }
+            // §13.1b: check the sender's advertised journal heads against our
+            // frontier (never fails the message — the payload is already
+            // authenticated; a missing/malformed element is just ignored).
+            check_advertised_heads(conversation, room_jid_str, group_env);
             // Decrypted → let the pipeline continue and store it (return value is
             // "abort pipeline?", see DecryptMessageListener).
             return false;
@@ -2061,6 +2105,55 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         } catch (GLib.Error e) {
             warning("x3dhpq group decrypt failed from %s in %s: %s", sender_aik_fp, room_jid_str, e.message);
             return false;
+        }
+    }
+
+    // §13.1b anti-withholding: compare the heads advertised in the envelope
+    // with our current v2 DAG frontier. An advertised head we do not hold
+    // means the peer's frontier extends past ours — a withholding relay,
+    // or our own gap. Surface it (UI flag + log) and re-fetch via MAM,
+    // rate-limited per room. The flag clears automatically once a later
+    // message confirms all advertised heads are local.
+    private void check_advertised_heads(Conversation conversation, string room_jid_str, StanzaNode group_env) {
+        StanzaNode? heads_node = group_env.get_subnode("heads", Protocol.NS_ENVELOPE);
+        if (heads_node == null || !is_v2_active(conversation.account, room_jid_str)) {
+            return; // no advertisement (pre-upgrade sender) or no v2 frontier to compare
+        }
+        string? heads_b64 = heads_node.get_string_content();
+        if (heads_b64 == null || heads_b64.strip() == "") return;
+        Gee.ArrayList<Bytes> advertised;
+        try {
+            advertised = Protocol.GroupHeads.decode(bytes_to_uint8_array(bytes_from_base64(heads_b64)));
+        } catch (Error e) {
+            warning("x3dhpq: malformed <heads> in group message for %s: %s", room_jid_str, e.message);
+            return;
+        }
+        Protocol.MembershipDag? dag = get_dag(conversation.account, room_jid_str);
+        if (dag == null) return;
+        // current_heads() walks the whole DAG — compute it once.
+        Gee.ArrayList<Bytes> local = dag.current_heads();
+        if (Protocol.GroupHeads.covers(advertised, local)) {
+            // We hold every head the peer advertised — converged (or the peer
+            // is simply behind us, which is not withholding).
+            clear_frontier_divergent(conversation);
+            return;
+        }
+        string key = divergent_key(conversation);
+        divergent_rooms.add(key);
+        // Count the missing heads for the log (they are not otherwise derivable).
+        var local_hex = new Gee.HashSet<string>();
+        foreach (Bytes h in local) local_hex.add(Protocol.hex_of(bytes_to_uint8_array(h)));
+        int missing = 0;
+        foreach (Bytes h in advertised) {
+            if (!local_hex.contains(Protocol.hex_of(bytes_to_uint8_array(h)))) missing++;
+        }
+        warning("x3dhpq: journal frontier divergence in %s: peer advertises %d head(s) we do not have; requesting MAM catch-up (§13.1b)",
+            room_jid_str, missing);
+        int64 now = GLib.get_monotonic_time();
+        int64 last = divergence_last_catchup.has_key(key) ? divergence_last_catchup.get(key) : 0;
+        if (now - last >= DIVERGENCE_CATCHUP_INTERVAL_US) {
+            divergence_last_catchup.set(key, now);
+            trigger_group_mam_catchup(conversation.account, room_jid_str);
         }
     }
 

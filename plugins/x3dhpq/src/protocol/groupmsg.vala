@@ -65,4 +65,84 @@ public class GroupMessageHeader : Object {
     }
 }
 
+// §13.1b anti-withholding: membership-journal DAG head list carried in a
+// group envelope's <heads> child.
+//
+// Wire encoding (base64 of this binary form):
+//   uint16 n_heads (BE) | n_heads × 32-byte SHA-256 head hash, sorted ascending
+//
+// A head is a journal entry not referenced as a parents[] element by any
+// other entry — the current DAG frontier (§13.1a). Sorting makes the
+// encoding deterministic across implementations (hash-map iteration order
+// is not). The element is omitted entirely when n_heads == 0.
+//
+// KAT: see tests/membership_dag.vala (group_heads_kat_vector) — MUST match
+// PQonversations' libs/x3dhpq-core GroupHeadsTest byte-for-byte.
+public class GroupHeads : Object {
+    public const size_t HEAD_LENGTH = 32;
+
+    public static uint8[] encode(Gee.ArrayList<Bytes> heads) throws Error {
+        var sorted = new Gee.ArrayList<Bytes>();
+        foreach (Bytes h in heads) {
+            if ((size_t) h.get_size() != HEAD_LENGTH) {
+                throw new IOError.FAILED("heads: entry must be 32 bytes");
+            }
+            sorted.add(h);
+        }
+        if (sorted.size > 0xFFFF) {
+            throw new IOError.FAILED("heads: too many entries");
+        }
+        sorted.sort((a, b) => {
+            uint8[] da = bytes_to_uint8_array(a);
+            uint8[] db_ = bytes_to_uint8_array(b);
+            int n = (da.length < db_.length) ? da.length : db_.length;
+            for (int i = 0; i < n; i++) {
+                if (da[i] != db_[i]) return (int) da[i] - (int) db_[i];
+            }
+            return da.length - db_.length;
+        });
+        uint8[] buf = new uint8[2 + 32 * (int) sorted.size];
+        buf[0] = (uint8) (sorted.size >> 8);
+        buf[1] = (uint8) sorted.size;
+        size_t off = 2;
+        foreach (Bytes h in sorted) {
+            uint8[] hd = bytes_to_uint8_array(h);
+            Memory.copy((uint8*) buf + off, hd, 32);
+            off += 32;
+        }
+        return buf;
+    }
+
+    public static Gee.ArrayList<Bytes> decode(uint8[] raw) throws Error {
+        if (raw.length < 2) {
+            throw new IOError.FAILED("heads: empty payload");
+        }
+        int n = ((int) raw[0] << 8) | raw[1];
+        if (raw.length != 2 + 32 * n) {
+            throw new IOError.FAILED("heads: length %u inconsistent with n=%d".printf(raw.length, n));
+        }
+        var out = new Gee.ArrayList<Bytes>();
+        for (int i = 0; i < n; i++) {
+            uint8[] piece = new uint8[32];
+            Memory.copy(piece, raw + (2 + 32 * i), 32);
+            out.add(new Bytes(piece));
+        }
+        return out;
+    }
+
+    // True iff every hash in `a` is present in `b` (order-insensitive).
+    public static bool covers(Gee.ArrayList<Bytes> a, Gee.ArrayList<Bytes> b) {
+        var bs = new Gee.HashSet<string>();
+        foreach (Bytes h in b) {
+            bs.add(hex_of(bytes_to_uint8_array(h)));
+        }
+        foreach (Bytes h in a) {
+            if (!bs.contains(hex_of(bytes_to_uint8_array(h)))) {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
 }

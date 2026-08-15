@@ -133,6 +133,14 @@ public class EncryptionListEntry : Plugins.EncryptionListEntry, Object {
                     }
                 }
             }
+            // §13.1b: a peer advertised membership-journal heads this device
+            // lacks (withholding relay, or our own gap). Manager already
+            // triggered a rate-limited MAM catch-up; the flag clears itself
+            // once the frontiers converge, so this warning is transient.
+            if (plugin.manager.is_frontier_divergent(conversation)) {
+                input_status_callback(new Plugins.InputFieldStatus("A group member reports membership updates this device doesn't have — catching up. If this persists, a relay may be withholding the group journal (§13.1b).", Plugins.InputFieldStatus.MessageType.WARNING, Plugins.InputFieldStatus.InputState.NORMAL));
+                return;
+            }
         }
 
         input_status_callback(new Plugins.InputFieldStatus("x3dhpq is ready for this conversation.", Plugins.InputFieldStatus.MessageType.INFO, Plugins.InputFieldStatus.InputState.NORMAL));
