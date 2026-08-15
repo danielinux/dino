@@ -12,6 +12,7 @@ class CPaceTest : Gee.TestCase {
         add_test("confirm_roundtrip",        test_confirm_roundtrip);
         add_test("wrong_tag_rejected",       test_wrong_tag_rejected);
         add_test("low_order_rejected",       test_low_order_rejected);
+        add_test("high_bit_low_order_rejected", test_high_bit_low_order_rejected);
         add_test("process_short_msg_rejected", test_process_short_msg_rejected);
         add_test("hash_to_curve_interop",    test_hash_to_curve_interop);
     }
@@ -158,6 +159,40 @@ class CPaceTest : Gee.TestCase {
                 "low_order_rejected: expected BAD_MESSAGE, got: " + e.message);
         } catch (Error e) {
             fail_if_reached("low_order_rejected: unexpected error type: " + e.message);
+        }
+    }
+
+    /* p with bit 255 set. This matches no entry in the raw-encoding blacklist, because
+     * that list stores the canonical 0x7f-topped form — but X25519 masks the high bit, so
+     * it is the same forbidden point once it reaches the ladder. Either the backend
+     * refuses the key or the output check catches the all-zero result; both are a
+     * BAD_MESSAGE here, and neither may yield a session key. */
+    private void test_high_bit_low_order_rejected() {
+        try {
+            uint8[] password = "test-password".data;
+            uint8[] sid      = make_sid();
+            CPaceContext ctx = make_ctx();
+
+            CPaceState initiator = CPaceState.create(CPaceRole.INITIATOR, password, sid, ctx);
+            initiator.message1();
+
+            uint8[] lop = new uint8[32];
+            lop[0] = 0xed;
+            for (int i = 1; i < 31; i++) {
+                lop[i] = 0xff;
+            }
+            lop[31] = 0xff; /* canonical form ends 0x7f; set bit 255 */
+
+            fail_if_not_eq_int(CPaceLowOrder.is_low_order(lop) ? 1 : 0, 0,
+                "high_bit_low_order: the raw blacklist is expected to miss this form");
+
+            initiator.process(lop);
+            fail_if_reached("high_bit_low_order: process() must throw");
+        } catch (CPaceError e) {
+            fail_if_not_eq_int((int) e.code, (int) CPaceError.BAD_MESSAGE,
+                "high_bit_low_order: expected BAD_MESSAGE, got: " + e.message);
+        } catch (Error e) {
+            /* wolfSSL rejects the import outright; that is an acceptable abort too. */
         }
     }
 

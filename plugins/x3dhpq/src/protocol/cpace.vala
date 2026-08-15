@@ -199,6 +199,20 @@ public class CPaceState : GLib.Object {
         );
         uint8[] K = K_bytes.get_data();
 
+        /* Abort on a degenerate shared secret (CPace scalar_mult_vfy semantics).
+         *
+         * The blacklist above compares the raw 32-byte encoding, but X25519 masks bit 255
+         * before use, so a forbidden value with the high bit SET slips past it and still
+         * multiplies to all-zero. wolfSSL happens to reject a high-bit-set public key, so
+         * this path is not currently reachable here — but that is a property of the
+         * backend, not of the protocol, and the equivalent Java client is exploitable
+         * without it. An attacker who lands a zero K knows it without the pairing code and
+         * can complete confirmation, which grants account-device authority. Check the
+         * output, which is encoding-independent. */
+        if (is_all_zero(K)) {
+            throw new CPaceError.BAD_MESSAGE("cpace: degenerate shared secret");
+        }
+
         /* ma = lexicographic minimum, mb = maximum */
         uint8[] ma = my_msg;
         uint8[] mb = peer_msg;
@@ -278,6 +292,16 @@ public class CPaceState : GLib.Object {
 
     /* Lexicographic comparison of two equal-length byte arrays.
      * Returns negative, zero, or positive. */
+    /* Accumulates rather than returning early so the check does not leak how many
+     * leading bytes of the shared secret were zero. */
+    private static bool is_all_zero(uint8[] v) {
+        uint8 acc = 0;
+        for (int i = 0; i < v.length; i++) {
+            acc |= v[i];
+        }
+        return acc == 0;
+    }
+
     private static int compare_bytes(uint8[] a, uint8[] b) {
         int len = int.min(a.length, b.length);
         for (int i = 0; i < len; i++) {
