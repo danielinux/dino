@@ -1820,11 +1820,34 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                 }
             }
             warning("Unable to decrypt x3dhpq message from %s/%d: %s", sender_jid_value, sender_device_id, e.message);
-            // Stale/mismatched session (e.g. our cached bundle predated the peer's
-            // key regeneration after a reset). Auto-renegotiate rather than staying
-            // wedged: drop the session, refetch a fresh bundle, and hand the peer a
-            // fresh prekey so both sides converge. Rate-limited inside. The message
-            // that just failed is lost (resend/retransmit picks it up).
+
+            // Renegotiating DELETES the stored session (trigger_session_rekey ->
+            // db.delete_session), so it must only fire on evidence the session is
+            // genuinely stale. A single failed decrypt is not that evidence:
+            //
+            //  * An archived message is expected to fail — it was encrypted to a chain
+            //    we have long since ratcheted past. A MAM catch-up delivers a burst of
+            //    them on reconnect, and letting the first one renegotiate destroyed the
+            //    live session out from under every VALID message queued behind it. That
+            //    is the "messages arrive but never decrypt, one direction only" bug.
+            // So: only renegotiate for a LIVE failure.
+            //
+            // NOTE: this still renegotiates on a single live failure, so an attacker who
+            // can echo one old ciphertext back as a live stanza can delete an established
+            // session on demand. Closing that needs the receiver to distinguish "replay of
+            // a chain we retired" from "genuinely stale session", which it cannot do today.
+            bool is_archived = Xmpp.MessageArchiveManagement.MessageFlag.get_flag(stanza) != null
+                || Xep.DelayedDelivery.MessageFlag.get_flag(stanza) != null;
+            if (is_archived) {
+                debug("x3dhpq: not renegotiating with %s/%d — message came from the archive"
+                    + " (session left intact)", sender_jid_value, sender_device_id);
+                return false;
+            }
+
+            // Live failure: the peer is sending now under keys we cannot handle (e.g.
+            // our cached bundle predated their reset). Drop the session, refetch a
+            // fresh bundle and hand the peer a fresh prekey so both sides converge.
+            // Rate-limited inside. The message that just failed is lost.
             try {
                 trigger_session_rekey.begin(conversation.account, new Jid(sender_jid_value), sender_device_id);
             } catch (InvalidJidError je) {
