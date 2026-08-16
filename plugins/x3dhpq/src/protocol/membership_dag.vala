@@ -545,6 +545,23 @@ public class DagState : Object {
      * fold order. Zeroed 32 bytes when nothing folded. */
     public uint8[] fold_hash = new uint8[32];
 
+    /* Per-entry disposition of the fold, as entry_hash hex, in CANONICAL fold order.
+     *
+     * `accepted` is exactly the list fold_hash is computed over (§13.5a), so publishing
+     * it turns a fold_hash mismatch from "some digest differs" into "you accepted a
+     * different set of entries, here it is" — which is the difference between a
+     * cross-client corpus that localises a divergence and one that only reports it.
+     *
+     * `unauthorized` and `quarantined` are deliberately SEPARATE (§13.1a.0 failure
+     * policy). An unauthorized entry is a decided negative and stays decided; a
+     * quarantined one is undecided — it stays in the store and is re-evaluated once the
+     * author's Trust Manifest arrives. Collapsing them loses the entry permanently on a
+     * transient lookup gap, so a fold that cannot tell them apart cannot be checked for
+     * getting it right. None of the three is on the wire or part of fold_hash. */
+    public Gee.ArrayList<string> accepted = new Gee.ArrayList<string>();
+    public Gee.ArrayList<string> unauthorized = new Gee.ArrayList<string>();
+    public Gee.ArrayList<string> quarantined = new Gee.ArrayList<string>();
+
     /* D5.1: epoch_id = SHA-256("X3DHPQ-EpochId-v1\0" || len||roomJID || epoch
      *                          || fold_hash)[0..8] as a big-endian uint64.
      *
@@ -674,8 +691,10 @@ public class MembershipDag : Object {
         var st = new DagState();
         var order = canonical_order();
         var removal_node = new Gee.HashMap<string, string>();
-        // D5.1: entry_hashes of every ACCEPTED entry, in canonical fold order.
-        var accepted_hashes = new Gee.ArrayList<string>();
+        // D5.1: entry_hashes of every ACCEPTED entry, in canonical fold order. Lives on
+        // the state so a caller can see WHICH entries produced the fold_hash, and which
+        // were refused versus merely held (§13.1a.0).
+        var accepted_hashes = st.accepted;
         // The genesis is the first entry that actually AUTHENTICATES (and matches the
         // pin), NOT whatever sorts first. Keying it off the raw index made the genesis
         // slot consumable: one entry that sorts first and fails to verify — which costs
@@ -687,11 +706,23 @@ public class MembershipDag : Object {
         for (int i = 0; i < order.size; i++) {
             JournalEntryV2 e = order.get(i);
             string signer_hex = hex_of(e.signer_fp);
+            /* §13.1a.0 failure policy: an entry failing steps 1–4 — unresolvable signer,
+             * unparseable or unverifiable DC, bad hybrid signature — is UNAUTHORIZED.
+             * Only step 5's no-manifest arm quarantines. */
             Bytes ed, ml;
-            if (!resolver(signer_hex, out ed, out ml)) continue;
+            if (!resolver(signer_hex, out ed, out ml)) {
+                st.unauthorized.add(e.hash_hex());
+                continue;
+            }
             try {
-                if (!e.verify(ed, ml)) continue;
-            } catch (GLib.Error err) { continue; }
+                if (!e.verify(ed, ml)) {
+                    st.unauthorized.add(e.hash_hex());
+                    continue;
+                }
+            } catch (GLib.Error err) {
+                st.unauthorized.add(e.hash_hex());
+                continue;
+            }
 
             /* §13.1a: the certificate chain proves the account certified this device at
              * SOME point, not that it is still authorized. Rejecting entries from a revoked
@@ -700,6 +731,7 @@ public class MembershipDag : Object {
              * to add, remove and promote members in every room its account administers. */
             if (revocation_checker != null
                     && revocation_checker(signer_hex, e.issuer_device_id)) {
+                st.unauthorized.add(e.hash_hex());
                 continue;
             }
 
@@ -715,27 +747,46 @@ public class MembershipDag : Object {
              * UNRESOLVED (no manifest held for that account) does not fold the entry
              * either, but the entry stays in the store and is re-evaluated on the
              * next fold once the manifest arrives — quarantine, not discard. */
-            if (issuer_checker != null
-                    && issuer_checker(signer_hex, e.issuer_device_id) != IssuerAuthStatus.AUTHORIZED) {
-                continue;
+            if (issuer_checker != null) {
+                IssuerAuthStatus status = issuer_checker(signer_hex, e.issuer_device_id);
+                if (status == IssuerAuthStatus.UNRESOLVED) {
+                    /* Held, not refused: absent from `accepted` AND absent from
+                     * `unauthorized`, so a caller can tell "we cannot decide yet" from
+                     * "we decided no". */
+                    st.quarantined.add(e.hash_hex());
+                    continue;
+                }
+                if (status != IssuerAuthStatus.AUTHORIZED) {
+                    st.unauthorized.add(e.hash_hex());
+                    continue;
+                }
             }
 
             if (!genesis_established) {
                 // A genesis must be a root: an entry descending from another entry
                 // cannot be the start of the room's history.
-                if (e.parents.size != 0) continue;
+                if (e.parents.size != 0) {
+                    st.unauthorized.add(e.hash_hex());
+                    continue;
+                }
                 // A first-in-canonical-order Snapshot is a virtual genesis
                 // (v1->v2 bridge / MAM-prune-proof catch-up): TOFU-pin owner_fp
                 // and import its asserted member/admin/banned sets. The snapshot
                 // signer MUST be an asserted admin of the set it declares.
                 if (e.action == (uint8) MemberAuditActionV2.SNAPSHOT) {
                     SnapshotPayload? sp = JournalEntryV2.parse_snapshot_payload(e.payload);
-                    if (sp == null) continue;
+                    if (sp == null) {
+                        st.unauthorized.add(e.hash_hex());
+                        continue;
+                    }
                     string owner_hex = hex_of(sp.owner_fp);
                     // The asserted owner is payload data the signer chose, so it is
                     // exactly as attacker-controlled as the signer field. Only the pin
                     // constrains it.
-                    if (pinned_owner_fp != null && pinned_owner_fp.down() != owner_hex.down()) continue;
+                    if (pinned_owner_fp != null && pinned_owner_fp.down() != owner_hex.down()) {
+                        st.unauthorized.add(e.hash_hex());
+                        continue;
+                    }
                     var imp_members = new Gee.HashSet<string>();
                     var imp_admins = new Gee.HashSet<string>();
                     for (int mi = 0; mi < sp.member_fps.size; mi++) {
@@ -746,7 +797,10 @@ public class MembershipDag : Object {
                     imp_members.add(owner_hex);
                     imp_admins.add(owner_hex);
                     // Reject a snapshot whose signer is not an admin it declares.
-                    if (!imp_admins.contains(signer_hex)) continue;
+                    if (!imp_admins.contains(signer_hex)) {
+                        st.unauthorized.add(e.hash_hex());
+                        continue;
+                    }
                     st.owner_fp = owner_hex;
                     foreach (string mh in imp_members) st.members.add(mh);
                     foreach (string ah in imp_admins) st.admins.add(ah);
@@ -760,7 +814,29 @@ public class MembershipDag : Object {
                     for (int ri = 0; ri < sp.retired_fps.size; ri++) {
                         st.retired.add(hex_of(sp.retired_fps.get(ri).get_data()));
                     }
-                    st.epoch = (uint32) sp.epoch;
+                    /* The asserted `epoch` is NOT imported (§13.1a.0 "Epoch derivation",
+                     * normative): the epoch MUST be the number of authorized
+                     * rotation-causing entries IN THE CURRENT FOLD, and a Snapshot is a
+                     * passive checkpoint that causes no rotation (§13.5 trigger 2), so a
+                     * fold rooted at one starts the count at 0 and the first
+                     * rotation-causing descendant makes it 1.
+                     *
+                     * The snapshot's `epoch` field is payload metadata the signer chose,
+                     * in exactly the sense §13.1a.1 gives `epoch_after`: advisory, to be
+                     * cross-checked and warned about, never trusted over the folded
+                     * state. Importing it lets any admin authoring a snapshot pick the
+                     * room's epoch number — including 0xFFFFFFFF, which under
+                     * install-once-per-epoch (§13.4a.2) burns the whole remaining epoch
+                     * space for every client that folds it.
+                     *
+                     * CROSS-CLIENT NOTE: §13.5 trigger 2 still carries the sentence "A
+                     * client that uses a snapshot as virtual genesis starts from the
+                     * snapshot's asserted epoch", which says the opposite. That sentence
+                     * is in a non-normative trigger list and is contradicted by two
+                     * normative MUSTs; conformance/v2/journal-fold.json
+                     * (`snapshot-as-virtual-genesis`) pins the count reading. The spec
+                     * sentence needs to go. */
+                    st.epoch = 0;
                     genesis_established = true;
                     accepted_hashes.add(e.hash_hex());
                     continue;
@@ -772,7 +848,10 @@ public class MembershipDag : Object {
                 // relay by anyone), and sort it ahead of the real genesis by choosing
                 // its own lamport/signer_fp/hash. On the next fold that stranger is
                 // owner: permanent admin, irremovable, undemotable.
-                if (pinned_owner_fp != null && pinned_owner_fp.down() != signer_hex.down()) continue;
+                if (pinned_owner_fp != null && pinned_owner_fp.down() != signer_hex.down()) {
+                    st.unauthorized.add(e.hash_hex());
+                    continue;
+                }
                 st.owner_fp = signer_hex;
                 st.admins.add(signer_hex);
                 st.members.add(signer_hex);
@@ -791,14 +870,20 @@ public class MembershipDag : Object {
             if (e.action == (uint8) MemberAuditActionV2.RETIRE_MEMBER) {
                 retire_parsed = JournalEntryV2.parse_retire_payload(
                     e.payload, out retire_fp, out retire_kind, out retire_evidence);
-                if (!retire_parsed) continue;
+                if (!retire_parsed) {
+                    st.unauthorized.add(e.hash_hex());
+                    continue;
+                }
             }
 
             /* D4.2 rule 1: a DeviceSetChange speaks only for its author's own device
              * set, so it needs MEMBERSHIP, not adminship — any member may announce
              * that its own devices changed. Every other action still requires admin. */
             if (e.action == (uint8) MemberAuditActionV2.DEVICE_SET_CHANGE) {
-                if (!st.members.contains(signer_hex)) continue;
+                if (!st.members.contains(signer_hex)) {
+                    st.unauthorized.add(e.hash_hex());
+                    continue;
+                }
             } else if (e.action == (uint8) MemberAuditActionV2.RETIRE_MEMBER) {
                 /* §13.5c: the authorization gate branches on the evidence kind, ahead of
                  * the generic owner-or-admin rule, the same way DeviceSetChange branches
@@ -813,13 +898,21 @@ public class MembershipDag : Object {
                  * kind 2 — nothing is proved; the entry IS the author's word that they
                  * re-verified the successor out-of-band per §12.2. OWNER OR ADMIN only. */
                 if (retire_kind == (uint8) RetireEvidenceKind.ROTATION_POINTER) {
-                    if (!st.members.contains(signer_hex)) continue;
+                    if (!st.members.contains(signer_hex)) {
+                        st.unauthorized.add(e.hash_hex());
+                        continue;
+                    }
                 } else if (retire_kind == (uint8) RetireEvidenceKind.WITNESSED) {
-                    if (!st.admins.contains(signer_hex)) continue;
+                    if (!st.admins.contains(signer_hex)) {
+                        st.unauthorized.add(e.hash_hex());
+                        continue;
+                    }
                 } else {
-                    continue;   // unknown evidence kind ⇒ unauthorized
+                    st.unauthorized.add(e.hash_hex());   // unknown evidence kind
+                    continue;
                 }
             } else if (!st.admins.contains(signer_hex)) {
+                st.unauthorized.add(e.hash_hex());
                 continue;
             }
 
@@ -853,12 +946,16 @@ public class MembershipDag : Object {
                 uint8[] claimed_fp;
                 uint64 manifest_version;
                 if (!JournalEntryV2.parse_device_set_change_payload(e.payload, out claimed_fp, out manifest_version)) {
+                    st.unauthorized.add(e.hash_hex());
                     continue;
                 }
                 /* Rule 2: an account speaks only for ITS OWN device set. Any other
                  * value makes the entry unauthorized — otherwise one member could
                  * force epoch churn in another member's name. */
-                if (hex_of(claimed_fp).down() != signer_hex.down()) continue;
+                if (hex_of(claimed_fp).down() != signer_hex.down()) {
+                    st.unauthorized.add(e.hash_hex());
+                    continue;
+                }
                 /* Rule 3: not-greater than the recorded version ⇒ accepted (it folds,
                  * and counts towards fold_hash) but NOT rotation-causing. Replaying an
                  * old entry must not inflate the epoch: install-once (§13.4a.2) makes
@@ -897,6 +994,7 @@ public class MembershipDag : Object {
                  * and the two clients' fold_hashes would then diverge permanently the
                  * first time anyone relayed the persistent pointer twice. */
                 if (!st.members.contains(retired_hex) && !st.retired.contains(retired_hex)) {
+                    st.unauthorized.add(e.hash_hex());
                     continue;
                 }
 
@@ -911,24 +1009,35 @@ public class MembershipDag : Object {
                      * and treating its relay as an assertion would hand any member the
                      * power to retire any other. */
                     Bytes t_ed, t_ml;
-                    if (!resolver(retired_hex, out t_ed, out t_ml)) continue;
+                    if (!resolver(retired_hex, out t_ed, out t_ml)) {
+                        st.unauthorized.add(e.hash_hex());
+                        continue;
+                    }
 
                     // Step 2 — a malformed blob makes the entry unauthorized.
                     RotationPointer? rp = RotationPointer.unmarshal(retire_evidence);
-                    if (rp == null) continue;
+                    if (rp == null) {
+                        st.unauthorized.add(e.hash_hex());
+                        continue;
+                    }
 
                     /* Step 3 — BOTH signatures over the pointer's signed_part, against
                      * the AIK the ROOM holds for the member being retired (not against a
                      * key the pointer supplies for itself). */
-                    if (!((!) rp).verify_with(t_ed, t_ml)) continue;
+                    if (!((!) rp).verify_with(t_ed, t_ml)) {
+                        st.unauthorized.add(e.hash_hex());
+                        continue;
+                    }
 
                     /* Step 4 — fingerprint(pointer.old_aik) == retired_aik_fp. Without
                      * it a pointer legitimately issued for one identity is replayable to
                      * retire a DIFFERENT one: the signature check above would still pass
                      * whenever the two identities share an AIK resolution path. */
                     uint8[] old_fp = ((!) rp).old_aik_fp_raw();
-                    if (old_fp.length != 20) continue;
-                    if (hex_of(old_fp) != retired_hex) continue;
+                    if (old_fp.length != 20 || hex_of(old_fp) != retired_hex) {
+                        st.unauthorized.add(e.hash_hex());
+                        continue;
+                    }
 
                     /* pointer.new_aik is read but NOT TRUSTED. It is deliberately not
                      * consulted here: it is not added to members, not made an admin, and
@@ -949,7 +1058,10 @@ public class MembershipDag : Object {
                      * deliberately not named: nothing here would bind it, and a
                      * named-but-unverified successor sitting in the journal is exactly
                      * the value that later gets mistaken for authoritative. */
-                    if (retire_evidence.length != 0) continue;
+                    if (retire_evidence.length != 0) {
+                        st.unauthorized.add(e.hash_hex());
+                        continue;
+                    }
                 }
 
                 /* Replay guard, same shape as §13.5b: a repeat naming an ALREADY-retired

@@ -127,6 +127,7 @@ test_sources = [
     'tests/cpace.vala',
     'tests/pairing.vala',
     'tests/conformance.vala',
+    'tests/journal_fold.vala',
 ]
 
 exe_x3dhpq_test = executable(
