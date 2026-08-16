@@ -134,16 +134,23 @@ public enum IssuerAuthStatus {
     UNRESOLVED,
 }
 
-/* D6 (§13.1a.0 step 5) resolver policy, extracted from the app-layer lookups so it can
- * be pinned directly by a test.
+/* D6 (§13.1a.0 step 5) resolver policy, extracted from the app-layer lookups so the
+ * shared conformance corpus can drive it directly.
  *
- * The shared conformance corpus CANNOT pin this: `device_auth` is a harness INPUT
+ * conformance/v2/journal-fold.json cannot reach this: `device_auth` is a harness INPUT
  * there, so a vector states the resolved status and pins only what the fold does GIVEN
  * one. Which status a receiver's own manifest bookkeeping produces is exactly the part
- * left unpinned — and it is where the two reference clients silently diverged (Dino
- * returned REJECTED for `manifest held / device never seen`, PQonversations returned
- * UNRESOLVED), which folds different member sets from identical entries. See
- * tests/issuer_status.vala. */
+ * those vectors leave unpinned — and it is where the two reference clients silently
+ * diverged (Dino returned REJECTED for `manifest held / device never seen`,
+ * PQonversations returned UNRESOLVED), which folds different member sets from identical
+ * entries while all 18 journal-fold vectors stay green.
+ *
+ * conformance/v2/issuer-status.json exists for that gap: sixteen vectors, the complete
+ * truth table over the four booleans below, pinning both the status AND whether it
+ * schedules a manifest fetch. Do not change this function or
+ * issuer_status_wants_manifest_fetch() below without a corpus change — the check ORDER
+ * is part of the contract, not an implementation detail, and the corpus's contradictory
+ * input rows exist specifically to catch a reordering. See tests/issuer_status.vala. */
 public static IssuerAuthStatus classify_issuer(bool owner_known, bool tombstoned,
                                                bool has_manifest_history,
                                                bool ever_authorized) {
