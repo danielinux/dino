@@ -58,6 +58,7 @@ class RotationTransportTest : Gee.TestCase {
         add_test("pointer_with_either_signature_invalid_is_discarded", test_bad_signature);
         add_test("pointer_for_an_unpinned_aik_is_ignored", test_unpinned_aik);
         add_test("redelivered_pointer_is_a_noop", test_redelivery_noop);
+        add_test("redelivered_pointer_still_fans_out_to_rooms", test_redelivery_still_fans_out);
         add_test("absence_of_a_pointer_marks_nothing_retired", test_absence_proves_nothing);
         // T4 — what must not happen
         add_test("accepting_pointer_never_pins_or_admits_successor", test_never_admits_successor);
@@ -419,6 +420,55 @@ class RotationTransportTest : Gee.TestCase {
                 "a devicelist that no longer verifies under a RETIRED pin must not "
                 + "resurrect it as a fresh 'rotated' takeover alarm");
             fail_if_not_eq_int(rotated_events, 0, "and must raise no new event");
+        } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    /* The other half of re-delivery, and the half that must NOT be suppressed.
+     *
+     * A re-delivered pointer suppresses the local retirement write and the user-visible
+     * event — that is the test above — but it MUST STILL reach the §13.5c fan-out. The
+     * tempting optimisation is to return early on "already retired" and skip the whole
+     * call; it is wrong because ROOMS ARE DISCOVERED OVER TIME. Join a room tomorrow that
+     * shares this contact and the fan-out is the only thing that authors the kind-1
+     * RetireMember there; short-circuit it today and that room keeps the dead AIK in its
+     * member set forever, receiving every rotation. That is the "half-applied retirement"
+     * §12.3 names, and the state in which §11.8's recovery claim silently fails to hold.
+     *
+     * The per-room de-duplication that makes this cheap lives in the fan-out itself
+     * (Manager.on_rotation_pointer_accepted skips rooms whose fold already retired the
+     * fingerprint), which is where it can see the rooms — not here, where it cannot. */
+    private void test_redelivery_still_fans_out() {
+        try {
+            Dino.Plugins.X3dhpq.Database db = new Dino.Plugins.X3dhpq.Database(db_path);
+            Account a = account();
+            db.ensure_local_identity(a);
+            var module = new StreamModule(a, db);
+
+            Id peer = make_id();
+            db.pin_peer_aik_first_use(a, PEER, bytes_to_arr(peer.ed_pub), bytes_to_arr(peer.ml_pub));
+
+            int fanouts = 0;
+            int retired_events = 0;
+            module.rotation_pointer_accepted.connect((p) => { fanouts++; });
+            db.peer_identity_retired.connect((acct, jid, fp) => { retired_events++; });
+
+            RotationPointer rp = make_pointer(peer, make_id().aik_marshaled,
+                peer.ed_priv, peer.ml_priv);
+            uint8[] wire = rp.marshal();
+
+            // Reconnect, reconnect, reconnect: the pointer is a persistent PEP item.
+            for (int i = 0; i < 3; i++) {
+                fail_if_not(module.consume_rotation_pointer(new Jid(PEER), wire),
+                    "a re-delivered valid pointer is still ACCEPTED, not rejected");
+            }
+
+            fail_if_not_eq_int(fanouts, 3,
+                "every accepted pointer, re-delivered or not, MUST reach the §13.5c "
+                + "fan-out — a room joined later has no other way to learn the retirement");
+            fail_if_not_eq_int(retired_events, 1,
+                "while the user-visible retirement is still raised exactly once");
+            fail_if_not_eq_str(trust_state(db, a, PEER), "retired",
+                "and the local state is written once and then stable");
         } catch (Error e) { fail_if_reached(e.message); }
     }
 

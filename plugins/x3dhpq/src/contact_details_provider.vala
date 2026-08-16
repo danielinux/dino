@@ -37,10 +37,11 @@ public class ContactDetailsProvider : Plugins.ContactDetailsProvider, Object {
             title = "Identity fingerprint",
             subtitle = fingerprint,
         });
+        bool retired_any = trust_state == "retired" || trust_state == "retired_witnessed";
         var trust_row = new ActionRow() {
             title = "Trust state",
-            subtitle = trust_state == "retired"
-                ? retired_subtitle(conversation, identity)
+            subtitle = retired_any
+                ? retired_subtitle(conversation, identity, trust_state == "retired")
                 : trust_state_subtitle(trust_state),
         };
         /* §13.5c: a retired contact still offers the ORDINARY verify flow — with the full
@@ -48,12 +49,12 @@ public class ContactDetailsProvider : Plugins.ContactDetailsProvider, Object {
          * out-of-band re-verification (§12.2). Retirement itself adopts nothing.
          * Deliberately NOT wired to the DESTRUCTIVE "Accept changed identity" styling of
          * the §12.2 takeover alarm. */
-        if (trust_state == "rotated" || trust_state == "unverified" || trust_state == "retired") {
+        if (trust_state == "rotated" || trust_state == "unverified" || retired_any) {
             var review_button = new Gtk.Button.with_label(trust_state == "rotated" ? "Review" : "Verify") {
                 valign = Gtk.Align.CENTER
             };
             review_button.add_css_class(trust_state == "rotated" ? "warning" : "flat");
-            if (trust_state == "retired") {
+            if (retired_any) {
                 // Neutral affordance: this is an expected event, not an alarm.
                 review_button.add_css_class("flat");
             }
@@ -81,7 +82,6 @@ public class ContactDetailsProvider : Plugins.ContactDetailsProvider, Object {
             case "rotated":    return "The contact's identity key changed and needs review.";
             case "verified":   return "Verified — you accepted this identity.";
             case "unverified": return "Unverified — not yet confirmed out-of-band.";
-            case "retired":    return "Retired — this identity was replaced by an account reset.";
             default:           return trust_state;
         }
     }
@@ -94,7 +94,7 @@ public class ContactDetailsProvider : Plugins.ContactDetailsProvider, Object {
      * a user ends up trusting the wrong successor. Either way the successor fingerprint
      * shown is a value to COMPARE OUT OF BAND, never one to accept from this screen.
      */
-    private string retired_subtitle(Conversation conversation, Row? identity) {
+    private string retired_subtitle(Conversation conversation, Row? identity, bool authoritative) {
         string tail = "";
         if (identity != null) {
             string? fp_display = ((!) identity)[plugin.db.peer_account_identity.aik_fingerprint];
@@ -117,7 +117,16 @@ public class ContactDetailsProvider : Plugins.ContactDetailsProvider, Object {
                 }
             }
         }
-        return "Retired — this identity was replaced by an account reset." + tail;
+        /* §13.5c "two strengths of retirement": the HEADLINE differs, not only the tail.
+         * An authoritative retirement is signed by the retired key itself and this client
+         * has already stopped sending; a witnessed one is one admin's word, we are still
+         * talking to the contact, and saying otherwise would be a lie about our own state. */
+        if (authoritative) {
+            return "Retired — this identity was replaced by an account reset."
+                + " Sending is paused until you verify their new fingerprint out-of-band." + tail;
+        }
+        return "Retired according to a group member — this is a CLAIM, not proof."
+            + " Messages to this contact still go through; verify their identity directly." + tail;
     }
 
     // Impersonation-aware accept flow. A changed AIK is exactly what a malicious

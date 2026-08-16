@@ -195,6 +195,14 @@ namespace Dino.Ui.ConversationDetails {
                 row.trust_badge = _("Retired identity");
                 row.trust_icon = "user-trash-symbolic";
                 break;
+            /* §13.5c "two strengths of retirement": a kind-2 entry is a member's word,
+             * not proof, and the badge must say so. Calling it "Retired identity" would
+             * present an admin's unsigned attestation in the same language as a signature
+             * made by the retired key itself. */
+            case Plugins.MemberTrustState.RETIRED_WITNESSED:
+                row.trust_badge = _("Retired (claimed)");
+                row.trust_icon = "dialog-question-symbolic";
+                break;
             default:
                 row.trust_badge = _("Unverified");
                 row.trust_icon = "dialog-question-symbolic";

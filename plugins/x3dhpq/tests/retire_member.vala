@@ -50,6 +50,7 @@ class RetireMemberTest : Gee.TestCase {
         add_test("kind1_from_non_admin_member_accepted", test_kind1_non_admin_accepted);
         add_test("kind2_from_non_admin_rejected", test_kind2_non_admin_rejected);
         add_test("kind2_with_evidence_rejected", test_kind2_with_evidence_rejected);
+        add_test("kind1_evidence_supersedes_a_recorded_kind2", test_kind1_supersedes_kind2);
         add_test("replayed_retire_accepted_but_does_not_rotate", test_replay_does_not_rotate);
         add_test("add_member_naming_retired_fp_is_noop", test_add_member_retired_noop);
         add_test("retiring_a_non_member_is_unauthorized", test_retire_non_member);
@@ -303,6 +304,75 @@ class RetireMemberTest : Gee.TestCase {
                 "kind 2 must name WHOSE word it is, so the UI can say so");
             fail_if_not_eq_str(((!) ev).successor_fp_hex, "",
                 "a witnessed entry names no successor — nothing would bind one");
+        } catch (Error e) { fail_if_reached(e.message); }
+    }
+
+    /* §13.5c "two strengths of retirement": a kind-1 entry SUPERSEDES an already-recorded
+     * kind-2 for the same identity, even though the kind-1 arrives second and is (by the
+     * replay guard) not rotation-causing.
+     *
+     * The ordering is ordinary, not adversarial: an admin witnesses the reset out of band
+     * and files a kind-2, and some other member later relays the owner's actual
+     * RotationPointer as a kind-1. Both entries fold. But the two carry DIFFERENT
+     * AUTHORITY — kind 2 is an admin's word and settles room membership only, while kind 1
+     * is a signature by the retired key itself and is what licenses discarding that peer's
+     * pairwise assertions and refusing to send to them. A client that keeps the first
+     * evidence unconditionally stays at witnessed strength forever and keeps encrypting to
+     * a key it holds signed evidence is dead, while a client that saw only the kind-1
+     * stops. That is precisely the divergence §13.5c forbids.
+     *
+     * Never the reverse: unsigned word may not demote a signature. Both directions are
+     * asserted, because a naive "last writer wins" passes the first half and fails here.
+     *
+     * retired_evidence is local presentation state — not on the wire, not in fold_hash —
+     * so this cannot fork the fold. */
+    private void test_kind1_supersedes_kind2() {
+        try {
+            Id owner = make_id(); Id victim = make_id(); Id successor = make_id();
+            var g = genesis(owner);
+            var a1 = sign(owner, 1, heads(g.compute_hash()),
+                (uint8) MemberAuditActionV2.ADD_MEMBER, mp(victim.fp), 1001);
+
+            // The admin's word lands first.
+            uint8[] witnessed = JournalEntryV2.build_retire_payload(victim.fp,
+                (uint8) RetireEvidenceKind.WITNESSED, new uint8[0]);
+            var k2 = sign(owner, 2, heads(a1.compute_hash()),
+                (uint8) MemberAuditActionV2.RETIRE_MEMBER, witnessed, 1002);
+
+            var dag = new MembershipDag();
+            foreach (var e in new JournalEntryV2[]{g, a1, k2}) dag.ingest(e.marshal());
+            DagState st1 = dag.recompute(resolver());
+            fail_if_not(st1.retired.contains(victim.fp_hex), "control: the kind-2 retires");
+            fail_if_not_eq_int((int) ((!) st1.retired_evidence.get(victim.fp_hex)).kind, 2,
+                "control: witnessed evidence is what we hold at this point");
+
+            // The owner's own signed statement is relayed into the room afterwards.
+            RotationPointer rp = make_pointer(victim, successor.aik_marshaled,
+                victim.ed_priv, victim.ml_priv);
+            uint8[] k1_payload = JournalEntryV2.build_retire_payload(victim.fp,
+                (uint8) RetireEvidenceKind.ROTATION_POINTER, rp.marshal());
+            var k1 = sign(owner, 3, heads(k2.compute_hash()),
+                (uint8) MemberAuditActionV2.RETIRE_MEMBER, k1_payload, 1003);
+            dag.ingest(k1.marshal());
+
+            DagState st2 = dag.recompute(resolver());
+            RetiredEvidence? ev = st2.retired_evidence.get(victim.fp_hex);
+            fail_if(ev == null, "evidence still recorded");
+            fail_if_not_eq_int((int) ((!) ev).kind, 1,
+                "a kind-1 entry MUST supersede an already-recorded kind-2: the signature is "
+                + "what licenses discarding the peer's assertions and refusing to send");
+            fail_if_not_eq_str(((!) ev).successor_fp_hex, successor.fp_hex,
+                "and the upgraded record carries the successor the pointer names, to DISPLAY");
+            fail_if_not_eq_int((int) st2.epoch, (int) st1.epoch,
+                "the second entry is a replay for fold purposes and must NOT rotate");
+
+            /* The reverse: another witnessed entry after the kind-1 leaves it alone. */
+            var k2_again = sign(owner, 4, heads(k1.compute_hash()),
+                (uint8) MemberAuditActionV2.RETIRE_MEMBER, witnessed, 1004);
+            dag.ingest(k2_again.marshal());
+            DagState st3 = dag.recompute(resolver());
+            fail_if_not_eq_int((int) ((!) st3.retired_evidence.get(victim.fp_hex)).kind, 1,
+                "unsigned word may never demote a signature back to a claim");
         } catch (Error e) { fail_if_reached(e.message); }
     }
 

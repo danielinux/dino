@@ -959,8 +959,26 @@ public class MembershipDag : Object {
                  * permanently unusable for a real chain. */
                 rotation_causing = !st.retired.contains(retired_hex);
                 /* First evidence wins, in canonical order: a later relay of the same
-                 * retirement must not overwrite what the user was shown. */
-                if (!st.retired_evidence.has_key(retired_hex)) {
+                 * retirement must not overwrite what the user was shown — EXCEPT that a
+                 * kind-1 entry supersedes an already-recorded kind-2 for the same
+                 * identity (§13.5c "two strengths of retirement").
+                 *
+                 * The exception is load-bearing, not cosmetic. Kind 2 is an admin's word
+                 * and is authoritative for room membership only; kind 1 is a signature by
+                 * the retired key itself and is what licenses discarding that peer's
+                 * pairwise assertions and refusing to send to it. An admin who witnesses
+                 * first and a member who relays the pointer second is an ordinary
+                 * ordering, and without this a client that saw them in that order would
+                 * keep talking to a key it holds signed evidence is dead — while a client
+                 * that saw only the kind-1 stops. That is exactly the divergence §13.5c
+                 * forbids. Never the reverse: unsigned word cannot demote a signature.
+                 *
+                 * Local presentation state — retired_evidence is NOT part of the wire
+                 * encoding and NOT part of fold_hash, so this cannot fork the fold. */
+                RetiredEvidence? seen = st.retired_evidence.get(retired_hex);
+                if (seen == null
+                        || (ev.kind == (uint8) RetireEvidenceKind.ROTATION_POINTER
+                            && ((!) seen).kind != (uint8) RetireEvidenceKind.ROTATION_POINTER)) {
                     st.retired_evidence.set(retired_hex, ev);
                 }
             }

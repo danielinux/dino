@@ -204,7 +204,19 @@ namespace Dino.Ui.ConversationDetails {
                 bool can_owner_admin = (own_affiliation == Xmpp.Xep.Muc.Affiliation.OWNER) || pq_local_admin;
                 bool can_member_ops = (is_private_room || is_pq_group) ? can_owner_admin : (can_owner_admin || own_affiliation == Xmpp.Xep.Muc.Affiliation.ADMIN);
                 bool can_ban = can_member_ops;
-                bool needs_identity_review = pq != null && pq.peer_aik_needs_review(model.conversation.account, row_view_model.jid);
+                /* §13.5c client requirement: a retirement naming a peer the user had
+                 * verified MUST be surfaced and SHOULD prompt for re-verification — and a
+                 * kind-2 (witnessed) one especially, since it is a member's CLAIM and the
+                 * only way to settle it is for this user to verify the contact directly.
+                 * Both retired states therefore offer the same ordinary review action the
+                 * §12.2 "rotated" state does; the badge is what tells them apart. */
+                var pq_trust = pq != null
+                    ? pq.get_member_trust_state(model.conversation.account, row_view_model.jid)
+                    : Plugins.MemberTrustState.UNKNOWN;
+                bool needs_identity_review = pq != null
+                    && (pq.peer_aik_needs_review(model.conversation.account, row_view_model.jid)
+                        || pq_trust == Plugins.MemberTrustState.RETIRED
+                        || pq_trust == Plugins.MemberTrustState.RETIRED_WITNESSED);
 
                 var dialog = new Adw.AlertDialog(_("Manage member"), row_view_model.jid.to_string());
                 dialog.add_response("cancel", _("Cancel"));

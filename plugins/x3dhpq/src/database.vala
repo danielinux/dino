@@ -4,6 +4,36 @@ using Xmpp;
 
 namespace Dino.Plugins.X3dhpq {
 
+/* §13.5c "Two strengths of retirement" (normative).
+ *
+ * A retirement is NOT one flag. The spec is explicit that collapsing the two kinds into
+ * a single "retired" boolean makes two implementations diverge — one refusing a peer the
+ * other still talks to — so the distinction is carried in the state itself:
+ *
+ *  - AUTHORITATIVE — a kind-1 `RetireMember`, or the §12.3 pairwise pointer path. Backed
+ *    by a signature made BY THE RETIRED KEY ITSELF, which is sound in the negative
+ *    direction (an attacker can only ever retire a key they already control). §12.3
+ *    step 3 applies in full: assertions under that AIK are discarded, and SENDING stops
+ *    until a successor is verified out of band — after a compromise-driven reset the old
+ *    key is precisely what the attacker holds.
+ *
+ *  - WITNESSED — a kind-2 `RetireMember`. The authoring admin's out-of-band attestation.
+ *    Authoritative for ROOM MEMBERSHIP, because that is what an admin has standing to
+ *    decide, and for nothing else: no signature binds it, and a mistaken or malicious
+ *    admin would otherwise render a peer permanently unreachable to everyone in the room.
+ *    It is surfaced and prompts for re-verification; it MUST NOT by itself discard the
+ *    peer's pairwise assertions or block sending.
+ *
+ * The strength is MONOTONE: witnessed may be upgraded to authoritative when a signature
+ * later turns up, never the reverse, and there is no un-retire (§12.3 step 3, §13.5c). */
+public enum RetirementStrength {
+    NONE,
+    WITNESSED,
+    AUTHORITATIVE;
+
+    public bool at_least(RetirementStrength other) { return this >= other; }
+}
+
 public class Database : Qlite.Database {
     // v22: D1 changed the pre-key signing input (domain-separated, id-bound), so
     // every stored SPK/KEM signature is stale and must be re-made; and D6 adds the
@@ -1072,14 +1102,25 @@ public class Database : Qlite.Database {
 
     /* §13.5c: record that a room's journal retired an identity.
      *
-     * Idempotent and FIRST-WRITER-WINS on the evidence, matching the fold: a later
-     * relay of the same retirement must not rewrite what the user was already shown —
-     * in particular a kind-2 "a member says so" must not be able to overwrite the
-     * kind-1 cryptographic record, nor the reverse without the user noticing. */
+     * Idempotent and first-writer-wins on the evidence, matching the fold — with ONE
+     * exception, which is the whole of "two strengths of retirement": a kind-1 entry
+     * SUPERSEDES an already-recorded kind-2 for the same identity. A witnessed entry is
+     * an admin's word and a kind-1 is a signature by the retired key itself, so learning
+     * the signature strictly strengthens what we know and the user must be shown the
+     * stronger evidence. The reverse is refused: a member's unsigned word may never
+     * overwrite a cryptographic record. */
     public void record_retired_identity(Account account, string room_jid, string retired_fp_hex,
                                         uint8 evidence_kind, string author_fp_hex,
                                         string successor_fp_hex) {
-        if (is_retired_identity(account, room_jid, retired_fp_hex)) return;
+        Row? cur = retired_identity.select()
+            .with(retired_identity.account_id, "=", account.id)
+            .with(retired_identity.room_jid, "=", room_jid)
+            .with(retired_identity.retired_fp_hex, "=", retired_fp_hex.down())
+            .single().row().inner;
+        if (cur != null) {
+            bool strengthens = evidence_kind == 1 && ((!) cur)[retired_identity.evidence_kind] != 1;
+            if (!strengthens) return;
+        }
         retired_identity.upsert()
             .value(retired_identity.account_id, account.id, true)
             .value(retired_identity.room_jid, room_jid, true)
@@ -1099,14 +1140,37 @@ public class Database : Qlite.Database {
             .count() > 0;
     }
 
-    // Any room in which this identity has been retired. Lets the contact UI answer
-    // "is this contact's key retired?" without a room in hand.
+    /* Any room in which this identity has been retired. Lets the contact UI answer
+     * "is this contact's key retired?" without a room in hand.
+     *
+     * §13.5c: the STRONGEST evidence wins the lookup, not the earliest. A kind-1 record
+     * in any room means we hold a signature by the retired key itself, and reporting a
+     * kind-2 "a member says so" from some other room while that signature sits in the
+     * table would understate what we know and put the two clients on different copy. */
     public Row? get_retired_identity_any_room(Account account, string retired_fp_hex) {
+        Row? kind1 = retired_identity.select()
+            .with(retired_identity.account_id, "=", account.id)
+            .with(retired_identity.retired_fp_hex, "=", retired_fp_hex.down())
+            .with(retired_identity.evidence_kind, "=", 1)
+            .order_by(retired_identity.created_at, "ASC")
+            .single().row().inner;
+        if (kind1 != null) return kind1;
         return retired_identity.select()
             .with(retired_identity.account_id, "=", account.id)
             .with(retired_identity.retired_fp_hex, "=", retired_fp_hex.down())
             .order_by(retired_identity.created_at, "ASC")
             .single().row().inner;
+    }
+
+    /* §13.5c: is there a kind-1 (signature-backed) retirement record for this AIK in ANY
+     * room? The cross-room source of truth behind an AUTHORITATIVE pairwise retirement
+     * learned through a journal rather than through the §12.3 pointer node. */
+    public bool has_authoritative_retirement(Account account, string retired_fp_hex) {
+        return retired_identity.select()
+            .with(retired_identity.account_id, "=", account.id)
+            .with(retired_identity.retired_fp_hex, "=", retired_fp_hex.down())
+            .with(retired_identity.evidence_kind, "=", 1)
+            .count() > 0;
     }
 
     /* §13.5c client requirement: a retirement naming a peer the user had previously
@@ -1119,34 +1183,85 @@ public class Database : Qlite.Database {
      * still goes through the ordinary verify flow — this flag never adopts anything. */
     public signal void peer_identity_retired(Account account, string bare_jid, string? fingerprint);
 
-    /* §12.3 step 3 / §13.5c: is this owner's PINNED identity retired?
-     *
-     * A retired pin has stopped being live, so every later assertion made UNDER IT — a
-     * trust manifest, a signed devicelist — is discarded rather than applied, and
-     * discarded QUIETLY: raising the §12.2 changed-identity alarm again for a key we
-     * have already established is dead is the re-prompt storm §12.3 exists to end. It
-     * says nothing about assertions under a DIFFERENT AIK: a genuine successor is still
-     * an ordinary "same JID, different AIK" event needing out-of-band re-verification. */
-    public bool is_peer_identity_retired(Account account, string bare_jid) {
+    /* §13.5c: the two trust_state values a retirement can take. They are DELIBERATELY
+     * two distinct persisted strings and not one string plus a side flag, because every
+     * read of trust_state in this client is a security decision and a reader that has
+     * never heard of witnessed retirement must not silently treat one as authoritative. */
+    public const string TRUST_RETIRED = "retired";                        // AUTHORITATIVE
+    public const string TRUST_RETIRED_WITNESSED = "retired_witnessed";    // WITNESSED
+
+    // The persisted trust_state for this owner's pinned identity, or "unknown" when we
+    // hold no identity for them at all.
+    public string get_peer_trust_state(Account account, string bare_jid) {
         Row? r = get_peer_account_identity_row(account, bare_jid);
-        return r != null && ((!) r)[peer_account_identity.trust_state] == "retired";
+        return r == null ? "unknown" : ((!) r)[peer_account_identity.trust_state];
     }
 
-    public void flag_peer_identity_retired(Account account, string display_fp) {
+    /* §13.5c: how strongly is this owner's PINNED identity retired? */
+    public RetirementStrength get_peer_retirement_strength(Account account, string bare_jid) {
+        Row? r = get_peer_account_identity_row(account, bare_jid);
+        if (r == null) return RetirementStrength.NONE;
+        switch (((!) r)[peer_account_identity.trust_state]) {
+            case TRUST_RETIRED:           return RetirementStrength.AUTHORITATIVE;
+            case TRUST_RETIRED_WITNESSED: return RetirementStrength.WITNESSED;
+            default:                      return RetirementStrength.NONE;
+        }
+    }
+
+    /* §12.3 step 3 / §13.5c: is this owner's PINNED identity AUTHORITATIVELY retired?
+     *
+     * THE gate. An authoritatively retired pin has stopped being live, so every later
+     * assertion made UNDER IT — a trust manifest, a signed devicelist — is discarded
+     * rather than applied, and discarded QUIETLY: raising the §12.2 changed-identity
+     * alarm again for a key we have already established is dead is the re-prompt storm
+     * §12.3 exists to end. Sending stops too (see the composer gate). It says nothing
+     * about assertions under a DIFFERENT AIK: a genuine successor is still an ordinary
+     * "same JID, different AIK" event needing out-of-band re-verification.
+     *
+     * A WITNESSED retirement deliberately does NOT satisfy this predicate: nothing signs
+     * it, so it may not kill the pairwise relationship. Callers that gate discarding or
+     * sending MUST use this and never is_peer_identity_retired below. */
+    public bool is_peer_identity_retired_authoritative(Account account, string bare_jid) {
+        return get_peer_retirement_strength(account, bare_jid) == RetirementStrength.AUTHORITATIVE;
+    }
+
+    /* Retired at ANY strength — a PRESENTATION predicate only ("show the retired row").
+     * Never a gate: a kind-2 retirement must not discard assertions or block sending. */
+    public bool is_peer_identity_retired(Account account, string bare_jid) {
+        return get_peer_retirement_strength(account, bare_jid) != RetirementStrength.NONE;
+    }
+
+    /* Record a retirement of this owner's pinned identity at the given STRENGTH.
+     *
+     * Monotone by construction: a witnessed retirement is upgraded to authoritative when
+     * a signature later turns up (a kind-1 relay of a pointer we never fetched ourselves),
+     * and an authoritative one is NEVER downgraded — otherwise an admin's unsigned word
+     * could cancel the owner's own signed statement. Returns true only when the state
+     * actually strengthened, which is also the only time the user-visible event fires: the
+     * pointer is a persistent PEP item re-observed on every reconnect, and re-prompting on
+     * each observation trains the user to click through the one alarm that matters. */
+    public bool flag_peer_identity_retired(Account account, string display_fp,
+                                           RetirementStrength strength) {
+        if (strength == RetirementStrength.NONE) return false;
         Row? r = peer_account_identity.select()
             .with(peer_account_identity.account_id, "=", account.id)
             .with(peer_account_identity.aik_fingerprint, "=", display_fp)
             .single().row().inner;
-        if (r == null) return;
-        if (((!) r)[peer_account_identity.trust_state] == "retired") return;   // already surfaced
+        if (r == null) return false;
+        string cur = ((!) r)[peer_account_identity.trust_state];
+        RetirementStrength held = cur == TRUST_RETIRED ? RetirementStrength.AUTHORITATIVE
+            : (cur == TRUST_RETIRED_WITNESSED ? RetirementStrength.WITNESSED : RetirementStrength.NONE);
+        if (held.at_least(strength)) return false;   // already surfaced at this strength or stronger
         string bare_jid = ((!) r)[peer_account_identity.bare_jid];
         peer_account_identity.update()
             .with(peer_account_identity.account_id, "=", account.id)
             .with(peer_account_identity.bare_jid, "=", bare_jid)
-            .set(peer_account_identity.trust_state, "retired")
+            .set(peer_account_identity.trust_state,
+                strength == RetirementStrength.AUTHORITATIVE ? TRUST_RETIRED : TRUST_RETIRED_WITNESSED)
             .set(peer_account_identity.updated_at, (long) new DateTime.now_utc().to_unix())
             .perform();
         peer_identity_retired(account, bare_jid, display_fp);
+        return true;
     }
 
     // §13.1a genesis quarantine: the fingerprint this room's genesis owner was quarantined
@@ -3159,6 +3274,28 @@ public class Database : Qlite.Database {
         bool rotation_detected = false;
         long created_at = (long) new DateTime.now_utc().to_unix();
         if (existing != null) {
+            /* §12.3 step 3, normative: a receiver MUST NOT "un-retire" an identity
+             * because fresh material appears. The pointer is signed by the retired key
+             * itself, so material signed by that same key is not evidence against it —
+             * and treating it as such lets whoever holds the stolen key cancel the
+             * owner's recovery simply by continuing to publish.
+             *
+             * This returns for BOTH shapes of "fresh material", and both matter:
+             *   - the SAME AIK republishing (the never-re-paired device §12.3 exists to
+             *     silence) — the pin must stay retired and stay quiet;
+             *   - a DIFFERENT AIK appearing in a bundle — which must not silently re-pin
+             *     over the retired identity either. §12.3 step 4 says the successor is
+             *     adopted only by explicit out-of-band re-verification, and the bundle
+             *     node is exactly what a hostile relay controls. The user-driven route is
+             *     unaffected: accept_peer_aik calls forget_peer first, which drops this
+             *     row entirely, so re-learning after a real verification still works.
+             *
+             * WITNESSED retirement is deliberately excluded: nothing signs it, so it may
+             * not freeze the pairwise relationship. A changed AIK under a witnessed
+             * retirement is an ordinary §12.2 event and falls through to "rotated". */
+            if (((!) existing)[peer_account_identity.trust_state] == TRUST_RETIRED) {
+                return;
+            }
             created_at = ((!) existing)[peer_account_identity.created_at];
             string? old_ed = ((!) existing)[peer_account_identity.aik_pub_ed25519_base64];
             string? old_m = ((!) existing)[peer_account_identity.aik_pub_mldsa_base64];
@@ -3224,12 +3361,17 @@ public class Database : Qlite.Database {
         if (trust_state == "rotated") {
             return; // already flagged; avoid re-notifying on every rejected republish
         }
-        if (trust_state == "retired") {
+        if (trust_state == TRUST_RETIRED) {
             /* §12.3 step 3: the pin is already known dead by a verified retirement
              * pointer. A devicelist that no longer verifies under it is exactly what a
              * retired identity looks like, and re-flagging it "rotated" would both undo
              * the retirement in the UI and re-raise the takeover alarm §12.3 exists to
-             * silence. Discard quietly. */
+             * silence. Discard quietly.
+             *
+             * NOT extended to TRUST_RETIRED_WITNESSED: that is an admin's unsigned word,
+             * and it must not suppress a genuine §12.2 changed-identity alarm the
+             * receiver detected for itself. A fork there falls through and flags
+             * "rotated", which is the prompt-for-re-verification §13.5c asks for. */
             return;
         }
         string? fingerprint = ((!) existing)[peer_account_identity.aik_fingerprint];

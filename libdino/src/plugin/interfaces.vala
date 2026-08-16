@@ -132,8 +132,23 @@ public enum MemberTrustState {
      * ROTATED is the §12.2 changed-identity alarm — a possible server-side takeover —
      * while a retirement is an expected, evidenced event. Reusing the alarm styling here
      * would train the user to click through it, which is itself a security cost. The
-     * successor is NOT adopted by this state; it is verified through the normal flow. */
-    RETIRED
+     * successor is NOT adopted by this state; it is verified through the normal flow.
+     *
+     * AUTHORITATIVE: backed by a signature made by the retired key itself (a kind-1
+     * RetireMember, or the §12.3 pairwise pointer). §12.3 step 3 applies in full — the
+     * peer's later assertions are discarded and sending to them is frozen. */
+    RETIRED,
+    /* §13.5c "two strengths of retirement": a kind-2 (WITNESSED) retirement — the
+     * authoring admin's out-of-band attestation, with no signature binding it.
+     *
+     * A SEPARATE state from RETIRED, and that separation is normative. It is
+     * authoritative for ROOM MEMBERSHIP, because that is what the admin has standing to
+     * decide, and for nothing else: it MUST NOT by itself discard the peer's pairwise
+     * assertions or block sending to them, because a mistaken or malicious admin would
+     * otherwise render that peer permanently unreachable to everyone in the room. The
+     * client surfaces it as a member's CLAIM and prompts for re-verification.
+     * Implementations that collapse the two kinds into one flag diverge here. */
+    RETIRED_WITNESSED
 }
 
 public interface X3dhpqGroupManager : Object {

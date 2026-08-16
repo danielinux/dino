@@ -1477,16 +1477,26 @@ public class StreamModule : XmppStreamModule {
             }
         }
 
-        /* Step 3 — mark the pinned AIK RETIRED. From here it stops being live:
-         * db.is_peer_identity_retired gates the manifest and devicelist paths, so later
-         * assertions under it are discarded WITHOUT raising a fresh identity-change
-         * event. flag_peer_identity_retired only notifies on the transition, so a
-         * republished or re-notified pointer for the same old_aik is a no-op rather than
-         * a fresh prompt — which matters because the pointer is a persistent item and
-         * will be re-observed on every single reconnect. */
+        /* Step 3 — mark the pinned AIK RETIRED, at AUTHORITATIVE strength (§13.5c "two
+         * strengths of retirement"): this is the pairwise pointer path, backed by a
+         * signature from the retired key itself, so §12.3 step 3 applies in full. From
+         * here the pin stops being live — is_peer_identity_retired_authoritative gates
+         * the manifest and devicelist paths, so later assertions under it are discarded
+         * WITHOUT raising a fresh identity-change event, and it freezes SENDING at the
+         * composer until a successor is verified out of band.
+         *
+         * flag_peer_identity_retired only notifies on a STRENGTHENING transition, so a
+         * republished or re-notified pointer for the same old_aik writes nothing and
+         * prompts nothing — which matters because the pointer is a persistent item and
+         * will be re-observed on every single reconnect. Note what is NOT conditional on
+         * that: the §13.5c fan-out below still runs on a re-delivered pointer. Rooms are
+         * discovered over time, so short-circuiting the whole call on "already retired"
+         * would leave a room joined LATER with the dead AIK sitting in its member set —
+         * the half-applied retirement §12.3 names, and the state in which §11.8's
+         * recovery claim silently fails to hold. */
         string? display_fp = db.get_peer_aik_fingerprint(account, bare);
         if (display_fp == null) return false;
-        db.flag_peer_identity_retired(account, display_fp);
+        db.flag_peer_identity_retired(account, display_fp, RetirementStrength.AUTHORITATIVE);
 
         /* Step 4 — the successor is NOT adopted. Nothing above or below writes
          * p.new_aik to the pin, to the trust tables, or to any room: §12.2 is unchanged
@@ -1579,7 +1589,11 @@ public class StreamModule : XmppStreamModule {
         }
     }
 
-    private bool verify_and_apply_manifest(Jid jid, uint8[] bytes) {
+    // Public so the §12.3 / §13.5c retirement gate at the head of this method is
+    // directly assertable: whether a peer's assertions are DISCARDED is a security
+    // decision, and it is the one place the two strengths of retirement differ most
+    // visibly. Every caller is still inside this module.
+    public bool verify_and_apply_manifest(Jid jid, uint8[] bytes) {
         string bare = jid.bare_jid.to_string();
         bool is_self = jid.bare_jid.equals(account.bare_jid);
 
@@ -1621,8 +1635,13 @@ public class StreamModule : XmppStreamModule {
              * signed under it, stops being live. Every later assertion made under that
              * identity is discarded — quietly, raising no fresh identity-change event —
              * because the whole problem §12.3 solves is a never-re-paired device
-             * republishing under the dead AIK forever. */
-            if (db.is_peer_identity_retired(account, bare)) {
+             * republishing under the dead AIK forever.
+             *
+             * AUTHORITATIVE only (§13.5c). A kind-2 witnessed retirement is one admin's
+             * unsigned word; discarding this peer's manifests on the strength of it would
+             * let a mistaken or malicious admin cut the peer off from everyone in the
+             * room, which is the failure mode the two-strengths rule exists to prevent. */
+            if (db.is_peer_identity_retired_authoritative(account, bare)) {
                 return false;
             }
             Bytes pin_ed, pin_ml;
@@ -2766,12 +2785,18 @@ public class StreamModule : XmppStreamModule {
         out_version = version;
         out_signed = false;
 
-        /* §12.3 step 3: the pin for this owner is RETIRED — a pointer signed under it
-         * said so, and we verified it. It is no longer live, so a devicelist asserted
-         * under it is discarded here, before any of the gates below can turn it into a
-         * fresh identity-change event. This is the "offline device republishing under
-         * the dead AIK on every connect, forever" case §12.3 exists to end. */
-        if (!jid.bare_jid.equals(account.bare_jid) && db.is_peer_identity_retired(account, bare)) {
+        /* §12.3 step 3: the pin for this owner is AUTHORITATIVELY RETIRED — a pointer
+         * signed under it said so (or a kind-1 entry relayed the same signature), and we
+         * verified it. It is no longer live, so a devicelist asserted under it is
+         * discarded here, before any of the gates below can turn it into a fresh
+         * identity-change event. This is the "offline device republishing under the dead
+         * AIK on every connect, forever" case §12.3 exists to end.
+         *
+         * §13.5c: a kind-2 witnessed retirement must NOT reach this gate. It carries no
+         * signature, and silently dropping a peer's devicelist on an admin's word is
+         * precisely how one mistaken admin makes that peer unreachable to the whole room. */
+        if (!jid.bare_jid.equals(account.bare_jid)
+                && db.is_peer_identity_retired_authoritative(account, bare)) {
             return false;
         }
 

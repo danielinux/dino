@@ -356,15 +356,35 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                 if (first_time) {
                     // §13.5c: the identity is dead everywhere, not only here.
                     drop_retired_chains_everywhere(account, display_fp);
-                    Protocol.RetiredEvidence? ev = st.retired_evidence.get(fp_hex);
-                    db.record_retired_identity(account, room_jid_str, fp_hex,
-                        ev != null ? ((!) ev).kind : (uint8) 0,
-                        ev != null ? ((!) ev).author_fp_hex : "",
-                        ev != null ? ((!) ev).successor_fp_hex : "");
-                    /* Surfaced, never silently applied: the contact's identity row moves
-                     * to RETIRED and the successor still needs fresh verification. */
-                    db.flag_peer_identity_retired(account, display_fp);
                 }
+                /* The DB record and the pairwise strength are written on EVERY fold, not
+                 * only the first: the group-session `retired` flag is a room-local
+                 * membership fact and says nothing about how the retirement was
+                 * EVIDENCED. A room that first folded a kind-2 and later folds a kind-1
+                 * relay of the pointer must be able to upgrade the pairwise state from
+                 * witnessed to authoritative, and gating that on first_time would pin it
+                 * to whichever kind happened to arrive first. Both calls below are
+                 * monotone and idempotent, so the repeat costs a lookup and nothing else. */
+                Protocol.RetiredEvidence? ev = st.retired_evidence.get(fp_hex);
+                uint8 kind = ev != null ? ((!) ev).kind : (uint8) 0;
+                db.record_retired_identity(account, room_jid_str, fp_hex, kind,
+                    ev != null ? ((!) ev).author_fp_hex : "",
+                    ev != null ? ((!) ev).successor_fp_hex : "");
+                /* §13.5c "two strengths of retirement". Surfaced, never silently applied:
+                 * the contact's identity row moves to a retired state and the successor
+                 * still needs fresh verification.
+                 *
+                 * KIND 1 is AUTHORITATIVE — a signature by the retired key itself — so
+                 * §12.3 step 3 applies in full pairwise. KIND 2 is the authoring admin's
+                 * word: it removes the identity from THIS ROOM (the fold above already
+                 * did that, and it is what the admin has standing to decide) but it must
+                 * NOT by itself discard the peer's pairwise assertions or block sending
+                 * to them, or one mistaken admin makes a peer unreachable to everyone in
+                 * the room. It is recorded at WITNESSED strength, which surfaces and
+                 * prompts for re-verification without gating anything. */
+                db.flag_peer_identity_retired(account, display_fp,
+                    kind == (uint8) Protocol.RetireEvidenceKind.ROTATION_POINTER
+                        ? RetirementStrength.AUTHORITATIVE : RetirementStrength.WITNESSED);
             } catch (GLib.Error e) {
                 warning("rebuild dag: retired fingerprint failed in %s: %s", room_jid_str, e.message);
             }
@@ -3176,6 +3196,11 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
              * nothing, and "this identity is dead, verify the successor before trusting
              * it" is precisely what they need to act on. */
             case "retired": return global::Dino.Plugins.MemberTrustState.RETIRED;
+            /* §13.5c: kind-2 is a member's ATTESTATION and gets its own state, not
+             * RETIRED. Presenting an admin's unsigned word in the same words as a
+             * signature by the retired key is how a user ends up believing a peer is
+             * dead on nothing but someone's say-so. */
+            case "retired_witnessed": return global::Dino.Plugins.MemberTrustState.RETIRED_WITNESSED;
             default: return global::Dino.Plugins.MemberTrustState.UNVERIFIED;
         }
     }

@@ -13,6 +13,37 @@ public class EncryptionListEntry : Plugins.EncryptionListEntry, Object {
 
     public string name { get { return "x3dhpq"; } }
 
+    /* The composer's 1:1 identity gate, as a PURE function of the peer's persisted
+     * trust_state. Returns null when sending may proceed, or the message to show
+     * alongside NO_SEND.
+     *
+     * Split out from the async callback so the decision itself is assertable without a
+     * live Application: it is a security decision — whether this client encrypts to a
+     * key — and "which trust states stop a send" is exactly what §13.5c says the two
+     * clients must not disagree on.
+     *
+     *  "rotated"          §12.2: the AIK changed and nobody has reviewed it. We suspect.
+     *  "retired"          §12.3 step 3: AUTHORITATIVE retirement — the owner's own signed
+     *                     statement that the key is dead. Stronger evidence than the
+     *                     above, and the case that matters most: after a compromise-driven
+     *                     reset the old key is precisely what the ATTACKER holds, so
+     *                     continuing to encrypt to it delivers plaintext to them.
+     *  "retired_witnessed" §13.5c: a kind-2 WITNESSED retirement. Deliberately NOT a block.
+     *                     No signature binds it; it is one admin's word, authoritative for
+     *                     room membership and nothing else. Blocking here would let a
+     *                     mistaken or malicious admin render a peer permanently
+     *                     unreachable to everyone in the room. It is surfaced in contact
+     *                     details and prompts for re-verification instead. */
+    public static string? pairwise_send_block_reason(string trust_state) {
+        if (trust_state == "rotated") {
+            return "This contact's identity key changed and hasn't been reviewed. Open Contact details → x3dhpq → Review identity before sending.";
+        }
+        if (trust_state == Database.TRUST_RETIRED) {
+            return "This contact's identity was retired by an account reset signed with their old key. Sending is paused until you verify their new fingerprint out-of-band (Contact details → x3dhpq → Verify).";
+        }
+        return null;
+    }
+
     public Object? get_encryption_icon(Entities.Conversation conversation, ContentItem content_item) {
         return null;
     }
@@ -78,8 +109,15 @@ public class EncryptionListEntry : Plugins.EncryptionListEntry, Object {
             // RotationTrustStrict). Without this, 1:1 chat would silently encrypt
             // to an unverified new identity while groups correctly reject it, so
             // authenticity would not actually be guaranteed for direct chats.
-            if (plugin.manager.peer_aik_needs_review(conversation.account, conversation.counterpart)) {
-                input_status_callback(new Plugins.InputFieldStatus("This contact's identity key changed and hasn't been reviewed. Open Contact details → x3dhpq → Review identity before sending.", Plugins.InputFieldStatus.MessageType.ERROR, Plugins.InputFieldStatus.InputState.NO_SEND));
+            /* §12.2 "rotated" AND §12.3 step 3 "retired", through one classifier: both
+             * are "we hold no identity we are willing to encrypt to". The retirement arm
+             * is not covered by the rotated one — a retirement never passes through
+             * "rotated" — and it is the arm that matters most, because after a
+             * compromise-driven reset the retired key is exactly what the attacker holds. */
+            string? block_reason = pairwise_send_block_reason(
+                plugin.db.get_peer_trust_state(conversation.account, conversation.counterpart.bare_jid.to_string()));
+            if (block_reason != null) {
+                input_status_callback(new Plugins.InputFieldStatus((!) block_reason, Plugins.InputFieldStatus.MessageType.ERROR, Plugins.InputFieldStatus.InputState.NO_SEND));
                 return;
             }
             if (!(yield plugin.manager.ensure_get_keys_for_jid(conversation.account, conversation.counterpart.bare_jid))) {

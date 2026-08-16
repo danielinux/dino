@@ -10,6 +10,7 @@ int main(string[] args) {
     TestSuite.get_root().add_suite(new MembershipDagPersistenceTest().get_suite());
     TestSuite.get_root().add_suite(new RetireMemberTest().get_suite());
     TestSuite.get_root().add_suite(new RotationTransportTest().get_suite());
+    TestSuite.get_root().add_suite(new RetirementStrengthTest().get_suite());
     TestSuite.get_root().add_suite(new DeferralQueueTest().get_suite());
     TestSuite.get_root().add_suite(new DeviceDagTest().get_suite());
     TestSuite.get_root().add_suite(new TrustManifestTest().get_suite());
