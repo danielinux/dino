@@ -79,6 +79,15 @@ class ConformanceTest : Gee.TestCase {
             }
         }
 
+        /* The `defaults` block is normative: it is what makes "this field is absent"
+         * mean the same thing in both implementations. An absent field is invisible at
+         * run time — no vector can catch a harness that guessed the wrong fallback —
+         * so the block is compared directly against the fallbacks this file passes.
+         * Both a corpus default this harness does not implement and a fallback the
+         * corpus no longer declares are failures. */
+        Jv? defaults = ((!) root).member("defaults");
+        add_test("group_accept_defaults_match_harness", () => { check_defaults(defaults); });
+
         Jv? vectors = ((!) root).member("vectors");
         if (vectors == null || ((!) vectors).kind != Jv.Kind.ARRAY) {
             add_test("group_accept_CORPUS_HAS_NO_VECTORS", () => {
@@ -136,6 +145,78 @@ class ConformanceTest : Gee.TestCase {
         return null;
     }
 
+    /* Every fallback this harness passes for an optional corpus field, keyed exactly as
+     * the corpus `defaults` block keys it. Kept as rendered JSON so a default of any
+     * shape — boolean, empty array — compares the same way. */
+    private static Gee.HashMap<string, string> harness_defaults() {
+        var d = new Gee.HashMap<string, string>();
+        d["receiver.sender_manifest_known"]   = "true";
+        d["receiver.sender_owner_known"]      = "true";
+        d["recv_chains[].has_sig_pub"]        = "true";
+        d["recv_chains[].skipped_indices"]    = "[]";
+        d["expect.assert_state_unchanged"]    = "false";
+        return d;
+    }
+
+    private static void check_defaults(Jv? defaults) {
+        if (defaults == null || ((!) defaults).kind != Jv.Kind.OBJECT) {
+            fail_if_reached("the corpus carries no `defaults` object; absent-field behaviour "
+                + "would then be agreed only by coincidence (§19.2.0)");
+            return;
+        }
+        var expected = harness_defaults();
+        var problems = new Gee.ArrayList<string>();
+
+        foreach (var e in ((!) defaults).obj.entries) {
+            if (e.key == "note") continue;
+            if (!expected.has_key(e.key)) {
+                problems.add(@"the corpus declares a default for `$(e.key)` that this harness "
+                    + "does not implement — every vector omitting that field is running untested");
+                continue;
+            }
+            string got = render(e.value);
+            if (got != expected[e.key]) {
+                problems.add(@"default for `$(e.key)`: corpus says $got, harness falls back to $(expected[e.key])");
+            }
+        }
+        foreach (string k in expected.keys) {
+            if (!((!) defaults).obj.has_key(k)) {
+                problems.add(@"this harness falls back on `$k`, which the corpus no longer declares a default for");
+            }
+        }
+
+        if (problems.size > 0) {
+            var sb = new StringBuilder();
+            sb.append("the corpus `defaults` block and this harness disagree:");
+            foreach (string p in problems) {
+                sb.append("\n  - ");
+                sb.append(p);
+            }
+            fail_if_reached(sb.str);
+        }
+    }
+
+    // Just enough JSON rendering to compare a declared default with a harness fallback.
+    private static string render(Jv v) {
+        switch (v.kind) {
+            case Jv.Kind.BOOL:   return v.flag ? "true" : "false";
+            case Jv.Kind.STRING: return "\"" + v.str + "\"";
+            case Jv.Kind.NUL:    return "null";
+            case Jv.Kind.NUMBER: return "%g".printf(v.num);
+            case Jv.Kind.ARRAY:
+                var sb = new StringBuilder("[");
+                bool first = true;
+                foreach (Jv e in v.arr) {
+                    if (!first) sb.append(",");
+                    sb.append(render(e));
+                    first = false;
+                }
+                sb.append("]");
+                return sb.str;
+            default: return "{...}";
+        }
+    }
+
     // Vectors name constants; the constants map holds the values.
     private string konst(string name) {
         return constants.has_key(name) ? constants[name] : name;
@@ -190,6 +271,82 @@ class ConformanceTest : Gee.TestCase {
         }
     }
 
+    /* Build the recv chain that the message's §13.5a 4-tuple SELECTS, by driving a real
+     * chain forward from the sender's index 0 using production code only.
+     *
+     * `next_index` on its own is reached with pure ratchet steps. Every index the vector
+     * lists in `skipped_indices` is banked exactly the way the receive path banks one:
+     * derive_message_key_at() across the gap, then commit(). The cached entry therefore
+     * holds the GENUINE message key for that index — the same bytes the sender's own
+     * chain produces there.
+     *
+     * Fabricating the cache with arbitrary bytes would be worse than useless. The vector
+     * that reads a cached key back would then pass for an implementation that ignored
+     * the cache entirely and re-derived from the chain key, which is precisely the bug it
+     * exists to catch. Same principle as walking the real chain for next_index/chain_index.
+     */
+    private static SenderChain build_selected_recv_chain(
+            uint32 epoch, uint8[] chain_key_at_zero, uint64 epoch_id,
+            uint32 next_index, Gee.ArrayList<uint32> skipped,
+            Gee.ArrayList<string> problems) throws GLib.Error {
+        SenderChain? sc = SenderChain.restore(epoch, chain_key_at_zero, 0, epoch_id);
+        if (sc == null) throw new IOError.FAILED("could not build a recv chain for the vector");
+
+        var ordered = new Gee.ArrayList<uint32>();
+        foreach (uint32 s in skipped) {
+            if (!ordered.contains(s)) ordered.add(s);
+        }
+        ordered.sort((a, b) => (a < b) ? -1 : ((a > b) ? 1 : 0));
+
+        /* A cached index has to sit at least two below next_index. Banking index i means
+         * some LATER message was the one actually delivered, and serving index i+1 is
+         * what lands next_index at i+2. So a chain standing at R can only hold cached
+         * indices up to R-2; anything higher describes a state the ratchet cannot reach,
+         * and quietly building something else would pin the wrong thing. */
+        foreach (uint32 s in ordered) {
+            if ((uint64) s + 2 > (uint64) next_index) {
+                problems.add(@"vector caches skipped index $s on a chain whose next_index is "
+                    + @"$next_index; the ratchet cannot reach that state (banking index i "
+                    + "leaves next_index at i+2 at the earliest)");
+                return (!) sc;
+            }
+        }
+
+        uint32 pos = 0;
+        uint32 discard;
+        int i = 0;
+        while (i < ordered.size) {
+            // Consecutive cached indices are banked by one call, as one gap.
+            uint32 run_start = ordered[i];
+            uint32 run_end = run_start;
+            while (i + 1 < ordered.size && ordered[i + 1] == run_end + 1) {
+                i++;
+                run_end = ordered[i];
+            }
+            i++;
+            while (pos < run_start) {
+                ((!) sc).step(out discard);
+                pos++;
+            }
+            PendingMessageKey? pending = ((!) sc).derive_message_key_at(run_end + 1);
+            if (pending == null) {
+                throw new IOError.FAILED("could not bank the vector's skipped keys");
+            }
+            ((!) pending).commit();
+            pos = run_end + 2;
+        }
+        while (pos < next_index) {
+            ((!) sc).step(out discard);
+            pos++;
+        }
+
+        if (((!) sc).next_index != next_index) {
+            problems.add(@"harness bug: built a recv chain standing at index "
+                + @"$(((!) sc).next_index), vector says $next_index");
+        }
+        return (!) sc;
+    }
+
     private void evaluate(string id, Jv vector, Gee.ArrayList<string> problems) throws GLib.Error {
         Jv receiver_spec = vector.req("receiver");
         Jv message_spec = vector.req("message");
@@ -198,7 +355,8 @@ class ConformanceTest : Gee.TestCase {
         // ---- receiver state -------------------------------------------------
         uint32 fold_epoch = (uint32) receiver_spec.int_member("fold_epoch", 0);
         bool sender_authorized = receiver_spec.bool_member("sender_authorized", true);
-        // The corpus `defaults` block fixes all four of these explicitly.
+        // The corpus `defaults` block fixes these explicitly; group_accept_defaults_match_harness
+        // checks that every fallback below is still the one the corpus declares.
         bool manifest_known = receiver_spec.bool_member("sender_manifest_known", true);
         bool owner_known = receiver_spec.bool_member("sender_owner_known", true);
         bool sender_removed = receiver_spec.bool_member("sender_removed", false);
@@ -229,32 +387,43 @@ class ConformanceTest : Gee.TestCase {
         string gsig_mode = message_spec.req("gsig").str;
         string aead_mode = message_spec.req("aead").str;
 
-        /* The corpus can state that the message's index is NOT sitting in the
-         * skipped-key cache. Every chain this harness restores has an empty cache, so
-         * that holds by construction — but a vector asking for the opposite would need
-         * a construction that does not exist here, and silently ignoring the field
-         * would make it pass for the wrong reason. */
-        if (!message_spec.bool_member("not_in_skipped_cache", true)) {
-            problems.add("vector requires the message index to be PRESENT in the skipped-key "
-                + "cache; this harness only restores chains with an empty cache");
-            return;
-        }
-
         Jv? chains = receiver_spec.member("recv_chains");
 
         /* Two chain positions matter and they are independent: where the receiver's
          * SELECTED chain stands (R = its next_index) and which index the message was
          * sent at (N). N defaults to R, which is what keeps every vector naming neither
-         * field exactly where it was — a fresh chain at 0 receiving a message at 0. */
+         * field exactly where it was — a fresh chain at 0 receiving a message at 0.
+         * The selected chain's banked skipped indices come along here too, because
+         * whether N is cached decides which of the two §13.7 paths this vector walks. */
         uint32 recv_next_index = 0;
+        var recv_skipped = new Gee.ArrayList<uint32>();
         if (chains != null) {
             foreach (Jv c in ((!) chains).arr) {
                 if (selects(c, msg_fp, msg_device, msg_epoch, msg_epoch_id)) {
                     recv_next_index = (uint32) c.int_member("next_index", 0);
+                    recv_skipped = c.uint32_array_member("skipped_indices");
                 }
             }
         }
         uint32 msg_index = (uint32) message_spec.int_member("chain_index", (int) recv_next_index);
+
+        /* A vector MAY state whether the message's index sits in the skipped-key cache.
+         * That is a cross-check on the construction, not an input — the cache itself is
+         * built from `skipped_indices` — so a vector whose two halves disagree is
+         * testing something other than what it says, and says so loudly. It carries no
+         * default: silence means the chain's own `skipped_indices` already settled it. */
+        Jv? cache_claim = message_spec.member("not_in_skipped_cache");
+        if (cache_claim != null) {
+            bool says_absent = ((!) cache_claim).flag;
+            bool is_present = recv_skipped.contains(msg_index);
+            if (says_absent && is_present) {
+                problems.add(@"vector says index $msg_index is NOT in the skipped-key cache, "
+                    + "but the recv chain it describes banks exactly that index");
+            } else if (!says_absent && !is_present) {
+                problems.add(@"vector says index $msg_index IS in the skipped-key cache, "
+                    + "but the recv chain it describes banks no such index");
+            }
+        }
 
         /* A real sender session at the message's (epoch, epoch_id). Everything the
          * receiver will check — ciphertext, tag, per-epoch Ed25519 signature — is
@@ -265,31 +434,25 @@ class ConformanceTest : Gee.TestCase {
         uint8[] live_sig_pub = ((!) sender.send_chain).sig_pub.copy();
         uint8[] live_sig_priv = ((!) sender.send_chain).sig_priv.copy();
 
-        /* Walk the sender's own chain to both positions rather than fabricating a chain
-         * key and a header index that do not belong together: the key the receiver ends
-         * up holding is genuinely the sender's chain key at R, and the message genuinely
-         * came out of the chain at N. That matters for the index vectors specifically —
-         * an implementation that ignored the index bound and derived anyway would derive
-         * the RIGHT key and decrypt, so a fabricated pairing could make a broken
-         * implementation look correct. Stepping is a pure ratchet (two HMACs, no
-         * encryption), so even the 5000-index vector is cheap. */
+        /* The head of the sender's chain, captured before it moves. The receiver's chain
+         * is DRIVEN from here (build_selected_recv_chain) rather than assembled from a
+         * fabricated chain key: chain key, index and every banked skipped key then belong
+         * to one and the same real ratchet, exactly as a genuine receiver's would.
+         *
+         * That matters for the index vectors specifically. An implementation that ignored
+         * the index bound and derived anyway would derive the RIGHT key and decrypt, and
+         * one that ignored the skipped cache and re-derived would too — so any fabricated
+         * pairing could make a broken implementation look correct. */
+        uint8[] chain_key_at_zero = ((!) sender.send_chain).chain_key.copy();
+
+        /* Walk the sender to the index the vector says the message went out at, so the
+         * ciphertext genuinely came out of the chain at N. Stepping is a pure ratchet
+         * (two HMACs, no encryption), so even the 5000-index vector is cheap. */
         GroupMessageHeader hdr;
         uint8[] ciphertext;
         uint8[] signature;
-        uint8[] chain_key_at_recv_index;
-        if (msg_index >= recv_next_index) {
-            ratchet_send_chain(sender, recv_next_index);
-            chain_key_at_recv_index = ((!) sender.send_chain).chain_key.copy();
-            ratchet_send_chain(sender, msg_index - recv_next_index);
-            sender.encrypt(string_bytes(PAYLOAD), out hdr, out ciphertext, out signature);
-        } else {
-            // The already-ratcheted-past case: the message was sent, and only afterwards
-            // did the receiver's chain move on past it.
-            ratchet_send_chain(sender, msg_index);
-            sender.encrypt(string_bytes(PAYLOAD), out hdr, out ciphertext, out signature);
-            ratchet_send_chain(sender, recv_next_index - msg_index - 1);
-            chain_key_at_recv_index = ((!) sender.send_chain).chain_key.copy();
-        }
+        ratchet_send_chain(sender, msg_index);
+        sender.encrypt(string_bytes(PAYLOAD), out hdr, out ciphertext, out signature);
         if (hdr.chain_index != msg_index) {
             problems.add(@"harness bug: the message went out at chain index $(hdr.chain_index), vector says $msg_index");
         }
@@ -307,6 +470,7 @@ class ConformanceTest : Gee.TestCase {
                 uint64 cepoch_id = hex64(konst(c.req("epoch_id").str));
                 bool has_sig_pub = c.bool_member("has_sig_pub", true);
                 uint32 cnext = (uint32) c.int_member("next_index", 0);
+                var cskipped = c.uint32_array_member("skipped_indices");
 
                 /* Only the chain the 4-tuple actually selects gets the sender's real
                  * key material. Every other chain is unrelated noise — which is the
@@ -314,8 +478,20 @@ class ConformanceTest : Gee.TestCase {
                  * lands on a chain that cannot decrypt it. */
                 bool selected = (cfp == msg_fp && cdev == msg_device
                                  && cepoch == msg_epoch && cepoch_id == msg_epoch_id);
-                SenderChain? sc = SenderChain.restore(cepoch,
-                    selected ? chain_key_at_recv_index : random32(), cnext, cepoch_id);
+                SenderChain? sc;
+                if (selected) {
+                    sc = build_selected_recv_chain(cepoch, chain_key_at_zero, cepoch_id,
+                                                   cnext, cskipped, problems);
+                } else {
+                    /* Noise chains carry no real material, so a banked key on one would
+                     * be exactly the fabrication this harness refuses to produce. No
+                     * vector asks for it; say so rather than dropping it silently. */
+                    if (cskipped.size > 0) {
+                        problems.add("vector banks skipped keys on a recv chain the message "
+                            + "does not select; this harness only drives the selected chain");
+                    }
+                    sc = SenderChain.restore(cepoch, random32(), cnext, cepoch_id);
+                }
                 if (sc == null) throw new IOError.FAILED("could not build a recv chain for the vector");
                 ((!) sc).sig_pub = has_sig_pub
                     ? (selected ? live_sig_pub : random32())
@@ -518,6 +694,27 @@ private class Jv : Object {
     public int int_member(string name, int fallback) {
         Jv? v = member(name);
         return (v != null && ((!) v).kind == Kind.NUMBER) ? (int) ((!) v).num : fallback;
+    }
+
+    /* An optional array of non-negative integers; absent means empty, which is what the
+     * corpus `defaults` block declares for `recv_chains[].skipped_indices`. Present but
+     * not an array of numbers throws rather than silently reading as empty — an empty
+     * skipped cache is a passing state for the vectors that use this field, so quiet
+     * degradation here would look exactly like success. */
+    public Gee.ArrayList<uint32> uint32_array_member(string name) throws GLib.Error {
+        var list = new Gee.ArrayList<uint32>();
+        Jv? v = member(name);
+        if (v == null) return list;
+        if (((!) v).kind != Kind.ARRAY) {
+            throw new IOError.FAILED(@"corpus field `$name` is not an array");
+        }
+        foreach (Jv e in ((!) v).arr) {
+            if (e.kind != Kind.NUMBER || e.num < 0) {
+                throw new IOError.FAILED(@"corpus field `$name` holds a non-index entry");
+            }
+            list.add((uint32) e.num);
+        }
+        return list;
     }
 
     public bool bool_member(string name, bool fallback) {
