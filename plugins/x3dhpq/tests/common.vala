@@ -23,6 +23,8 @@ int main(string[] args) {
     // §19.2.0: the shared corpus is normative and runs like any other suite.
     TestSuite.get_root().add_suite(new ConformanceTest().get_suite());
     TestSuite.get_root().add_suite(new JournalFoldTest().get_suite());
+    // The resolver-side counterpart to the corpus's journal-fold `device_auth` input.
+    TestSuite.get_root().add_suite(new IssuerStatusTest().get_suite());
     return GLib.Test.run();
 }
 

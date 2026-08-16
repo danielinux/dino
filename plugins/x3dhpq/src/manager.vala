@@ -533,30 +533,50 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
      * EVER- rather than CURRENTLY-authorized is deliberate (unlike D4.1, which
      * governs live traffic): a journal entry is a historical record, and demanding
      * current membership would retroactively erase history authored by devices since
-     * legitimately retired. */
+     * legitimately retired.
+     *
+     * The only DEFINITIVE negative is a tombstone. "We hold manifest history for this
+     * account and the id has never appeared in it" is NOT one: our ever-authorized set
+     * is only as complete as the manifests this install happened to fold, so a late
+     * joiner — or one that missed a manifest version — legitimately lacks the entry
+     * that authorized a device its peers folded. Rejecting there would permanently skip
+     * an entry the peers folded and the two fold_hashes would never reconverge
+     * (§13.1a.0 failure policy). Quarantine instead: never folded until authorization
+     * is positively established, but self-healing once the author's manifest lands. */
     private Gee.HashSet<string> pending_manifest_fetch = new Gee.HashSet<string>();
     private Gee.HashSet<string> manifest_fetch_in_flight = new Gee.HashSet<string>();
+    /* Owner -> monotonic time of the last quarantine-release fetch. A refetch that
+     * re-accepts the same manifest re-folds, which re-quarantines, which would ask for
+     * the same fetch again: without this the genuine attack case (a device that really
+     * never was authorized) becomes a fetch loop. */
+    private Gee.HashMap<string, int64?> manifest_fetch_last = new Gee.HashMap<string, int64?>();
+    private const int64 MANIFEST_REFETCH_INTERVAL_US = 60 * 1000000;
 
     private Protocol.DeviceIssuerChecker make_issuer_checker(Account account) {
         return (signer_fp_hex, device_id) => {
             string? owner_jid = owner_jid_for_hex_fp(account, signer_fp_hex);
-            if (owner_jid == null) {
-                // We cannot even name the account, so we certainly hold no manifest
-                // for it: quarantine rather than fail either way.
-                return Protocol.IssuerAuthStatus.UNRESOLVED;
+            bool owner_known = owner_jid != null;
+            string owner = owner_known ? (!) owner_jid : "";
+            bool tombstoned = false;
+            bool has_history = false;
+            bool ever_authorized = false;
+            if (owner_known) {
+                tombstoned = owner == account.bare_jid.to_string()
+                    ? db.is_device_revoked(account, (int) device_id)
+                    : db.get_manifest_revoked_devices(account, owner).contains(device_id);
+                has_history = db.has_ever_authorized_devices(account, owner);
+                ever_authorized = db.is_ever_authorized_device(account, owner, (int) device_id);
             }
-            string owner = (!) owner_jid;
-            if (!db.has_ever_authorized_devices(account, owner)) {
+            var status = Protocol.classify_issuer(owner_known, tombstoned, has_history, ever_authorized);
+            /* Both UNRESOLVED shapes are releasable by a manifest we do not have yet —
+             * the no-history one obviously, and the never-seen-id one because the
+             * authorizing entry may simply be in a manifest version we never folded.
+             * Queue the fetch for BOTH, or the second shape would stay quarantined for
+             * good and this client would still not converge with its peers. */
+            if (Protocol.issuer_status_wants_manifest_fetch(status, owner_known)) {
                 pending_manifest_fetch.add(owner);
-                return Protocol.IssuerAuthStatus.UNRESOLVED;
             }
-            bool tombstoned = owner == account.bare_jid.to_string()
-                ? db.is_device_revoked(account, (int) device_id)
-                : db.get_manifest_revoked_devices(account, owner).contains(device_id);
-            if (tombstoned) return Protocol.IssuerAuthStatus.REJECTED;
-            return db.is_ever_authorized_device(account, owner, (int) device_id)
-                ? Protocol.IssuerAuthStatus.AUTHORIZED
-                : Protocol.IssuerAuthStatus.REJECTED;
+            return status;
         };
     }
 
@@ -582,18 +602,53 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         XmppStream? stream = app.stream_interactor.get_stream(account);
         StreamModule? module = app.stream_interactor.module_manager.get_module(account, StreamModule.IDENTITY);
         if (stream == null || module == null) return;
+        int64 now = GLib.get_monotonic_time();
         foreach (string bare in todo) {
             string key = "%d/%s".printf(account.id, bare);
             if (!manifest_fetch_in_flight.add(key)) continue;
+            int64? last = manifest_fetch_last.get(key);
+            if (last != null && now - (!) last < MANIFEST_REFETCH_INTERVAL_US) {
+                // Asked again too soon — the last fetch did not release this entry, so
+                // repeating it immediately would only spin. It stays quarantined and is
+                // retried on the next fold after the interval.
+                manifest_fetch_in_flight.remove(key);
+                continue;
+            }
+            manifest_fetch_last.set(key, now);
             try {
                 Jid j = new Jid(bare);
                 module.fetch_and_apply_peer_manifest.begin((!) stream, j, (obj, res) => {
-                    module.fetch_and_apply_peer_manifest.end(res);
+                    bool applied = module.fetch_and_apply_peer_manifest.end(res);
                     manifest_fetch_in_flight.remove(key);
+                    // A manifest we just accepted may have made a previously undecidable
+                    // issuer decidable. Re-fold now instead of waiting for whatever
+                    // unrelated event next happens to trigger a fold — otherwise the
+                    // fetch is wasted work and the held membership change surfaces late
+                    // or, if nothing else ever folds this room, never.
+                    if (applied) refold_v2_rooms(account);
                 });
             } catch (Xmpp.InvalidJidError e) {
                 manifest_fetch_in_flight.remove(key);
             }
+        }
+    }
+
+    /* D6 quarantine release, second half: re-fold every v2 room and push the result
+     * into its group session. Called once a fetched manifest has been accepted, since
+     * that is the only event that can turn an UNRESOLVED issuer into AUTHORIZED (or
+     * leave it held, if the fetched manifest genuinely never authorized that id). */
+    private void refold_v2_rooms(Account account) {
+        int? local_device_id = db.get_local_device_id(account);
+        if (local_device_id == null) return;
+        uint8[] aik_ed, aik_ml, canonical_aik, my_fp;
+        if (!local_aik(account, out aik_ed, out aik_ml, out canonical_aik, out my_fp)) return;
+        foreach (string room in db.list_membership_dag_rooms(account)) {
+            if (!is_v2_active(account, room)) continue;
+            Protocol.GroupSession? gs = db.load_group_session(
+                account, room, canonical_aik, (uint32) (!) local_device_id);
+            if (gs == null) continue;
+            rebuild_group_session_from_dag(account, room, (!) gs);
+            db.store_group_session(account, room, (!) gs);
         }
     }
 

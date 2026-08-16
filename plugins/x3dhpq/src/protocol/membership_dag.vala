@@ -108,18 +108,67 @@ public enum IssuerAuthStatus {
     /* The device appears in a Trust Manifest fold this receiver accepted and is not
      * tombstoned. Fold the entry. */
     AUTHORIZED,
-    /* We hold manifest history for that account and this device id never appeared in
-     * it, or it is tombstoned. Reject: this is the forged-DC case — AIK_priv is
-     * replicated to every authorized device (§11.8), so a device revoked as id 42 can
-     * mint a fresh DIK, pick an unseen id and self-sign a valid DC under the stolen
-     * account root. The tombstone on 42 does not cover the new id; "ever appeared in a
-     * manifest we accepted" does. */
+    /* A POSITIVE revocation: we hold a tombstone (§11.4) for this (account, device id).
+     * Reject — hard, and permanently: no manifest we could later fetch undoes a
+     * tombstone, so there is nothing to wait for. This is the only definitive negative;
+     * everything else that is merely *unproven* is UNRESOLVED. */
     REJECTED,
-    /* We hold NO manifest for that account yet, so authorization cannot be decided.
-     * The entry is QUARANTINED — kept in the store, not folded, re-evaluated once the
+    /* Authorization cannot be decided YET. Two shapes, and §13.1a.0's failure policy
+     * treats them identically:
+     *   (a) we hold NO manifest for that account at all; and
+     *   (b) we DO hold manifest history and this device id has never appeared in it —
+     *       the forged-DC shape (AIK_priv is replicated to every authorized device
+     *       (§11.8), so a device revoked as id 42 can mint a fresh DIK, pick an unseen
+     *       id and self-sign a valid DC under the stolen account root).
+     * (b) is tempting to REJECT as a definitive negative, and it is not one: an
+     * ever-authorized set is only as complete as the manifests THIS receiver happened
+     * to fold, so a client that joined late or missed a manifest version legitimately
+     * lacks the entry that authorized a device its peers folded. Rejecting there
+     * permanently skips an entry the peers folded and the two fold_hashes never
+     * reconverge. Quarantine defeats the attack just as completely — the entry is never
+     * folded until authorization is positively established — while self-healing when
+     * the gap was merely local. Fail closed on the FOLD, not on the ENTRY.
+     * The entry is QUARANTINED: kept in the store, not folded, re-evaluated once the
      * author's manifest arrives. Failing open here would restore the attack; discarding
      * would let a transient lookup gap permanently erase a room's history. */
     UNRESOLVED,
+}
+
+/* D6 (§13.1a.0 step 5) resolver policy, extracted from the app-layer lookups so it can
+ * be pinned directly by a test.
+ *
+ * The shared conformance corpus CANNOT pin this: `device_auth` is a harness INPUT
+ * there, so a vector states the resolved status and pins only what the fold does GIVEN
+ * one. Which status a receiver's own manifest bookkeeping produces is exactly the part
+ * left unpinned — and it is where the two reference clients silently diverged (Dino
+ * returned REJECTED for `manifest held / device never seen`, PQonversations returned
+ * UNRESOLVED), which folds different member sets from identical entries. See
+ * tests/issuer_status.vala. */
+public static IssuerAuthStatus classify_issuer(bool owner_known, bool tombstoned,
+                                               bool has_manifest_history,
+                                               bool ever_authorized) {
+    // We cannot even name the account, so we certainly hold no manifest for it.
+    if (!owner_known) return IssuerAuthStatus.UNRESOLVED;
+    // Checked BEFORE the history test: a tombstone is a positive result and stands on
+    // its own, and the check order is part of the cross-client contract.
+    if (tombstoned) return IssuerAuthStatus.REJECTED;
+    if (!has_manifest_history) return IssuerAuthStatus.UNRESOLVED;
+    return ever_authorized ? IssuerAuthStatus.AUTHORIZED : IssuerAuthStatus.UNRESOLVED;
+}
+
+/* Quarantine RELEASE condition: whether an issuer verdict should make the receiver go
+ * and fetch that account's Trust Manifest.
+ *
+ * Derived from the verdict itself rather than from a second, parallel test of the
+ * underlying facts. That is the point: EVERY UNRESOLVED shape is releasable by a
+ * manifest we do not hold yet — the no-history one obviously, and the
+ * history-held-but-id-never-seen one because the authorizing entry may simply live in a
+ * manifest version we never folded. Wiring the fetch to only one of the two shapes
+ * leaves the other quarantined for good, which is indistinguishable from dropping it.
+ * A tombstone needs no fetch (no manifest undoes one), and neither does AUTHORIZED. */
+public static bool issuer_status_wants_manifest_fetch(IssuerAuthStatus status, bool owner_known) {
+    // An account we cannot name has no node to fetch from.
+    return owner_known && status == IssuerAuthStatus.UNRESOLVED;
 }
 
 /* D6: resolves the issuer verdict above. Returning AUTHORIZED for everything
@@ -708,7 +757,9 @@ public class MembershipDag : Object {
             string signer_hex = hex_of(e.signer_fp);
             /* §13.1a.0 failure policy: an entry failing steps 1–4 — unresolvable signer,
              * unparseable or unverifiable DC, bad hybrid signature — is UNAUTHORIZED.
-             * Only step 5's no-manifest arm quarantines. */
+             * Only step 5 quarantines, and there only when authorization is UNDECIDED
+             * (no manifest held, or held-but-device-never-seen); a positive tombstone
+             * is unauthorized, not quarantined. */
             Bytes ed, ml;
             if (!resolver(signer_hex, out ed, out ml)) {
                 st.unauthorized.add(e.hash_hex());
@@ -744,9 +795,12 @@ public class MembershipDag : Object {
              * the stolen root. Tombstoning the id it USED to have does not cover the
              * new one.
              *
-             * UNRESOLVED (no manifest held for that account) does not fold the entry
-             * either, but the entry stays in the store and is re-evaluated on the
-             * next fold once the manifest arrives — quarantine, not discard. */
+             * UNRESOLVED — authorization undecided, whether because we hold no
+             * manifest for that account or because we hold history the device has
+             * never appeared in — does not fold the entry either, but the entry stays
+             * in the store and is re-evaluated on the next fold once the manifest
+             * arrives: quarantine, not discard. Only a positive tombstone is a
+             * definitive refusal. */
             if (issuer_checker != null) {
                 IssuerAuthStatus status = issuer_checker(signer_hex, e.issuer_device_id);
                 if (status == IssuerAuthStatus.UNRESOLVED) {
