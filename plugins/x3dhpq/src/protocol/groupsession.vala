@@ -95,6 +95,13 @@ public class GroupSession : Object {
     private HashMap<string, SenderChain> recv_chains = new HashMap<string, SenderChain>();
     // aik_fp -> epoch at which removed
     private HashMap<string, uint32> removed_aiks = new HashMap<string, uint32>();
+    /* §13.5c: AIKs whose account identity was replaced by a reset. Kept ONLY so the UI
+     * can say "retired" instead of "removed" and so the distinction survives a restart.
+     * It is deliberately NOT a second gate on the receive path: a retired sender is
+     * refused by the SAME removed-member check (mark_retired writes removed_aiks too),
+     * so §19.2.0's decision table is unchanged and a retired sender presents as
+     * sender_removed. Do not add a REJECT_RETIRED_MEMBER decision. */
+    private Gee.HashSet<string> retired_aiks = new Gee.HashSet<string>();
 
     public SenderChain? send_chain { get; private set; }
 
@@ -137,6 +144,9 @@ public class GroupSession : Object {
 
     public void add_member(GroupMember m) throws GLib.Error {
         string fp = m.fingerprint();
+        // §13.5c: retirement is permanent — the successor joins under its OWN
+        // fingerprint, never by resurrecting the dead one.
+        if (retired_aiks.contains(fp)) return;
         removed_aiks.unset(fp);
         members[fp] = m;
         rotate_epoch();
@@ -149,6 +159,7 @@ public class GroupSession : Object {
     // "add at epoch 0 without rotating" semantics for initial members.
     public void add_initial_member(GroupMember m) throws GLib.Error {
         string fp = m.fingerprint();
+        if (retired_aiks.contains(fp)) return;   // §13.5c, as in add_member
         removed_aiks.unset(fp);
         members[fp] = m;
     }
@@ -190,6 +201,49 @@ public class GroupSession : Object {
         remove_member_by_fp(fp);
         rotate_epoch();
         removed_aiks[fp] = epoch;
+    }
+
+    /* §13.5c: this AIK's account identity was retired by a RetireMember entry.
+     *
+     * Feeds the SAME per-sender check that refuses a removed member (§13.6), so the
+     * retired identity's traffic is refused at ANY epoch — including one at which it was
+     * still a member — and adds no new receive decision. Dropping the installed recv
+     * chains is the operative half: refusing new messages while still holding a chain
+     * key that forward-ratchets deterministically would leave the retired identity
+     * served by state we already hold.
+     *
+     * Epoch-neutral, exactly like remove_member_by_fp: on the fold-driven path the
+     * caller applies the fold epoch FIRST, so `epoch` here is already the fold epoch the
+     * rotation produced. */
+    public void mark_retired(string fp) {
+        members.unset(fp);
+        drop_recv_chains_for_aik(fp);
+        retired_aiks.add(fp);
+        removed_aiks[fp] = epoch;
+    }
+
+    public bool is_retired(string fp) {
+        return retired_aiks.contains(fp);
+    }
+
+    public Gee.HashSet<string> get_retired_aiks() {
+        return retired_aiks;
+    }
+
+    // Drop every recv chain held for an ACCOUNT (all its devices, all epochs) in this
+    // room. Returns the number of chains dropped.
+    public int drop_recv_chains_for_aik(string aik_fp) {
+        var to_remove = new ArrayList<string>();
+        foreach (string k in recv_chains.keys) {
+            if (k.has_prefix(aik_fp + ":")) to_remove.add(k);
+        }
+        foreach (string k in to_remove) recv_chains.unset(k);
+        return to_remove.size;
+    }
+
+    // Test/inspection helper: how many recv chains this session currently holds.
+    public int recv_chain_count() {
+        return recv_chains.size;
     }
 
     // D4.1: drop every recv chain held for one DEVICE of one account, across all
@@ -678,6 +732,16 @@ public class GroupSession : Object {
             sb.append(e.value.to_string());
             sb.append("\n");
         }
+        /* §13.5c: the retired set must survive a restart. It is written ALONGSIDE the
+         * R: rows (mark_retired populates removed_aiks too), so a client that only
+         * understood R: would still refuse the traffic — the T: rows exist to keep the
+         * retired/removed DISTINCTION, which is what the UI shows and what stops an
+         * AddMember resurrecting the identity after a restart. */
+        foreach (string fp in retired_aiks) {
+            sb.append("T:");
+            sb.append(fp);
+            sb.append("\n");
+        }
         return sb.str;
     }
 
@@ -775,6 +839,8 @@ public class GroupSession : Object {
                 string fp = rest.substring(0, colon1);
                 uint32 ep = (uint32) int.parse(rest.substring(colon1 + 1));
                 gs.removed_aiks[fp] = ep;
+            } else if (line.has_prefix("T:")) {
+                gs.retired_aiks.add(line.substring(2));   // §13.5c
             } else if (line.has_prefix("RC:")) {
                 // Recv-chain key format is `<fp>:<device>:<epoch>` and the
                 // fp itself never contains a colon, so the SERIALISE wrote

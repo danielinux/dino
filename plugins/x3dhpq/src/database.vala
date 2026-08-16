@@ -10,7 +10,8 @@ public class Database : Qlite.Database {
     // durable ever-authorized device set.
     // v23: §9.4.2 requires the checkpoint-deferral queue to be persisted alongside
     // the session state (deferred_pairwise_message).
-    private const int VERSION = 23;
+    // v24: §13.5c retired_identity (genesis succession).
+    private const int VERSION = 24;
 
     public class AccountIdentityTable : Table {
         public Column<int> id = new Column.Integer("id") { primary_key = true, auto_increment = true };
@@ -324,6 +325,40 @@ public class Database : Qlite.Database {
         }
     }
 
+    /* §13.5c: identities a room's membership journal has RETIRED (an account reset,
+     * §12, reached the room). Added at schema v24.
+     *
+     * Persisted rather than left to be re-derived from the fold on demand because the
+     * UI has to answer "is this contact retired?" from a bare JID/fingerprint, with no
+     * room in hand — and because the retired/removed distinction is what stops a later
+     * AddMember quietly resurrecting the dead key after a restart.
+     *
+     * `successor_fp_hex` is populated for evidence_kind = 1 only, from the pointer's
+     * new_aik. It exists to be SHOWN, so the user compares the right fingerprint out of
+     * band. It is never admitted, never pinned, and nothing reads it as authority: §12.2
+     * requires per-receiver out-of-band re-verification and no journal entry substitutes
+     * for that. */
+    public class RetiredIdentityTable : Table {
+        public Column<int> account_id = new Column.Integer("account_id") { not_null = true };
+        public Column<string> room_jid = new Column.NonNullText("room_jid");
+        // Raw lowercase hex of the retired AIK fingerprint (journal form).
+        public Column<string> retired_fp_hex = new Column.NonNullText("retired_fp_hex");
+        // 1 = RotationPointer (cryptographic evidence), 2 = witnessed (a member's word).
+        public Column<int> evidence_kind = new Column.Integer("evidence_kind") { not_null = true };
+        // Raw hex fingerprint of the member that authored the entry. For kind 2 this is
+        // whose word it is, and the UI MUST name them.
+        public Column<string> author_fp_hex = new Column.NonNullText("author_fp_hex");
+        // Kind 1 only, display-only. Empty for kind 2, which names no successor at all.
+        public Column<string> successor_fp_hex = new Column.NonNullText("successor_fp_hex");
+        public Column<long> created_at = new Column.Long("created_at") { not_null = true };
+
+        internal RetiredIdentityTable(Database db) {
+            base(db, "retired_identity");
+            init({ account_id, room_jid, retired_fp_hex, evidence_kind, author_fp_hex, successor_fp_hex, created_at });
+            unique({ account_id, room_jid, retired_fp_hex });
+        }
+    }
+
     // §13.1a genesis quarantine. A room lands here when its membership journal names a
     // genesis owner whose AIK cannot be resolved — in practice a room created before that
     // owner reset their account identity. The MUC archive keeps serving those entries
@@ -612,6 +647,7 @@ public class Database : Qlite.Database {
     public DeferredPairwiseMessageTable deferred_pairwise_message { get; private set; }
     public GroupSessionTable group_session { get; private set; }
     public RoomOwnerPinTable room_owner_pin { get; private set; }
+    public RetiredIdentityTable retired_identity { get; private set; }
     public RoomGenesisQuarantineTable room_genesis_quarantine { get; private set; }
     public MembershipJournalTable membership_journal { get; private set; }
     public MembershipDagTable membership_dag { get; private set; }
@@ -641,6 +677,7 @@ public class Database : Qlite.Database {
         deferred_pairwise_message = new DeferredPairwiseMessageTable(this);
         group_session = new GroupSessionTable(this);
         room_owner_pin = new RoomOwnerPinTable(this);
+        retired_identity = new RetiredIdentityTable(this);
         room_genesis_quarantine = new RoomGenesisQuarantineTable(this);
         membership_journal = new MembershipJournalTable(this);
         membership_dag = new MembershipDagTable(this);
@@ -654,7 +691,7 @@ public class Database : Qlite.Database {
         ever_authorized_device = new EverAuthorizedDeviceTable(this);
         revoked_device = new RevokedDeviceTable(this);
         message_device = new MessageDeviceTable(this);
-        init({ account_identity, peer_account_identity, peer_device, device_list, trust_manifest, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, deferred_pairwise_message, group_session, room_owner_pin, room_genesis_quarantine, membership_journal, membership_dag, device_audit, audit_entry, recovery_blob, pairing_session, pending_enrollment_request, device_nickname, manifest_revoked_device, ever_authorized_device, revoked_device, message_device });
+        init({ account_identity, peer_account_identity, peer_device, device_list, trust_manifest, bundle, signed_pre_key, kem_pre_key, one_time_pre_key, pairwise_session, deferred_pairwise_message, group_session, room_owner_pin, retired_identity, room_genesis_quarantine, membership_journal, membership_dag, device_audit, audit_entry, recovery_blob, pairing_session, pending_enrollment_request, device_nickname, manifest_revoked_device, ever_authorized_device, revoked_device, message_device });
     }
 
     public Row? get_local_identity(int account_id) {
@@ -1020,6 +1057,72 @@ public class Database : Qlite.Database {
             .value(room_owner_pin.owner_fp_hex, owner_fp_hex)
             .value(room_owner_pin.created_at, (long) new DateTime.now_utc().to_unix())
             .perform();
+    }
+
+    /* §13.5c: record that a room's journal retired an identity.
+     *
+     * Idempotent and FIRST-WRITER-WINS on the evidence, matching the fold: a later
+     * relay of the same retirement must not rewrite what the user was already shown —
+     * in particular a kind-2 "a member says so" must not be able to overwrite the
+     * kind-1 cryptographic record, nor the reverse without the user noticing. */
+    public void record_retired_identity(Account account, string room_jid, string retired_fp_hex,
+                                        uint8 evidence_kind, string author_fp_hex,
+                                        string successor_fp_hex) {
+        if (is_retired_identity(account, room_jid, retired_fp_hex)) return;
+        retired_identity.upsert()
+            .value(retired_identity.account_id, account.id, true)
+            .value(retired_identity.room_jid, room_jid, true)
+            .value(retired_identity.retired_fp_hex, retired_fp_hex.down(), true)
+            .value(retired_identity.evidence_kind, (int) evidence_kind)
+            .value(retired_identity.author_fp_hex, author_fp_hex.down())
+            .value(retired_identity.successor_fp_hex, successor_fp_hex.down())
+            .value(retired_identity.created_at, (long) new DateTime.now_utc().to_unix())
+            .perform();
+    }
+
+    public bool is_retired_identity(Account account, string room_jid, string retired_fp_hex) {
+        return retired_identity.select()
+            .with(retired_identity.account_id, "=", account.id)
+            .with(retired_identity.room_jid, "=", room_jid)
+            .with(retired_identity.retired_fp_hex, "=", retired_fp_hex.down())
+            .count() > 0;
+    }
+
+    // Any room in which this identity has been retired. Lets the contact UI answer
+    // "is this contact's key retired?" without a room in hand.
+    public Row? get_retired_identity_any_room(Account account, string retired_fp_hex) {
+        return retired_identity.select()
+            .with(retired_identity.account_id, "=", account.id)
+            .with(retired_identity.retired_fp_hex, "=", retired_fp_hex.down())
+            .order_by(retired_identity.created_at, "ASC")
+            .single().row().inner;
+    }
+
+    /* §13.5c client requirement: a retirement naming a peer the user had previously
+     * verified MUST be surfaced, not silently applied.
+     *
+     * "retired" is a state of its OWN, deliberately not "rotated": the §12.2
+     * changed-identity alarm is an all-red takeover warning, and a retirement is an
+     * expected, evidenced event. Training the user to click through takeover styling is
+     * itself a security cost, so the two must not share it. Adoption of the successor
+     * still goes through the ordinary verify flow — this flag never adopts anything. */
+    public signal void peer_identity_retired(Account account, string bare_jid, string? fingerprint);
+
+    public void flag_peer_identity_retired(Account account, string display_fp) {
+        Row? r = peer_account_identity.select()
+            .with(peer_account_identity.account_id, "=", account.id)
+            .with(peer_account_identity.aik_fingerprint, "=", display_fp)
+            .single().row().inner;
+        if (r == null) return;
+        if (((!) r)[peer_account_identity.trust_state] == "retired") return;   // already surfaced
+        string bare_jid = ((!) r)[peer_account_identity.bare_jid];
+        peer_account_identity.update()
+            .with(peer_account_identity.account_id, "=", account.id)
+            .with(peer_account_identity.bare_jid, "=", bare_jid)
+            .set(peer_account_identity.trust_state, "retired")
+            .set(peer_account_identity.updated_at, (long) new DateTime.now_utc().to_unix())
+            .perform();
+        peer_identity_retired(account, bare_jid, display_fp);
     }
 
     // §13.1a genesis quarantine: the fingerprint this room's genesis owner was quarantined

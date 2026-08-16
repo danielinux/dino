@@ -126,7 +126,14 @@ public enum MemberTrustState {
     UNKNOWN,    // No x3dhpq identity known for this JID yet.
     UNVERIFIED, // AIK known via TOFU but not manually verified.
     VERIFIED,   // AIK manually verified by the local user.
-    ROTATED     // AIK changed since last seen and needs review.
+    ROTATED,    // AIK changed since last seen and needs review.
+    /* §13.5c: the account identity behind this AIK was retired by an evidenced reset
+     * that reached the room's membership journal. DISTINCT from ROTATED on purpose:
+     * ROTATED is the §12.2 changed-identity alarm — a possible server-side takeover —
+     * while a retirement is an expected, evidenced event. Reusing the alarm styling here
+     * would train the user to click through it, which is itself a security cost. The
+     * successor is NOT adopted by this state; it is verified through the normal flow. */
+    RETIRED
 }
 
 public interface X3dhpqGroupManager : Object {
@@ -141,6 +148,14 @@ public interface X3dhpqGroupManager : Object {
     public abstract async bool group_add_admin(Dino.Entities.Account account, Jid room_jid, Jid member_jid);
     public abstract async bool group_remove_admin(Dino.Entities.Account account, Jid room_jid, Jid member_jid);
     public abstract async bool group_ban_member(Dino.Entities.Account account, Jid room_jid, Jid member_jid);
+
+    /* §13.5c witnessed retirement (`RetireMember`, evidence kind 2). The caller attests
+     * it re-verified the member's NEW identity out-of-band per §12.2, so this is
+     * owner-or-admin only and MUST NEVER be invoked automatically — it is the author's
+     * word, and every other client presents it to its user as a claim rather than as
+     * proof. It retires the old key; it does NOT admit the successor, who is added
+     * afterwards by an ordinary member-add under their own fingerprint. */
+    public abstract async bool group_retire_member_witnessed(Dino.Entities.Account account, Jid room_jid, Jid member_jid);
 
     // Whether the local account may perform admin/member ops in this room per the
     // crypto authority (folded v2 admin set, or the v1 owner) — used to relax the

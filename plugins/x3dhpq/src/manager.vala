@@ -334,6 +334,42 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             warning("rebuild dag: epoch rotation failed in %s: %s", room_jid_str, e.message);
         }
 
+        /* §13.5c: retired identities, applied BEFORE the plain removals so the session
+         * records them as retired rather than merely removed. Both end up refused by the
+         * same §13.6 check — mark_retired writes removed_aiks too — so this adds no new
+         * receive decision; what it adds is the distinction the UI surfaces and the
+         * permanence that stops a later AddMember resurrecting the dead key.
+         *
+         * Runs after apply_fold_epoch above, so the retirement is recorded against the
+         * fold epoch the rotation produced, not a throwaway local counter. */
+        foreach (string fp_hex in st.retired) {
+            Bytes r_ed, r_ml;
+            if (!resolve_aik(account, fp_hex, out r_ed, out r_ml)) continue;
+            uint8[] canonical = Manager.build_canonical_aik_bytes_static(
+                bytes_to_uint8_array(r_ed), bytes_to_uint8_array(r_ml));
+            var rm = new Protocol.GroupMember();
+            rm.aik_pub_bytes = canonical;
+            try {
+                string display_fp = rm.fingerprint();
+                bool first_time = !gs.is_retired(display_fp);
+                gs.mark_retired(display_fp);
+                if (first_time) {
+                    // §13.5c: the identity is dead everywhere, not only here.
+                    drop_retired_chains_everywhere(account, display_fp);
+                    Protocol.RetiredEvidence? ev = st.retired_evidence.get(fp_hex);
+                    db.record_retired_identity(account, room_jid_str, fp_hex,
+                        ev != null ? ((!) ev).kind : (uint8) 0,
+                        ev != null ? ((!) ev).author_fp_hex : "",
+                        ev != null ? ((!) ev).successor_fp_hex : "");
+                    /* Surfaced, never silently applied: the contact's identity row moves
+                     * to RETIRED and the successor still needs fresh verification. */
+                    db.flag_peer_identity_retired(account, display_fp);
+                }
+            } catch (GLib.Error e) {
+                warning("rebuild dag: retired fingerprint failed in %s: %s", room_jid_str, e.message);
+            }
+        }
+
         // Removals: epoch-neutral, recorded at the fold epoch applied just above.
         var to_remove = new Gee.ArrayList<string>();
         foreach (string fp in gs.get_members().keys) {
@@ -805,6 +841,117 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                 warning("x3dhpq: cannot emit DeviceSetChange for %s: %s", room, e.message);
             }
         }
+    }
+
+    /* §13.5c / W4 — KIND 1, AUTOMATIC.
+     *
+     * Called when this client accepts a valid §12.3 RotationPointer for a PEER: for every
+     * room where that peer's OLD AIK is still a current member, relay the pointer into
+     * the journal as a RetireMember(kind 1). The entry proves itself — every receiver
+     * re-verifies the embedded pointer against the AIK the room already holds — so we are
+     * only a relay and this is deliberately NOT gated on being an admin: a room whose
+     * admins are all offline must still be able to act on evidence every member can check.
+     *
+     * De-duplicated on the folded `retired` set: the pointer is a persistent PEP item and
+     * will be re-observed on every reconnect, and a repeat entry, while harmless to the
+     * fold (accepted, not rotation-causing), still costs a publish and a full group-sync
+     * fan-out per room per observation.
+     *
+     * NEVER called for our OWN account's old AIK. Under the new identity we are not a
+     * member and cannot author; under the old one we may no longer hold the key.
+     * Retirement is something other members do for you — there is no self-retire path.
+     */
+    public void on_rotation_pointer_accepted(Account account, Protocol.RotationPointer pointer) {
+        uint8[] old_fp = pointer.old_aik_fp_raw();
+        if (old_fp.length != 20) return;
+        string old_fp_hex = Protocol.hex_of(old_fp);
+
+        uint8[] my_ed, my_ml, my_canon, my_fp;
+        if (!local_aik(account, out my_ed, out my_ml, out my_canon, out my_fp)) return;
+        string my_fp_hex = Protocol.hex_of(my_fp);
+        if (old_fp_hex == my_fp_hex) {
+            // Self-retire: refused by design, see the comment above.
+            return;
+        }
+
+        uint8[] evidence = pointer.marshal();
+        uint8[] payload = Protocol.JournalEntryV2.build_retire_payload(
+            old_fp, (uint8) Protocol.RetireEvidenceKind.ROTATION_POINTER, evidence);
+
+        /* Exclude the retired identity from the group-sync fan-out. The fold drops it
+         * from the member set, but the recipient list is that set UNION the MUC
+         * occupants — and a dead key whose device is still sitting in the room would
+         * otherwise be handed the very chain the rotation exists to withhold. */
+        Jid? retired_jid = null;
+        string? retired_jid_str = db.find_peer_jid_by_aik_fp(account, old_fp);
+        if (retired_jid_str != null) {
+            try {
+                retired_jid = new Jid((!) retired_jid_str).bare_jid;
+            } catch (Xmpp.InvalidJidError e) {
+                retired_jid = null;
+            }
+        }
+
+        foreach (string room in db.list_membership_dag_rooms(account)) {
+            if (!is_v2_active(account, room)) continue;
+            Protocol.MembershipDag? dag = get_dag(account, room);
+            if (dag == null) continue;
+            Protocol.DagState st = recompute_dag_pinned(account, room, (!) dag);
+            // Already retired here → nothing to say (rate-limit / de-duplication).
+            if (st.retired.contains(old_fp_hex)) continue;
+            // Retiring a non-member is unauthorized, so do not emit one.
+            if (!st.members.contains(old_fp_hex)) continue;
+            // Any CURRENT MEMBER may author a kind-1 entry; we must be one.
+            if (!st.members.contains(my_fp_hex)) continue;
+            try {
+                emit_v2.begin(account, new Jid(room),
+                    (uint8) Protocol.MemberAuditActionV2.RETIRE_MEMBER, payload, retired_jid);
+            } catch (Xmpp.InvalidJidError e) {
+                warning("x3dhpq: cannot emit RetireMember for %s: %s", room, e.message);
+            }
+        }
+    }
+
+    /* §13.5c / W4 — KIND 2, EXPLICIT.
+     *
+     * An owner/admin user action taken AFTER they have re-verified the successor out of
+     * band per §12.2. Never automatic under any circumstance: unlike kind 1 there is no
+     * evidence here at all, the entry IS the author's word, and every other client will
+     * present it to its user as a claim rather than as proof.
+     *
+     * The payload carries an EMPTY evidence blob. That is normative, not an omission: an
+     * unconstrained blob in a slot with no verifier is a smuggling channel, and naming a
+     * successor here would put an unbound fingerprint in the journal for someone to later
+     * mistake for authority. The successor is admitted separately, by an ordinary
+     * AddMember under its own fingerprint.
+     */
+    public async bool group_retire_member_witnessed(Dino.Entities.Account account, Jid room_jid, Jid member_jid) {
+        string room_jid_str = room_jid.bare_jid.to_string();
+        if (!is_v2_active(account, room_jid_str)) {
+            warning("x3dhpq retire refused in %s: room is not v2-active", room_jid_str);
+            return false;
+        }
+        uint8[] fp;
+        if (!db.get_peer_aik_fingerprint_raw(account, member_jid.bare_jid.to_string(), out fp)) return false;
+        string fp_hex = Protocol.hex_of(fp);
+
+        uint8[] my_ed, my_ml, my_canon, my_fp;
+        if (!local_aik(account, out my_ed, out my_ml, out my_canon, out my_fp)) return false;
+        if (Protocol.hex_of(my_fp) == fp_hex) return false;   // no self-retire path
+
+        Protocol.DagState st = recompute_dag_pinned(account, room_jid_str,
+            (!) get_dag(account, room_jid_str));
+        if (!st.admins.contains(Protocol.hex_of(my_fp))) {
+            warning("x3dhpq retire refused in %s: witnessed retirement is owner/admin only", room_jid_str);
+            return false;
+        }
+        if (!st.members.contains(fp_hex)) return false;       // cannot retire a non-member
+        if (st.retired.contains(fp_hex)) return true;         // already retired
+
+        uint8[] payload = Protocol.JournalEntryV2.build_retire_payload(
+            fp, (uint8) Protocol.RetireEvidenceKind.WITNESSED, new uint8[0]);
+        return yield emit_v2(account, room_jid,
+            (uint8) Protocol.MemberAuditActionV2.RETIRE_MEMBER, payload, member_jid.bare_jid);
     }
 
     // Verify and persist a membership-journal entry received via PEP. The
@@ -2420,6 +2567,34 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         }
     }
 
+    /* §13.5c: drop every recv chain held for a RETIRED account, in EVERY room.
+     *
+     * Scoped to the whole account rather than to the room whose journal retired it,
+     * because retirement is a statement about the identity itself: the same dead AIK is
+     * serving chains in every room it shares with us, and a chain key forward-ratchets
+     * deterministically (MK = HMAC(CK,0x01), CK' = HMAC(CK,0x02)), so a chain left
+     * installed keeps yielding future message keys long after the entry that retired it.
+     *
+     * Only the CHAIN STATE is swept here. Membership itself stays per-journal: a room is
+     * told a member is retired by its own fold (rebuild_group_session_from_dag), never by
+     * another room's. */
+    private void drop_retired_chains_everywhere(Account account, string retired_display_fp) {
+        int? local_device_id = db.get_local_device_id(account);
+        if (local_device_id == null) return;
+        uint8[] aik_ed = bytes_to_uint8_array(db.get_local_identity_bytes(account, db.account_identity.aik_pub_ed25519_base64));
+        uint8[] aik_mldsa = bytes_to_uint8_array(db.get_local_identity_bytes(account, db.account_identity.aik_pub_mldsa_base64));
+        uint8[] canonical_aik = Manager.build_canonical_aik_bytes_static(aik_ed, aik_mldsa);
+        foreach (string room in db.list_group_session_rooms(account)) {
+            Protocol.GroupSession? gs = db.load_group_session(account, room, canonical_aik, (uint32) (!) local_device_id);
+            if (gs == null) continue;
+            if (((!) gs).drop_recv_chains_for_aik(retired_display_fp) > 0) {
+                db.store_group_session(account, room, (!) gs);
+                warning("x3dhpq: dropped recv chains for retired identity %s in %s (§13.5c)",
+                    retired_display_fp, room);
+            }
+        }
+    }
+
     private void on_sender_chain_announcement(Dino.Entities.Account account, Protocol.SenderChainAnnouncement ann,
                                               string sender_jid_value, int sender_device_id) {
         if (!announcement_matches_outer_sender(account, ann, sender_jid_value, sender_device_id)) {
@@ -2985,6 +3160,11 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         switch (trust_state) {
             case "verified": return global::Dino.Plugins.MemberTrustState.VERIFIED;
             case "rotated": return global::Dino.Plugins.MemberTrustState.ROTATED;
+            /* §13.5c: a retired member stays VISIBLE in the member list as retired
+             * rather than simply vanishing — a row that disappears tells the user
+             * nothing, and "this identity is dead, verify the successor before trusting
+             * it" is precisely what they need to act on. */
+            case "retired": return global::Dino.Plugins.MemberTrustState.RETIRED;
             default: return global::Dino.Plugins.MemberTrustState.UNVERIFIED;
         }
     }

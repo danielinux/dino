@@ -35,7 +35,8 @@
 // revokes its ability to administer rooms.
 //
 // Actions: AddMember=5, RemoveMember=6 (+optional ban flag byte), AddAdmin=7,
-// RemoveAdmin=8, Snapshot=10. Payload for 5/7/8 reuses the v1 24-byte
+// RemoveAdmin=8, Snapshot=10, DeviceSetChange=11, RetireMember=12.
+// Payload for 5/7/8 reuses the v1 24-byte
 // subject_fp(20)|epoch_after(4); RemoveMember is 24 or 25 bytes (trailing
 // flags byte, bit0 = ban). Parents/heads are carried as GLib.Bytes because Vala
 // forbids uint8[] as a generic type argument.
@@ -61,6 +62,33 @@ public enum MemberAuditActionV2 {
      * rotation, which is what actually severs the revoked device: the fresh chain
      * key and signing keypair are distributed only to currently authorized devices. */
     DEVICE_SET_CHANGE = 11,
+    /* §13.5c — a member's whole ACCOUNT IDENTITY was replaced by a reset (§12).
+     * Payload: retired_aik_fp(20) | evidence_kind(1) | evidence_len(uint16) | evidence.
+     *
+     * §13.5b covers one DEVICE leaving an account; this covers the account itself
+     * being re-rooted. Until this entry existed the room listed the old AIK as a
+     * member forever, which made §11.8's and §13.1a.0's claim — that a thief holding
+     * AIK_priv is left only the loud path of minting a new genesis identity — false
+     * for groups: the stolen AIK stayed a member and kept receiving every rotation.
+     *
+     * Retiring and admitting are deliberately SEPARATE steps. Nothing distinguishes a
+     * genuine reset from one minted by whoever stole AIK_priv, so bundling them would
+     * let the thief retire the victim and take their seat. Split, the thief can only
+     * retire a key they already control (no escalation), and admission still needs an
+     * admin who performed the §12.2 out-of-band verification. */
+    RETIRE_MEMBER = 12,
+}
+
+/* §13.5c evidence kinds. Read as a plain uint8 off the wire; anything else makes the
+ * entry unauthorized. */
+public enum RetireEvidenceKind {
+    /* The complete §12.3 RotationPointer blob, verbatim, signatures included. The
+     * entry PROVES ITSELF, so the author vouches for nothing and any current member
+     * may relay it. */
+    ROTATION_POINTER = 1,
+    /* The author attests it re-verified the successor out-of-band per §12.2. This IS
+     * the author's word, so owner-or-admin only, and evidence_len MUST be 0. */
+    WITNESSED = 2,
 }
 
 // Resolve a signer's AIK public keys from its raw-hex fingerprint. Returns false
@@ -314,15 +342,60 @@ public class JournalEntryV2 : Object {
         return true;
     }
 
+    /* §13.5c RetireMember payload (cross-client contract, big-endian):
+     *   retired_aik_fp(20) | evidence_kind(uint8) | evidence_len(uint16) | evidence
+     *
+     * For kind 2 (witnessed) `evidence` MUST be empty: an unconstrained blob there is a
+     * smuggling channel with no verifier, and the successor is deliberately not named
+     * because nothing in a witnessed entry would bind it. */
+    public static uint8[] build_retire_payload(uint8[] fp20, uint8 evidence_kind, uint8[] evidence) {
+        int size = 20 + 1 + 2 + evidence.length;
+        uint8[] buf = new uint8[size];
+        Memory.copy(buf, fp20, 20);
+        int off = 20;
+        buf[off++] = evidence_kind;
+        put_u16(buf, ref off, (uint16) evidence.length);
+        if (evidence.length > 0) {
+            Memory.copy((uint8*) buf + off, evidence, evidence.length);
+        }
+        return buf;
+    }
+
+    /* Strict: a declared evidence_len that does not exactly match the remaining bytes is
+     * a parse failure, so trailing junk cannot ride along inside an otherwise-valid
+     * payload. Returns false on any malformation; the fold treats that as unauthorized. */
+    public static bool parse_retire_payload(uint8[] p, out uint8[] fp20,
+                                            out uint8 evidence_kind, out uint8[] evidence) {
+        fp20 = new uint8[20];
+        evidence_kind = 0;
+        evidence = new uint8[0];
+        if (p.length < 23) return false;
+        Memory.copy(fp20, p, 20);
+        int off = 20;
+        evidence_kind = p[off++];
+        int len = (int) get_u16(p, ref off);
+        if ((int64) off + (int64) len != (int64) p.length) return false;
+        evidence = new uint8[len];
+        if (len > 0) Memory.copy(evidence, (uint8*) p + off, len);
+        return true;
+    }
+
     // v1->v2 bridge Snapshot payload (cross-client contract, big-endian):
     //   owner_fp(20) | epoch(8) | member_count(4) |
     //   member[ fp(20) | is_admin(1) ]* |
-    //   banned_count(4) | banned[ fp(20) | removal_epoch(4) ]*
+    //   banned_count(4) | banned[ fp(20) | removal_epoch(4) ]* |
+    //   retired_count(4) | retired[ fp(20) ]*        (§13.5c)
     // Pubkeys are NOT embedded — resolved via the AIK/devicelist layer.
+    //
+    // The retired block carries §13.5c state to a late joiner that never saw the
+    // RetireMember entries themselves; without it a pruned-history client would fold
+    // the dead identity back into the room. Retired fingerprints are emitted ASCENDING
+    // by raw byte value so the encoding is canonical for a given set.
     public static uint8[] build_snapshot_payload(SnapshotPayload sp) {
         int mc = sp.member_fps.size;
         int bc = sp.banned_fps.size;
-        int size = 20 + 8 + 4 + mc * 21 + 4 + bc * 24;
+        int rc = sp.retired_fps.size;
+        int size = 20 + 8 + 4 + mc * 21 + 4 + bc * 24 + 4 + rc * 20;
         uint8[] buf = new uint8[size];
         int off = 0;
         Memory.copy((uint8*) buf + off, sp.owner_fp, 20); off += 20;
@@ -336,6 +409,13 @@ public class JournalEntryV2 : Object {
         for (int i = 0; i < bc; i++) {
             Memory.copy((uint8*) buf + off, sp.banned_fps.get(i).get_data(), 20); off += 20;
             put_u32(buf, ref off, sp.banned_epochs.get(i));
+        }
+        put_u32(buf, ref off, (uint32) rc);
+        var sorted_retired = new Gee.ArrayList<Bytes>();
+        sorted_retired.add_all(sp.retired_fps);
+        sorted_retired.sort((a, b) => Memory.cmp(a.get_data(), b.get_data(), 20));
+        foreach (Bytes fp in sorted_retired) {
+            Memory.copy((uint8*) buf + off, fp.get_data(), 20); off += 20;
         }
         return buf;
     }
@@ -359,13 +439,25 @@ public class JournalEntryV2 : Object {
         }
         int bc = (int) get_u32(p, ref off);
         if (bc < 0 || bc > 100000) return null;
-        if ((int64) off + (int64) bc * 24 > (int64) p.length) return null;
+        if ((int64) off + (int64) bc * 24 + 4 > (int64) p.length) return null;
         for (int i = 0; i < bc; i++) {
             uint8[] fp = new uint8[20];
             Memory.copy(fp, (uint8*) p + off, 20); off += 20;
             uint32 rep = get_u32(p, ref off);
             sp.banned_fps.add(new Bytes(fp));
             sp.banned_epochs.add(rep);
+        }
+        /* §13.5c retired block. Required, not optional: this is an alpha wire with no
+         * backward-compatibility obligation, and treating a missing block as "no retired
+         * members" would let a truncating relay silently resurrect a retired identity in
+         * every late joiner. */
+        int rc = (int) get_u32(p, ref off);
+        if (rc < 0 || rc > 100000) return null;
+        if ((int64) off + (int64) rc * 20 > (int64) p.length) return null;
+        for (int i = 0; i < rc; i++) {
+            uint8[] fp = new uint8[20];
+            Memory.copy(fp, (uint8*) p + off, 20); off += 20;
+            sp.retired_fps.add(new Bytes(fp));
         }
         return sp;
     }
@@ -403,6 +495,23 @@ public class SnapshotPayload : Object {
     public Gee.ArrayList<bool> member_is_admin = new Gee.ArrayList<bool>();
     public Gee.ArrayList<Bytes> banned_fps = new Gee.ArrayList<Bytes>(); // 20 bytes each
     public Gee.ArrayList<uint32> banned_epochs = new Gee.ArrayList<uint32>();
+    /* §13.5c: identities replaced by an account reset. Encoded ascending by raw byte
+     * value; build_snapshot_payload sorts, so callers may add in any order. */
+    public Gee.ArrayList<Bytes> retired_fps = new Gee.ArrayList<Bytes>();
+}
+
+/* §13.5c presentation record for one retirement. Never serialised onto the wire.
+ *
+ * `successor_fp_hex` is populated ONLY for kind 1, from pointer.new_aik, and is a value
+ * to DISPLAY so the user compares the right fingerprint out of band — it confers no
+ * trust, is never admitted, and is never pinned. For kind 2 there is deliberately no
+ * successor at all: nothing in a witnessed entry would bind one. */
+public class RetiredEvidence : Object {
+    public uint8 kind { get; set; default = 0; }
+    // The member that authored the entry. For kind 2 this is WHOSE WORD it is.
+    public string author_fp_hex { get; set; default = ""; }
+    // Kind 1 only: the successor the owner CLAIMS to have moved to. Display only.
+    public string successor_fp_hex { get; set; default = ""; }
 }
 
 public class DagState : Object {
@@ -410,6 +519,21 @@ public class DagState : Object {
     public Gee.HashSet<string> admins = new Gee.HashSet<string>();      // fp_hex
     public Gee.HashMap<string, uint32> removed = new Gee.HashMap<string, uint32>(); // fp_hex -> removal epoch
     public Gee.HashSet<string> banned = new Gee.HashSet<string>();      // fp_hex
+    /* §13.5c: AIKs whose ACCOUNT IDENTITY was replaced by a reset (§12).
+     *
+     * Deliberately DISTINCT from `removed` and `banned`. It means "this identity is
+     * dead", not "this person was ejected", so the successor — who joins under its own
+     * fingerprint by an ordinary AddMember — is never fighting the removal-wins /
+     * fail-closed re-admission rules of §13.1a. Retirement is permanent within a
+     * journal: there is no un-retire action, and an AddMember naming a retired
+     * fingerprint is a no-op. */
+    public Gee.HashSet<string> retired = new Gee.HashSet<string>();     // fp_hex
+    /* §13.5c client surfacing: how each retirement was evidenced, so the UI can tell the
+     * user whether they are looking at a signature made by the old key (kind 1) or at
+     * another member's word (kind 2). Local presentation state — it is NOT part of the
+     * wire encoding and NOT part of fold_hash. */
+    public Gee.HashMap<string, RetiredEvidence> retired_evidence =
+        new Gee.HashMap<string, RetiredEvidence>();                     // fp_hex -> evidence
     public string? owner_fp = null;                                     // fp_hex
     public uint32 epoch = 0;
     /* D4.2: highest Trust Manifest version each account has announced through a
@@ -631,6 +755,11 @@ public class MembershipDag : Object {
                         st.banned.add(bh);
                         st.removed.set(bh, sp.banned_epochs.get(bi));
                     }
+                    /* §13.5c: a late joiner converges on the retired set from the
+                     * snapshot, so it never folds a dead identity back into the room. */
+                    for (int ri = 0; ri < sp.retired_fps.size; ri++) {
+                        st.retired.add(hex_of(sp.retired_fps.get(ri).get_data()));
+                    }
                     st.epoch = (uint32) sp.epoch;
                     genesis_established = true;
                     accepted_hashes.add(e.hash_hex());
@@ -653,11 +782,43 @@ public class MembershipDag : Object {
                 continue;
             }
 
+            /* §13.5c: parse the RetireMember payload BEFORE the authorization gate,
+             * because who may author one depends on the evidence kind it carries. */
+            uint8[] retire_fp = new uint8[20];
+            uint8 retire_kind = 0;
+            uint8[] retire_evidence = new uint8[0];
+            bool retire_parsed = false;
+            if (e.action == (uint8) MemberAuditActionV2.RETIRE_MEMBER) {
+                retire_parsed = JournalEntryV2.parse_retire_payload(
+                    e.payload, out retire_fp, out retire_kind, out retire_evidence);
+                if (!retire_parsed) continue;
+            }
+
             /* D4.2 rule 1: a DeviceSetChange speaks only for its author's own device
              * set, so it needs MEMBERSHIP, not adminship — any member may announce
              * that its own devices changed. Every other action still requires admin. */
             if (e.action == (uint8) MemberAuditActionV2.DEVICE_SET_CHANGE) {
                 if (!st.members.contains(signer_hex)) continue;
+            } else if (e.action == (uint8) MemberAuditActionV2.RETIRE_MEMBER) {
+                /* §13.5c: the authorization gate branches on the evidence kind, ahead of
+                 * the generic owner-or-admin rule, the same way DeviceSetChange branches
+                 * on membership.
+                 *
+                 * kind 1 — the embedded RotationPointer proves itself, re-verified below
+                 * against the retired member's own AIK, so the author vouches for nothing
+                 * and is only a relay: ANY CURRENT MEMBER may carry it. Restricting it to
+                 * admins would mean a room whose admins are all offline cannot act on
+                 * evidence every member can check for itself.
+                 *
+                 * kind 2 — nothing is proved; the entry IS the author's word that they
+                 * re-verified the successor out-of-band per §12.2. OWNER OR ADMIN only. */
+                if (retire_kind == (uint8) RetireEvidenceKind.ROTATION_POINTER) {
+                    if (!st.members.contains(signer_hex)) continue;
+                } else if (retire_kind == (uint8) RetireEvidenceKind.WITNESSED) {
+                    if (!st.admins.contains(signer_hex)) continue;
+                } else {
+                    continue;   // unknown evidence kind ⇒ unauthorized
+                }
             } else if (!st.admins.contains(signer_hex)) {
                 continue;
             }
@@ -716,6 +877,94 @@ public class MembershipDag : Object {
                 }
             }
 
+            /* §13.5c RetireMember, evaluated here for the same reason DeviceSetChange is:
+             * whether it rotates depends on its payload and on already-folded state, not
+             * on its action alone. */
+            if (e.action == (uint8) MemberAuditActionV2.RETIRE_MEMBER) {
+                string retired_hex = hex_of(retire_fp);
+
+                /* Step 1 — the target MUST resolve to a CURRENT MEMBER of the room, OR be
+                 * one this journal has already retired. You cannot retire someone who was
+                 * never there: without this a stray entry naming any fingerprint at all
+                 * would enter the retired set, and since retirement is permanent and
+                 * blocks AddMember, that is a durable denial of admission against a
+                 * stranger.
+                 *
+                 * The already-retired arm is what makes the replay guard below reachable.
+                 * The first accepted RetireMember takes the target OUT of `members`, so a
+                 * strict current-member test would make every subsequent copy of the same
+                 * entry UNAUTHORIZED rather than "accepted but not rotation-causing" —
+                 * and the two clients' fold_hashes would then diverge permanently the
+                 * first time anyone relayed the persistent pointer twice. */
+                if (!st.members.contains(retired_hex) && !st.retired.contains(retired_hex)) {
+                    continue;
+                }
+
+                var ev = new RetiredEvidence();
+                ev.kind = retire_kind;
+                ev.author_fp_hex = signer_hex;
+
+                if (retire_kind == (uint8) RetireEvidenceKind.ROTATION_POINTER) {
+                    /* THE evidence is re-verified LOCALLY, by every receiver. A kind-1
+                     * entry is trusted because the pointer proves itself, never because
+                     * the authoring member vouched for it — the author is only a relay,
+                     * and treating its relay as an assertion would hand any member the
+                     * power to retire any other. */
+                    Bytes t_ed, t_ml;
+                    if (!resolver(retired_hex, out t_ed, out t_ml)) continue;
+
+                    // Step 2 — a malformed blob makes the entry unauthorized.
+                    RotationPointer? rp = RotationPointer.unmarshal(retire_evidence);
+                    if (rp == null) continue;
+
+                    /* Step 3 — BOTH signatures over the pointer's signed_part, against
+                     * the AIK the ROOM holds for the member being retired (not against a
+                     * key the pointer supplies for itself). */
+                    if (!((!) rp).verify_with(t_ed, t_ml)) continue;
+
+                    /* Step 4 — fingerprint(pointer.old_aik) == retired_aik_fp. Without
+                     * it a pointer legitimately issued for one identity is replayable to
+                     * retire a DIFFERENT one: the signature check above would still pass
+                     * whenever the two identities share an AIK resolution path. */
+                    uint8[] old_fp = ((!) rp).old_aik_fp_raw();
+                    if (old_fp.length != 20) continue;
+                    if (hex_of(old_fp) != retired_hex) continue;
+
+                    /* pointer.new_aik is read but NOT TRUSTED. It is deliberately not
+                     * consulted here: it is not added to members, not made an admin, and
+                     * not pinned. §12.2 requires per-receiver out-of-band verification to
+                     * adopt a new identity and no journal entry substitutes for that.
+                     * Admitting it here would invert the whole mechanism — whoever stole
+                     * AIK_priv could retire the victim AND take their seat, turning a
+                     * recovery tool into an eviction primitive. The UI may DISPLAY it so
+                     * the user compares the right value out of band — which is all this
+                     * assignment is: a string handed to the presentation layer, never
+                     * consulted by the fold. */
+                    uint8[] new_fp = ((!) rp).new_aik_fp_raw();
+                    if (new_fp.length == 20) ev.successor_fp_hex = hex_of(new_fp);
+                } else {
+                    /* kind 2 — witnessed. evidence_len MUST be 0. A non-zero length is a
+                     * smuggling channel with no verifier, so it makes the entry
+                     * unauthorized rather than merely being ignored. The successor is
+                     * deliberately not named: nothing here would bind it, and a
+                     * named-but-unverified successor sitting in the journal is exactly
+                     * the value that later gets mistaken for authoritative. */
+                    if (retire_evidence.length != 0) continue;
+                }
+
+                /* Replay guard, same shape as §13.5b: a repeat naming an ALREADY-retired
+                 * fingerprint is accepted (it folds and counts towards fold_hash) but is
+                 * NOT rotation-causing. Letting a replay bump the epoch would burn epoch
+                 * numbers, and install-once (§13.4a.2) makes every burnt number
+                 * permanently unusable for a real chain. */
+                rotation_causing = !st.retired.contains(retired_hex);
+                /* First evidence wins, in canonical order: a later relay of the same
+                 * retirement must not overwrite what the user was shown. */
+                if (!st.retired_evidence.has_key(retired_hex)) {
+                    st.retired_evidence.set(retired_hex, ev);
+                }
+            }
+
             accepted_hashes.add(e.hash_hex());
 
             if (rotation_causing) {
@@ -725,12 +974,18 @@ public class MembershipDag : Object {
             switch (e.action) {
                 case (uint8) MemberAuditActionV2.ADD_MEMBER:
                     if (subj_hex == st.owner_fp) break;
+                    /* §13.5c: an AddMember naming a RETIRED fingerprint is a NO-OP. The
+                     * key is retired permanently and the successor joins under its own
+                     * fingerprint; resurrecting the dead one would undo the rotation that
+                     * severed it and hand the room straight back to whoever holds it. */
+                    if (st.retired.contains(subj_hex)) break;
                     if (can_readd(st, removal_node, subj_hex, e)) {
                         st.members.add(subj_hex);
                         st.removed.unset(subj_hex);
                     }
                     break;
                 case (uint8) MemberAuditActionV2.ADD_ADMIN:
+                    if (st.retired.contains(subj_hex)) break;   // §13.5c, as above
                     if (can_readd(st, removal_node, subj_hex, e)) {
                         st.members.add(subj_hex);
                         st.admins.add(subj_hex);
@@ -754,6 +1009,25 @@ public class MembershipDag : Object {
                 case (uint8) MemberAuditActionV2.DEVICE_SET_CHANGE:
                     /* No membership effect: the whole point of the entry is the epoch
                      * rotation handled above. */
+                    break;
+                case (uint8) MemberAuditActionV2.RETIRE_MEMBER:
+                    /* §13.5c fold effect. The retired identity leaves members AND admins
+                     * and enters `retired`; the rotation counted above is what actually
+                     * severs it, since the fresh chain key and per-epoch signing key are
+                     * only ever handed to the members that remain. Idempotent, so the
+                     * replayed (non-rotating) case is harmless.
+                     *
+                     * The SUCCESSOR is not touched here — see the evidence block above.
+                     *
+                     * NOTE (cross-client): there is deliberately NO owner exemption here,
+                     * unlike RemoveMember/RemoveAdmin. §13.1a makes the owner irremovable
+                     * because removal is an ejection someone else performs; a retirement
+                     * is a statement that the owner's own key is dead, and an owner who
+                     * resets their account needs it to reach the room exactly as much as
+                     * anyone else. The durable owner pin is unaffected. */
+                    st.members.remove(subj_hex);
+                    st.admins.remove(subj_hex);
+                    st.retired.add(subj_hex);
                     break;
             }
         }

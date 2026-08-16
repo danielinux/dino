@@ -152,6 +152,19 @@ public class View : Popover {
                 });
             }
         }
+        /* §13.5c witnessed retirement. Owner/admin only, deliberately separate from Ban:
+         * a retirement says "this identity is dead", not "this person was ejected", so
+         * the successor is not later fighting removal-wins re-admission. It retires the
+         * old key and nothing else — admitting the successor stays a separate, deliberate
+         * act, which is the whole reason a thief who steals a key cannot use this to take
+         * their victim's seat. */
+        if (real_jid != null && can_admin_ops && is_pq_group && pq_local_admin) {
+            Button retire_button = new Button.with_label(_("Retire identity…"));
+            outer_box.append(retire_button);
+            retire_button.clicked.connect(() => {
+                confirm_retire_identity(real_jid);
+            });
+        }
         if (stream_interactor.get_module(MucManager.IDENTITY).is_moderated_room(conversation.account, conversation.counterpart) && role ==  Xmpp.Xep.Muc.Role.MODERATOR){
             if (stream_interactor.get_module(MucManager.IDENTITY).get_role(selected_jid, conversation.account) ==  Xmpp.Xep.Muc.Role.VISITOR) {
                 Button voice_button = new Button.with_label(_("Grant write permission")) ;
@@ -226,6 +239,29 @@ public class View : Popover {
         Jid? real_jid = muc_manager.get_real_jid(occupant, conversation.account);
         if (real_jid == null) return;
         yield pq.group_ban_member(conversation.account, conversation.counterpart, real_jid.bare_jid);
+    }
+
+    /* §13.5c kind 2. The confirmation text is doing real work: this entry carries no
+     * evidence at all, so it is the local user's word that they performed the §12.2
+     * out-of-band re-verification, and every other member's client will label it as such.
+     * It must therefore never fire as a side effect of some other action. */
+    private void confirm_retire_identity(Jid real_jid) {
+        Application? app = GLib.Application.get_default() as Application;
+        var pq = (app != null) ? app.plugin_registry.x3dhpq_group_manager : null;
+        if (pq == null) return;
+        var confirm = new Adw.AlertDialog(
+            _("Retire this identity?"),
+            _("Only do this if %s has told you — out-of-band, in person or on a call — that they reset their client, and you have compared their NEW fingerprint with them.\n\nThis marks their OLD key dead for everyone in the room and rotates the group keys. It does NOT add their new identity: you add that separately, and every member still verifies it for themselves.\n\nOther members will see this as YOUR claim, not as proof.").printf(real_jid.bare_jid.to_string())
+        );
+        confirm.add_response("cancel", _("Cancel"));
+        confirm.add_response("retire", _("Retire identity"));
+        confirm.set_default_response("cancel");
+        confirm.set_close_response("cancel");
+        confirm.choose.begin(this, null, (obj, res) => {
+            if (confirm.choose.end(res) != "retire") return;
+            pq.group_retire_member_witnessed.begin(conversation.account,
+                conversation.counterpart, real_jid.bare_jid);
+        });
     }
 
     private void voice_button_clicked(string role) {

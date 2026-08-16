@@ -39,13 +39,24 @@ public class ContactDetailsProvider : Plugins.ContactDetailsProvider, Object {
         });
         var trust_row = new ActionRow() {
             title = "Trust state",
-            subtitle = trust_state_subtitle(trust_state),
+            subtitle = trust_state == "retired"
+                ? retired_subtitle(conversation, identity)
+                : trust_state_subtitle(trust_state),
         };
-        if (trust_state == "rotated" || trust_state == "unverified") {
+        /* §13.5c: a retired contact still offers the ORDINARY verify flow — with the full
+         * "what verifying means" text — because the successor is adopted only by explicit
+         * out-of-band re-verification (§12.2). Retirement itself adopts nothing.
+         * Deliberately NOT wired to the DESTRUCTIVE "Accept changed identity" styling of
+         * the §12.2 takeover alarm. */
+        if (trust_state == "rotated" || trust_state == "unverified" || trust_state == "retired") {
             var review_button = new Gtk.Button.with_label(trust_state == "rotated" ? "Review" : "Verify") {
                 valign = Gtk.Align.CENTER
             };
             review_button.add_css_class(trust_state == "rotated" ? "warning" : "flat");
+            if (trust_state == "retired") {
+                // Neutral affordance: this is an expected event, not an alarm.
+                review_button.add_css_class("flat");
+            }
             bool changed = trust_state == "rotated";
             review_button.clicked.connect(() => {
                 show_accept_identity_dialog(conversation, review_button, trust_row, fingerprint, changed);
@@ -70,8 +81,43 @@ public class ContactDetailsProvider : Plugins.ContactDetailsProvider, Object {
             case "rotated":    return "The contact's identity key changed and needs review.";
             case "verified":   return "Verified — you accepted this identity.";
             case "unverified": return "Unverified — not yet confirmed out-of-band.";
+            case "retired":    return "Retired — this identity was replaced by an account reset.";
             default:           return trust_state;
         }
+    }
+
+    /* §13.5c client requirement: distinguish the EVIDENCE in the copy.
+     *
+     * Kind 1 is a statement signed by the old key itself — cryptographic, re-verified
+     * locally. Kind 2 is another member's word, and the copy says so and names them,
+     * because presenting an unevidenced claim in the same language as a signature is how
+     * a user ends up trusting the wrong successor. Either way the successor fingerprint
+     * shown is a value to COMPARE OUT OF BAND, never one to accept from this screen.
+     */
+    private string retired_subtitle(Conversation conversation, Row? identity) {
+        string tail = "";
+        if (identity != null) {
+            string? fp_display = ((!) identity)[plugin.db.peer_account_identity.aik_fingerprint];
+            string? fp_hex = (fp_display == null) ? null
+                : fp_display.replace(" ", "").down();
+            if (fp_hex != null) {
+                Row? rec = plugin.db.get_retired_identity_any_room(conversation.account, (!) fp_hex);
+                if (rec != null) {
+                    int kind = ((!) rec)[plugin.db.retired_identity.evidence_kind];
+                    string author = ((!) rec)[plugin.db.retired_identity.author_fp_hex];
+                    string successor = ((!) rec)[plugin.db.retired_identity.successor_fp_hex];
+                    if (kind == 1) {
+                        tail = " The retirement is signed by the old key itself.";
+                        if (successor != "") {
+                            tail += " They claim to have moved to %s — confirm that fingerprint with them out-of-band before verifying it.".printf(successor);
+                        }
+                    } else if (kind == 2) {
+                        tail = " This is a CLAIM by another member (%s), not proof. Verify the new identity with the contact directly.".printf(author);
+                    }
+                }
+            }
+        }
+        return "Retired — this identity was replaced by an account reset." + tail;
     }
 
     // Impersonation-aware accept flow. A changed AIK is exactly what a malicious

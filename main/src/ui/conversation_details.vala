@@ -188,6 +188,13 @@ namespace Dino.Ui.ConversationDetails {
                 row.trust_badge = _("Key changed");
                 row.trust_icon = "dialog-warning-symbolic";
                 break;
+            /* §13.5c: retired is NOT the "Key changed" takeover alarm. It is an
+             * expected, evidenced event, so it gets its own neutral badge — and the
+             * member stays listed instead of silently vanishing. */
+            case Plugins.MemberTrustState.RETIRED:
+                row.trust_badge = _("Retired identity");
+                row.trust_icon = "user-trash-symbolic";
+                break;
             default:
                 row.trust_badge = _("Unverified");
                 row.trust_icon = "dialog-question-symbolic";
