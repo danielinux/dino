@@ -13,6 +13,14 @@ public const string NS_DEVTRACKER = "urn:xmppqr:x3dhpq:devtracker:0";
 // Trust Manifest (Phase 1): AIK-rooted delegation DAG of authorized devices,
 // published as a single signed blob. See trust_manifest.vala.
 public const string NS_TRUSTMANIFEST = "urn:xmppqr:x3dhpq:trustmanifest:0";
+// §12.3 AIK retirement pointer, item id "current". Unlike NS_PAIR (§10.1a), which is
+// owner-only because it coordinates the account's OWN devices, this node exists
+// specifically to be read by CONTACTS: a whitelist-restricted pointer tells nobody
+// what it was written to tell. It carries no secret — only a statement, signed by the
+// old AIK, that a key the publisher already controls is dead (§12.3), which is sound
+// in the negative direction precisely because a thief can only ever retire a key they
+// already hold. Published with access_model=open, see ROTATION_PUBLISH_OPTIONS.
+public const string NS_ROTATION = "urn:xmppqr:x3dhpq:rotation:0";
 
 public const string PAYLOAD_TYPE_SENDER_CHAIN = "sender-chain";
 // A group-sync payload bundles the sender-chain announcement with the current
@@ -40,6 +48,7 @@ public string[] get_disco_features() {
         NS_GROUP,
         NS_DEVTRACKER,
         NS_TRUSTMANIFEST,
+        NS_ROTATION,
     };
 }
 

@@ -11,7 +11,9 @@ public class Database : Qlite.Database {
     // v23: §9.4.2 requires the checkpoint-deferral queue to be persisted alongside
     // the session state (deferred_pairwise_message).
     // v24: §13.5c retired_identity (genesis succession).
-    private const int VERSION = 24;
+    // v25: §12.3 transport — a retirement pointer minted by a reset that has not yet
+    // been published (offline reset, or a publish that never confirmed).
+    private const int VERSION = 25;
 
     public class AccountIdentityTable : Table {
         public Column<int> id = new Column.Integer("id") { primary_key = true, auto_increment = true };
@@ -55,10 +57,19 @@ public class Database : Qlite.Database {
         // list_version (device_list table); this one only guards the devtracker
         // item. Added at schema v11.
         public Column<long> tracker_version = new Column.Long("tracker_version") { min_version = 11, default = "0" };
+        // §12.3 transport: base64 of a RotationPointer minted by an account reset on
+        // THIS device that has not yet been accepted by the server. A reset can happen
+        // offline, and the old AIK_priv that signs the pointer is destroyed by the very
+        // reset that mints it — so if the blob were only held in memory a reset
+        // performed offline (or one whose publish IQ was lost) could never produce a
+        // pointer at all. Null/empty once published. Public data by construction: it
+        // is a signed statement that a now-dead key is dead, and it names no private
+        // material. Added at schema v25.
+        public Column<string?> pending_rotation_pointer_base64 = new Column.Text("pending_rotation_pointer_base64") { min_version = 25 };
 
         internal AccountIdentityTable(Database db) {
             base(db, "account_identity");
-            init({ id, account_id, device_id, is_primary, aik_pub_ed25519_base64, aik_priv_ed25519_base64, aik_pub_mldsa_base64, aik_priv_mldsa_base64, dik_pub_ed25519_base64, dik_priv_ed25519_base64, dik_pub_x25519_base64, dik_priv_x25519_base64, dik_pub_mldsa_base64, dik_priv_mldsa_base64, created_at, confirmed, tracker_last_decryptable, tracker_revoked, tracker_version });
+            init({ id, account_id, device_id, is_primary, aik_pub_ed25519_base64, aik_priv_ed25519_base64, aik_pub_mldsa_base64, aik_priv_mldsa_base64, dik_pub_ed25519_base64, dik_priv_ed25519_base64, dik_pub_x25519_base64, dik_priv_x25519_base64, dik_pub_mldsa_base64, dik_priv_mldsa_base64, created_at, confirmed, tracker_last_decryptable, tracker_revoked, tracker_version, pending_rotation_pointer_base64 });
             index("x3dhpq_account_identity_account_idx", { account_id }, true);
         }
     }
@@ -1107,6 +1118,19 @@ public class Database : Qlite.Database {
      * itself a security cost, so the two must not share it. Adoption of the successor
      * still goes through the ordinary verify flow — this flag never adopts anything. */
     public signal void peer_identity_retired(Account account, string bare_jid, string? fingerprint);
+
+    /* §12.3 step 3 / §13.5c: is this owner's PINNED identity retired?
+     *
+     * A retired pin has stopped being live, so every later assertion made UNDER IT — a
+     * trust manifest, a signed devicelist — is discarded rather than applied, and
+     * discarded QUIETLY: raising the §12.2 changed-identity alarm again for a key we
+     * have already established is dead is the re-prompt storm §12.3 exists to end. It
+     * says nothing about assertions under a DIFFERENT AIK: a genuine successor is still
+     * an ordinary "same JID, different AIK" event needing out-of-band re-verification. */
+    public bool is_peer_identity_retired(Account account, string bare_jid) {
+        Row? r = get_peer_account_identity_row(account, bare_jid);
+        return r != null && ((!) r)[peer_account_identity.trust_state] == "retired";
+    }
 
     public void flag_peer_identity_retired(Account account, string display_fp) {
         Row? r = peer_account_identity.select()
@@ -2488,6 +2512,33 @@ public class Database : Qlite.Database {
         update.perform();
     }
 
+    /* §12.3 transport — the not-yet-published retirement pointer minted by our own
+     * reset, base64 of the RotationPointer wire blob, or null when there is none.
+     *
+     * Persisted rather than kept in memory because the key that signs it is gone the
+     * instant the reset that mints it completes: an offline reset, or one whose publish
+     * IQ is lost, gets exactly one chance to produce the blob and none to re-make it. */
+    public string? get_pending_rotation_pointer(Account account) {
+        Row? row = get_local_identity(account.id);
+        if (row == null) return null;
+        string? b64 = ((!) row)[account_identity.pending_rotation_pointer_base64];
+        return (b64 == null || b64 == "") ? null : b64;
+    }
+
+    public void store_pending_rotation_pointer(Account account, string blob_base64) {
+        account_identity.update()
+            .with(account_identity.account_id, "=", account.id)
+            .set(account_identity.pending_rotation_pointer_base64, blob_base64)
+            .perform();
+    }
+
+    public void clear_pending_rotation_pointer(Account account) {
+        account_identity.update()
+            .with(account_identity.account_id, "=", account.id)
+            .set_null(account_identity.pending_rotation_pointer_base64)
+            .perform();
+    }
+
     // §11.8: true if this device currently holds the account AIK private key
     // material (genuinely primary, or a share_primary=true paired secondary) —
     // i.e. it can sign new devicelist/tracker/audit entries. Used to decide
@@ -3172,6 +3223,14 @@ public class Database : Qlite.Database {
         string trust_state = ((!) existing)[peer_account_identity.trust_state];
         if (trust_state == "rotated") {
             return; // already flagged; avoid re-notifying on every rejected republish
+        }
+        if (trust_state == "retired") {
+            /* §12.3 step 3: the pin is already known dead by a verified retirement
+             * pointer. A devicelist that no longer verifies under it is exactly what a
+             * retired identity looks like, and re-flagging it "rotated" would both undo
+             * the retirement in the UI and re-raise the takeover alarm §12.3 exists to
+             * silence. Discard quietly. */
+            return;
         }
         string? fingerprint = ((!) existing)[peer_account_identity.aik_fingerprint];
         peer_account_identity.update()

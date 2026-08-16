@@ -809,6 +809,17 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
         module.own_device_set_changed.connect((manifest_version) => {
             broadcast_device_set_change(account, manifest_version);
         });
+        /* §12.3 transport → §13.5c: the stream module accepted a peer's retirement
+         * pointer (both signatures verified, old_aik was the AIK we had pinned) and
+         * marked the pin retired. Fan the retirement out to the rooms, or the identity
+         * stays a member of every shared room while being dead pairwise — a
+         * half-applied retirement, and exactly the state in which §11.8's recovery claim
+         * silently fails. Never adopts the successor: on_rotation_pointer_accepted reads
+         * only the retired fingerprint and relays the pointer verbatim as evidence every
+         * other member re-verifies for itself. */
+        module.rotation_pointer_accepted.connect((pointer) => {
+            on_rotation_pointer_accepted(account, pointer);
+        });
     }
 
     /* D4.2: emit a DeviceSetChange (action 11) into every room this account is a

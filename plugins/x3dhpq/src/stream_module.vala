@@ -38,6 +38,17 @@ public class StreamModule : XmppStreamModule {
         .set_persist_items(true)
         .set_max_items("1")
         .set_access_model(Pubsub.ACCESS_MODEL_OPEN);
+    // §12.3 "Transport (normative)": OPEN, deliberately NOT the whitelist model the
+    // pairing rendezvous node uses. That node is owner-only because it coordinates the
+    // account's own devices; this one exists specifically to be read by CONTACTS, and a
+    // whitelist-restricted retirement pointer tells nobody what it was written to tell.
+    // It leaks nothing: the item is a signed statement that a key the publisher already
+    // controls is dead. Single retained item at id "current", so republishing an
+    // identical pointer is idempotent.
+    private static Pubsub.PublishOptions ROTATION_PUBLISH_OPTIONS = new Pubsub.PublishOptions()
+        .set_persist_items(true)
+        .set_max_items("1")
+        .set_access_model(Pubsub.ACCESS_MODEL_OPEN);
     private HashMap<Jid, Future<ArrayList<int>>> active_devicelist_requests = new HashMap<Jid, Future<ArrayList<int>>>(Jid.hash_func, Jid.equals_func);
     // Per-(bare_jid/device_id) cooldown on bundle fetches. Callers re-request a
     // bundle whenever the stored one is missing or fails verify(); without a
@@ -65,6 +76,18 @@ public class StreamModule : XmppStreamModule {
      * journal entry in every room the account is a member of, which is what forces
      * the epoch rotation that actually severs it. */
     public signal void own_device_set_changed(uint64 manifest_version);
+
+    /* §12.3: a peer's retirement pointer passed every consuming check and the pin for
+     * that owner has been marked retired. The manager turns this into the §13.5c group
+     * consequence — a kind-1 `RetireMember` in every room where the retired AIK is
+     * still a member. Accepting a pointer pairwise while leaving the identity seated in
+     * every shared room is a half-applied retirement, and it is precisely the state in
+     * which the §11.8 recovery claim silently fails to hold.
+     *
+     * Carries ONLY the pointer. Nothing downstream may read `new_aik` as anything but a
+     * value to DISPLAY: §12.2 adoption stays out-of-band, and this signal grants the
+     * successor nothing. */
+    public signal void rotation_pointer_accepted(Protocol.RotationPointer pointer);
 
     public signal void device_list_loaded(Jid jid, ArrayList<int> devices);
     public signal void bundle_fetched(Jid jid, int device_id, StanzaNode bundle);
@@ -147,6 +170,26 @@ public class StreamModule : XmppStreamModule {
         pubsub.add_filtered_notification(stream, Protocol.NS_TRUSTMANIFEST, (stream, jid, id, node) => {
             handle_manifest_event(stream, jid, id, node);
         }, null, null);
+        // §12.3 "Transport (normative)", first consuming entry point: live +notify of a
+        // contact's retirement pointer. Registering the filtered notification is also
+        // what advertises `urn:xmppqr:x3dhpq:rotation:0+notify` in our disco#info
+        // (Pubsub.Module.add_filtered_notification → add_feature_notify), which is what
+        // makes the server push a peer's pointer to us instead of us having to poll.
+        pubsub.add_filtered_notification(stream, Protocol.NS_ROTATION, (stream, jid, id, node) => {
+            handle_rotation_event(stream, jid, id, node);
+        }, null, null);
+
+        /* §12.3 "Transport (normative)", SECOND consuming entry point, and it is
+         * REQUIRED rather than an optimisation: a client that was offline when the
+         * pointer was published never receives the notification, and the §12.2
+         * identity-change prompt is exactly the moment the pointer is needed. The
+         * pointer is a persistent item, so the fetch is always available.
+         *
+         * Hooked on the DB signal rather than on the individual detection sites so that
+         * every "same JID, different AIK" route reaches it identically — the devicelist
+         * AIK-signature failure, the same-version fork, and the bundle-driven
+         * update_peer_identity all funnel through peer_identity_rotated. */
+        db.peer_identity_rotated.connect(on_peer_identity_rotated);
 
         attached_stream = stream;
         stream.get_module(Xmpp.MessageModule.IDENTITY).received_message.connect(on_received_message);
@@ -169,6 +212,8 @@ public class StreamModule : XmppStreamModule {
         pubsub.remove_filtered_notification(stream, Protocol.NS_PAIR);
         pubsub.remove_filtered_notification(stream, Protocol.NS_DEVTRACKER);
         pubsub.remove_filtered_notification(stream, Protocol.NS_TRUSTMANIFEST);
+        pubsub.remove_filtered_notification(stream, Protocol.NS_ROTATION);
+        db.peer_identity_rotated.disconnect(on_peer_identity_rotated);
 
         stream.get_module(Xmpp.MessageModule.IDENTITY).received_message.disconnect(on_received_message);
         attached_stream = null;
@@ -177,6 +222,12 @@ public class StreamModule : XmppStreamModule {
     public async void publish_current_state(XmppStream stream) {
         db.ensure_local_identity(account);
         db.ensure_local_prekeys(account);
+        /* §12.3: flush a retirement pointer minted by a reset that could not publish it
+         * at the time — an offline reset, or one whose publish IQ was lost. The key that
+         * signs it is destroyed by the reset, so this retry is the only thing standing
+         * between "the user reset on a train" and "the pointer never exists". No-op when
+         * nothing is pending, which is the overwhelmingly common case. */
+        yield publish_rotation_pointer(stream);
         // §10.6.6 device-authorization gating: a device that is not yet
         // authorized (not confirmed, or confirmed but without AIK_priv — see
         // Database.is_authorized) MUST NOT publish an authoritative devicelist.
@@ -1229,6 +1280,279 @@ public class StreamModule : XmppStreamModule {
         verify_and_apply_manifest(jid, ((!) m).marshal());
     }
 
+    // ─────────────────────────── §12.3 AIK retirement pointer: transport ────────
+    //
+    // The pointer type, its verification and the §13.5c fan-out all existed before
+    // this block; what did not exist was anything that CALLED them. Without a
+    // transport the automatic retirement path can never fire and genesis succession
+    // only happens when an admin performs it by hand — which makes §11.8's and
+    // §13.1a.0's claim (a compromised AIK_priv holder is left "only the loud path of
+    // minting a new genesis identity") true only under manual intervention.
+
+    /* The canonical `<rotation/>` element. Static and side-effect free so the
+     * cross-client byte-exactness vector can pin it directly: both reference clients
+     * must publish the identical element for the identical RotationPointer, or a
+     * pointer authored on one is unreadable on the other. */
+    public static StanzaNode build_rotation_node(uint8[] blob) {
+        return new StanzaNode.build("rotation", Protocol.NS_ROTATION)
+            .add_self_xmlns()
+            .put_node(new StanzaNode.text(Base64.encode(blob)));
+    }
+
+    /* Read a `<rotation>` element's base64 text child back to the raw wire blob. Takes
+     * either the element itself (the +notify path hands us the item's child) or a
+     * wrapper containing it. Returns null on anything malformed — a caller treats that
+     * exactly like an absent item, never like a retirement. */
+    public static uint8[]? parse_rotation_node(StanzaNode? node) {
+        if (node == null) return null;
+        StanzaNode rot = (!) node;
+        if (rot.name != "rotation") {
+            StanzaNode? inner = rot.get_subnode("rotation", Protocol.NS_ROTATION);
+            if (inner == null) return null;
+            rot = (!) inner;
+        }
+        string? b64 = rot.get_string_content();
+        if (b64 == null || b64 == "") return null;
+        uint8[] raw = Base64.decode((!) b64);
+        return raw.length == 0 ? null : raw;
+    }
+
+    /* §12.1 step 4 / §12.3 "Publishing (normative)".
+     *
+     * Publishes the pointer this device's own reset minted, if any. Idempotent at item
+     * id "current"; the stored blob is dropped once the server has taken it.
+     *
+     * Returns false both when the publish fails AND when there was nothing to publish,
+     * and NEITHER is an error: a reset performed by a device that no longer holds the
+     * old AIK_priv legitimately produces no pointer. The pointer is a courtesy, never a
+     * precondition for a valid reset — total device loss is the common reset case, and
+     * blocking or failing it there would break the one path §12 exists to provide. */
+    public async bool publish_rotation_pointer(XmppStream stream) {
+        string? b64 = db.get_pending_rotation_pointer(account);
+        if (b64 == null) return false;
+        uint8[] blob;
+        try {
+            blob = bytes_to_uint8_array(bytes_from_base64((!) b64));
+        } catch (GLib.Error e) {
+            warning("publish_rotation_pointer: stored pointer for %s is undecodable; dropping it",
+                account.bare_jid.to_string());
+            db.clear_pending_rotation_pointer(account);
+            return false;
+        }
+        if (Protocol.RotationPointer.unmarshal(blob) == null) {
+            warning("publish_rotation_pointer: stored pointer for %s does not parse; dropping it",
+                account.bare_jid.to_string());
+            db.clear_pending_rotation_pointer(account);
+            return false;
+        }
+        Pubsub.Module pubsub_mod = stream.get_module(Pubsub.Module.IDENTITY);
+        bool ok = yield pubsub_mod.publish(stream, null, Protocol.NS_ROTATION, "current",
+            build_rotation_node(blob), ROTATION_PUBLISH_OPTIONS);
+        if (ok) {
+            // The node must be readable by contacts — that is the entire point of it.
+            // Fire-and-forget, as for the devicelist/manifest nodes: the publish options
+            // already ask for access_model=open and this is only a repair for a node a
+            // previous client version created with a stricter model.
+            try_make_node_public.begin(stream, Protocol.NS_ROTATION);
+            db.clear_pending_rotation_pointer(account);
+        } else {
+            // Keep the blob: the signing key is gone, so a lost publish is the only
+            // chance we get. The next connect retries via publish_current_state.
+            warning("publish_rotation_pointer: publish failed for %s: %s — will retry on the next connect",
+                account.bare_jid.to_string(),
+                pubsub_mod.last_publish_error ?? "no response (timeout / lost ACK)");
+        }
+        return ok;
+    }
+
+    /* On-demand fetch of an owner's pointer (§12.3 transport, second entry point).
+     * Mirrors fetch_trust_manifest: the framework's callback-based Pubsub.request with
+     * a timeout, so an absent node or a lost response resolves to "nothing" instead of
+     * hanging the caller. An absent pointer is NOT evidence of anything (§12.3 step 5):
+     * it is not a liveness signal, and an attacker able to suppress it is exactly the
+     * relay this protocol already assumes. */
+    public async void fetch_rotation_pointer(XmppStream stream, Jid jid) {
+        // Bytes rather than uint8[]: valac forbids arrays as generic type arguments.
+        Promise<Bytes?> promise = new Promise<Bytes?>();
+        bool settled = false;
+        stream.get_module(Pubsub.Module.IDENTITY).request(stream, jid.bare_jid, Protocol.NS_ROTATION,
+                (stream, from, id, node) => {
+            if (settled) return;
+            settled = true;
+            uint8[]? raw = parse_rotation_node(node);
+            promise.set_value(raw == null ? null : new Bytes((!) raw));
+        });
+        Timeout.add(15000, () => {
+            if (settled) return false;
+            settled = true;
+            promise.set_value(null);
+            return false;
+        });
+        Bytes? blob = null;
+        try {
+            blob = yield promise.future.wait_async();
+        } catch (GLib.Error e) {
+            return;
+        }
+        if (blob == null) return;
+        consume_rotation_pointer(jid, bytes_to_uint8_array((!) blob));
+    }
+
+    // First consuming entry point: a contact's pointer arrived by +notify.
+    private void handle_rotation_event(XmppStream stream, Jid jid, string? id, StanzaNode? node) {
+        uint8[]? blob = parse_rotation_node(node);
+        if (blob == null) return;
+        consume_rotation_pointer(jid, (!) blob);
+    }
+
+    // Second consuming entry point: a "same JID, different AIK" event was detected for
+    // this owner, so go and ask for the pointer we may have missed while offline.
+    private void on_peer_identity_rotated(Account acct, string bare_jid, string? fingerprint) {
+        if (acct.id != account.id) return;
+        XmppStream? stream = attached_stream;
+        if (stream == null) return;
+        try {
+            fetch_rotation_pointer.begin((!) stream, new Jid(bare_jid));
+        } catch (Xmpp.InvalidJidError e) {
+            warning("x3dhpq: cannot fetch a rotation pointer for %s: %s", bare_jid, e.message);
+        }
+    }
+
+    /* §12.3 "Consuming (normative)", applied in order. Deliberately stream-free: the
+     * decision is pure local state, and both transports (+notify and on-demand fetch)
+     * land here so neither can drift from the other.
+     *
+     * Returns true only when the pointer was ACCEPTED. Every rejection is silent — a
+     * pointer is unauthenticated input from the relay until its signatures check out,
+     * and a rejected one must not become a UI event of any kind. */
+    public bool consume_rotation_pointer(Jid owner, uint8[] blob) {
+        string bare = owner.bare_jid.to_string();
+
+        /* T4 — no self-retire loop. Our own pointer comes straight back from the server
+         * on every reconnect (it is a persistent item on our own node). Acting on it is
+         * meaningless in both directions: under the new identity we are not the party
+         * being retired, and under the old one we may no longer hold the key. Retirement
+         * is something OTHER members do for you; there is no self-retire path. */
+        if (owner.bare_jid.equals(account.bare_jid)) return false;
+
+        Protocol.RotationPointer? p_ = Protocol.RotationPointer.unmarshal(blob);
+        if (p_ == null) return false;
+        Protocol.RotationPointer p = (!) p_;
+
+        /* Step 1 — BOTH signatures over signed_part, against pointer.old_aik. Either
+         * failing discards it. Both, because a single-algorithm check makes the
+         * post-quantum half decorative (§7.7). Sound self-referentially ONLY because the
+         * statement is negative: it retires the very key it is signed by, and an
+         * attacker holding that key can already do everything it permits. Step 2 below
+         * is what binds it to an identity we actually trusted. */
+        if (!p.verify()) return false;
+
+        /* Step 2 — old_aik MUST be the AIK we currently have PINNED for this owner. A
+         * pointer naming an identity the receiver never trusted conveys nothing, and
+         * honouring one would let any passer-by push arbitrary fingerprints into the
+         * retired state — permanent, and a durable denial of admission. */
+        Bytes pin_ed, pin_ml;
+        if (!db.get_peer_aik_pubs(account, bare, out pin_ed, out pin_ml)) return false;
+        Protocol.AccountIdentityPub? old_pub = Protocol.AccountIdentityPub.unmarshal(p.old_aik);
+        if (old_pub == null) return false;
+        if (!manifest_bytes_equal(((!) old_pub).pub_ed25519, bytes_to_uint8_array(pin_ed))) return false;
+        if (!manifest_bytes_equal(((!) old_pub).pub_mldsa, bytes_to_uint8_array(pin_ml))) return false;
+
+        /* Belt and braces on the self-retire rule: refuse a pointer naming OUR OWN AIK
+         * no matter which JID it arrives under, so a relay cannot route our own
+         * retirement back at us through a third party's node. */
+        Row? local = db.get_local_identity(account.id);
+        if (local != null) {
+            string? my_ed = ((!) local)[db.account_identity.aik_pub_ed25519_base64];
+            string? my_ml = ((!) local)[db.account_identity.aik_pub_mldsa_base64];
+            if (my_ed != null && my_ml != null && my_ed != "" && my_ml != "") {
+                try {
+                    if (manifest_bytes_equal(((!) old_pub).pub_ed25519,
+                                bytes_to_uint8_array(bytes_from_base64((!) my_ed)))
+                            && manifest_bytes_equal(((!) old_pub).pub_mldsa,
+                                bytes_to_uint8_array(bytes_from_base64((!) my_ml)))) {
+                        return false;
+                    }
+                } catch (GLib.Error e) { /* undecodable own key — fall through */ }
+            }
+        }
+
+        /* Step 3 — mark the pinned AIK RETIRED. From here it stops being live:
+         * db.is_peer_identity_retired gates the manifest and devicelist paths, so later
+         * assertions under it are discarded WITHOUT raising a fresh identity-change
+         * event. flag_peer_identity_retired only notifies on the transition, so a
+         * republished or re-notified pointer for the same old_aik is a no-op rather than
+         * a fresh prompt — which matters because the pointer is a persistent item and
+         * will be re-observed on every single reconnect. */
+        string? display_fp = db.get_peer_aik_fingerprint(account, bare);
+        if (display_fp == null) return false;
+        db.flag_peer_identity_retired(account, display_fp);
+
+        /* Step 4 — the successor is NOT adopted. Nothing above or below writes
+         * p.new_aik to the pin, to the trust tables, or to any room: §12.2 is unchanged
+         * and the successor is adopted only by explicit out-of-band re-verification.
+         * It may be DISPLAYED (so the user compares the right fingerprint), and
+         * RotationPointer.new_aik_fp_raw() exists for exactly that — but it grants no
+         * trust, and the §13.5c fan-out below carries it only as evidence bytes that
+         * every other member re-verifies for themselves.
+         *
+         * Step 5 (absence proves nothing) needs no code, and that is the point: there is
+         * no "no pointer ⇒ still live" branch anywhere, because a suppressing relay is
+         * exactly the adversary already assumed. */
+        rotation_pointer_accepted(p);
+        return true;
+    }
+
+    /* §12.1 step 4 — mint the pointer for a reset this device is performing.
+     *
+     * Called from inside reset_local_identity_for_genesis with the OLD AIK captured
+     * before the new one is minted. Best-effort by design: every failure path leaves
+     * the reset itself untouched and simply publishes no pointer. */
+    private void mint_rotation_pointer(uint8[] old_ed_pub, uint8[] old_ml_pub,
+            Bytes old_ed_priv, Bytes old_ml_priv) {
+        Row? row = db.get_local_identity(account.id);
+        if (row == null) return;
+        try {
+            string? new_ed_b64 = ((!) row)[db.account_identity.aik_pub_ed25519_base64];
+            string? new_ml_b64 = ((!) row)[db.account_identity.aik_pub_mldsa_base64];
+            if (new_ed_b64 == null || new_ml_b64 == null || new_ed_b64 == "" || new_ml_b64 == "") return;
+
+            var old_pub = new Protocol.AccountIdentityPub();
+            old_pub.pub_ed25519 = old_ed_pub;
+            old_pub.pub_mldsa = old_ml_pub;
+            var new_pub = new Protocol.AccountIdentityPub();
+            new_pub.pub_ed25519 = bytes_to_uint8_array(bytes_from_base64((!) new_ed_b64));
+            new_pub.pub_mldsa = bytes_to_uint8_array(bytes_from_base64((!) new_ml_b64));
+
+            // A reset that somehow left the AIK unchanged has nothing to say; publishing
+            // old == new would retire the identity the account is still using.
+            if (manifest_bytes_equal(old_pub.pub_ed25519, new_pub.pub_ed25519)
+                    && manifest_bytes_equal(old_pub.pub_mldsa, new_pub.pub_mldsa)) {
+                return;
+            }
+
+            var p = new Protocol.RotationPointer();
+            p.version = 1;
+            p.old_aik = old_pub.marshal();
+            p.new_aik = new_pub.marshal();
+            p.rotated_at = (int64) new DateTime.now_utc().to_unix();
+            // Free-text and user-visible on the far side; deliberately fixed and
+            // content-free so it can never carry anything about the account's state.
+            p.reason = "reset";
+            uint8[] sp = p.signed_part();
+            // Signed by the OLD AIK under BOTH algorithms (§12.3 "Publishing").
+            p.sig_ed25519 = bytes_to_uint8_array(
+                global::X3dhpq.Crypto.ed25519_sign(old_ed_priv, new Bytes(sp)));
+            p.sig_mldsa = bytes_to_uint8_array(
+                global::X3dhpq.Crypto.mldsa65_sign(old_ml_priv, new Bytes(sp)));
+            db.store_pending_rotation_pointer(account, Base64.encode(p.marshal()));
+        } catch (GLib.Error e) {
+            // Never fatal: see publish_rotation_pointer's contract note.
+            warning("x3dhpq: could not mint a §12.3 retirement pointer for this reset (%s);"
+                + " the reset itself is unaffected", e.message);
+        }
+    }
+
     // §C gate: verify (AIK pin + version/rollback/fork + fold + head-sig under a
     // folded device) then write the folded device set into the trust tables. On
     // any REJECT, keep the last good state (do not wipe trust). Returns true if
@@ -1293,6 +1617,14 @@ public class StreamModule : XmppStreamModule {
                 }
             } catch (GLib.Error e) { return false; }
         } else {
+            /* §12.3 step 3: a pin we have already established is DEAD, by a pointer
+             * signed under it, stops being live. Every later assertion made under that
+             * identity is discarded — quietly, raising no fresh identity-change event —
+             * because the whole problem §12.3 solves is a never-re-paired device
+             * republishing under the dead AIK forever. */
+            if (db.is_peer_identity_retired(account, bare)) {
+                return false;
+            }
             Bytes pin_ed, pin_ml;
             if (db.get_peer_aik_pubs(account, bare, out pin_ed, out pin_ml)) {
                 if (!manifest_bytes_equal(m_aik_ed, bytes_to_uint8_array(pin_ed))
@@ -1606,6 +1938,39 @@ public class StreamModule : XmppStreamModule {
     // sequence documented in EncryptionPreferencesEntry.perform_account_reset.
     public void reset_local_identity_for_genesis() {
         string own_bare = account.bare_jid.to_string();
+        /* §12.1 step 4 / §12.3: capture the OLD AIK — public halves AND private halves —
+         * BEFORE reset_account_identity_new_aik overwrites them. This is the only moment
+         * the pointer can be signed: the reset destroys the signing key by design.
+         *
+         * A device that no longer holds the old private key (a paired secondary, or the
+         * total-device-loss case §12 exists for) simply skips it. The pointer is a
+         * courtesy, never a precondition: refusing to reset without one would break the
+         * exact recovery path §12.2 promises. */
+        uint8[] old_aik_ed = {};
+        uint8[] old_aik_ml = {};
+        Bytes? old_priv_ed = null;
+        Bytes? old_priv_ml = null;
+        if (db.has_local_aik_priv(account)) {
+            Row? prev = db.get_local_identity(account.id);
+            if (prev != null) {
+                try {
+                    string? ed_pub_b64 = ((!) prev)[db.account_identity.aik_pub_ed25519_base64];
+                    string? ml_pub_b64 = ((!) prev)[db.account_identity.aik_pub_mldsa_base64];
+                    string? ed_priv_b64 = ((!) prev)[db.account_identity.aik_priv_ed25519_base64];
+                    string? ml_priv_b64 = ((!) prev)[db.account_identity.aik_priv_mldsa_base64];
+                    if (ed_pub_b64 != null && ml_pub_b64 != null && ed_pub_b64 != "" && ml_pub_b64 != ""
+                            && ed_priv_b64 != null && ml_priv_b64 != null) {
+                        old_aik_ed = bytes_to_uint8_array(bytes_from_base64((!) ed_pub_b64));
+                        old_aik_ml = bytes_to_uint8_array(bytes_from_base64((!) ml_pub_b64));
+                        old_priv_ed = bytes_from_base64((!) ed_priv_b64);
+                        old_priv_ml = bytes_from_base64((!) ml_priv_b64);
+                    }
+                } catch (GLib.Error e) {
+                    old_priv_ed = null;
+                    old_priv_ml = null;
+                }
+            }
+        }
         // Wipe own-account sibling rows learned under the OLD identity (§10.6.5),
         // the cached device-audit DAG (§11.7), the own-devicelist snapshot (§8.6
         // shrink-guard exception), and the old revocation tombstones — all
@@ -1620,6 +1985,13 @@ public class StreamModule : XmppStreamModule {
         db.reset_account_identity_new_aik(account);
         db.invalidate_local_device_certificate(account);
         db.clear_trust_manifest(account, own_bare);
+
+        // The new AIK now exists, so the old→new statement can be signed by the key we
+        // captured above. Stored, not published, here: this method is also the OFFLINE
+        // reset path, and publish_current_state / perform_self_genesis flush it.
+        if (old_priv_ed != null && old_priv_ml != null) {
+            mint_rotation_pointer(old_aik_ed, old_aik_ml, (!) old_priv_ed, (!) old_priv_ml);
+        }
     }
 
     // Full self-genesis: reset the local identity, PURGE every stale own PEP node
@@ -1640,6 +2012,13 @@ public class StreamModule : XmppStreamModule {
         yield purge_own_node(stream, Protocol.NS_DEVICELIST);
         yield purge_own_node(stream, Protocol.NS_TRUSTMANIFEST);
         yield purge_own_node(stream, Protocol.NS_PAIR);
+        /* §12.1 step 4 / §12.3: publish the retirement pointer minted just above. NOT
+         * purged like the nodes around it: those hold items signed by the now-dead AIK
+         * that nothing can ever verify again, whereas the pointer is self-verifying
+         * against the very key it names, and it is the one item a peer still pinned on
+         * the old identity actually needs. A no-op when this device no longer held the
+         * old AIK_priv — the reset stands either way. */
+        yield publish_rotation_pointer(stream);
         yield publish_reset_genesis_manifest(stream);
         yield publish_current_state(stream);
     }
@@ -2386,6 +2765,15 @@ public class StreamModule : XmppStreamModule {
         long issued_at = (long) int64.parse(node.get_attribute("issued-at") ?? "0");
         out_version = version;
         out_signed = false;
+
+        /* §12.3 step 3: the pin for this owner is RETIRED — a pointer signed under it
+         * said so, and we verified it. It is no longer live, so a devicelist asserted
+         * under it is discarded here, before any of the gates below can turn it into a
+         * fresh identity-change event. This is the "offline device republishing under
+         * the dead AIK on every connect, forever" case §12.3 exists to end. */
+        if (!jid.bare_jid.equals(account.bare_jid) && db.is_peer_identity_retired(account, bare)) {
+            return false;
+        }
 
         StanzaNode? sig_node = node.get_subnode("sig", Protocol.NS_DEVICELIST);
         StanzaNode? mldsa_node = node.get_subnode("mldsa-sig", Protocol.NS_DEVICELIST);

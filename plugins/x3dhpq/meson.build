@@ -115,6 +115,7 @@ test_sources = [
     'tests/membership_dag.vala',
     'tests/membership_dag_persistence.vala',
     'tests/retire_member.vala',
+    'tests/rotation_transport.vala',
     'tests/deferral_queue.vala',
     'tests/device_dag.vala',
     'tests/trust_manifest.vala',
