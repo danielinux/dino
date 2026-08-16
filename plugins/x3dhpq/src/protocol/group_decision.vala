@@ -2,14 +2,14 @@
  *
  * WHY THIS FILE EXISTS. The receive-side checks used to be split across two layers:
  * device authorization (§13.5b) and the drop-every-chain side effect lived in
- * Manager, while the removed-member, stale-epoch and chain-selection checks lived
- * inside GroupSession.decrypt_with_heads(). Several of those checks carry SIDE
- * EFFECTS, so the ORDER they fire in is observable — an implementation that tests
- * staleness before device authorization reaches the same verdict while failing to
- * drop the revoked device's chains, and nothing in either layer's own tests can see
- * that. The shared conformance corpus (§19.2.0, conformance/v1/group-accept.json)
- * pins that order, which is only testable if there is ONE place the whole sequence
- * runs. GroupSession.receive() is that place; this file gives it its vocabulary.
+ * Manager, while the removed-member and chain-selection checks lived inside
+ * GroupSession.decrypt_with_heads(). Several of those checks carry SIDE EFFECTS, so
+ * the ORDER they fire in is observable — an implementation that decides on the epoch
+ * before device authorization reaches the same verdict while failing to drop the
+ * revoked device's chains, and nothing in either layer's own tests can see that. The
+ * shared conformance corpus (§19.2.0, conformance/v2/group-accept.json) pins that
+ * order, which is only testable if there is ONE place the whole sequence runs.
+ * GroupSession.receive() is that place; this file gives it its vocabulary.
  *
  * Device authorization is deliberately an INPUT, not a lookup: resolving it needs
  * the Trust Manifest fold, the tombstone set and the account database, none of which
@@ -28,12 +28,18 @@ public enum GroupDeviceAuthorization {
     NO_MANIFEST,
 }
 
-/* The verdicts of conformance/v1/group-accept.json, one-for-one. */
+/* The verdicts of conformance/v2/group-accept.json, one-for-one.
+ *
+ * v1's REJECT_STALE_EPOCH is gone and MUST NOT come back (§13.7a, OQ-12 resolved).
+ * The global comparison it encoded refused a lagging peer's messages permanently —
+ * our fold epoch only grows, so it never descends to meet them — while every threat
+ * it appeared to cover is caught by REJECT_REMOVED_MEMBER (at any epoch),
+ * REJECT_UNAUTHORIZED_DEVICE, the (epoch, epoch_id) chain selection and the §13.7
+ * chain-index rules, none of which depend on two peers' folds being in step. */
 public enum GroupDecision {
     ACCEPT,
     REJECT_UNAUTHORIZED_DEVICE,
     REJECT_REMOVED_MEMBER,
-    REJECT_STALE_EPOCH,
     REJECT_EPOCH_ID_MISMATCH,
     DEFER_NO_CHAIN,
     REJECT_SIGNATURE,
@@ -53,7 +59,6 @@ public enum GroupDecision {
             case ACCEPT:                     return "ACCEPT";
             case REJECT_UNAUTHORIZED_DEVICE: return "REJECT_UNAUTHORIZED_DEVICE";
             case REJECT_REMOVED_MEMBER:      return "REJECT_REMOVED_MEMBER";
-            case REJECT_STALE_EPOCH:         return "REJECT_STALE_EPOCH";
             case REJECT_EPOCH_ID_MISMATCH:   return "REJECT_EPOCH_ID_MISMATCH";
             case DEFER_NO_CHAIN:             return "DEFER_NO_CHAIN";
             case REJECT_SIGNATURE:           return "REJECT_SIGNATURE";
@@ -84,8 +89,8 @@ public class GroupReceiveOutcome : Object {
     public bool drop_recv_chains_all_rooms { get; private set; default = false; }
     // §13.5b: no manifest held for the sender's account, so ask for one.
     public bool fetch_manifest { get; private set; default = false; }
-    /* §13.4a.3 / §13.7a: hold the ciphertext rather than surfacing a decryption
-     * failure. MAM de-duplicates, so a discarded message is gone for good. */
+    /* §13.4a.3: hold the ciphertext rather than surfacing a decryption failure. MAM
+     * de-duplicates, so a discarded message is gone for good. */
     public bool stash_for_retry { get; private set; default = false; }
     // Observable on ACCEPT: the recv chain moved forward exactly once.
     public bool recv_chain_advanced { get; private set; default = false; }

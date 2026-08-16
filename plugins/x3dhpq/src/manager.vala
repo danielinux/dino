@@ -2644,7 +2644,9 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             }
         }
         // Replay journal so the fold epoch, members and removed_aiks are populated
-        // before receive() runs its §13.6 membership and §13.7a staleness checks.
+        // before receive() runs its §13.6 membership check. removed_aiks in particular
+        // is what protects §13.6 now that §13.7a has no epoch comparison: it refuses a
+        // removed sender at ANY epoch, so it must be populated before the decision.
         rebuild_group_session_from_journal(conversation.account, room_jid_str, (!) gs);
 
         // §13.1b: the <heads> advertisement is bound into the AAD by value and presence, so
@@ -2716,10 +2718,13 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
             drop_recv_chains_everywhere(conversation.account, (!) sender_aik_fp, hdr.sender_device_id);
         }
         if (outcome.stash_for_retry) {
-            /* No recv chain yet (§13.4a.3), or a stale epoch (§13.7a). Either way the
-             * message must not surface as a decryption failure and must not be stored
-             * unreadable: Dino's history_sync dedupes by server id and would never
-             * re-deliver it. ABORT the pipeline so it is not stored/deduped now. */
+            /* No recv chain installed for this sender at this (epoch, epoch_id) yet
+             * (§13.4a.3) — the only stash case now that §13.7a has no epoch
+             * comparison. The message must not surface as a decryption failure and
+             * must not be stored unreadable: Dino's history_sync dedupes by server id
+             * and would never re-deliver it. ABORT the pipeline so it is not
+             * stored/deduped now; drain_pending_group_messages re-runs it once the
+             * sender's chain lands. */
             debug("x3dhpq: stashing group message from %s in %s: %s",
                 sender_aik_fp, room_jid_str, outcome.detail);
             queue_undecryptable_group_message(conversation, message, stanza);

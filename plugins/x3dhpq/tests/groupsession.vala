@@ -30,6 +30,108 @@ class GroupSessionTest : Gee.TestCase {
         add_test("epoch_id_change_rotates_sender_chain", test_epoch_id_change_rotates);
         // D4.1
         add_test("revoked_device_recv_chains_dropped", test_revoked_device_recv_chains_dropped);
+        // #35
+        add_test("recv_ratchet_survives_a_reload", test_recv_ratchet_survives_reload);
+    }
+
+    /* #35 / §18.3 — the recv-chain advance must be DURABLE.
+     *
+     * §18.3 claims a receiver ratchets past each consumed message key and destroys it.
+     * That claim is only true if the advance reaches storage: a session that ratchets
+     * in memory and is persisted only on rotations and installs resumes, after a
+     * restart, at the last persisted position — so the keys it "destroyed" are derived
+     * again from a chain key still on disk, every message since the last persist is
+     * re-delivered, and the skipped-key cache is lost, which makes genuinely
+     * out-of-order messages permanently undecryptable.
+     *
+     * This drives the exact round-trip Database.store_group_session /
+     * load_group_session performs (serialize_send_state, and serialize_member_state
+     * concatenated with serialize_recv_chains), so it fails if the persisted form ever
+     * stops carrying the ratchet position or the banked skipped keys. Manager persists
+     * on the ACCEPT arm of decrypt_group_message, which is what makes the round-trip
+     * happen after every consumed message rather than only at rotation time.
+     */
+    private void test_recv_ratchet_survives_reload() {
+        try {
+            Bytes aed; Bytes apriv; Crypto.generate_ed25519(out aed, out apriv);
+            Bytes aml; Bytes amlpriv; Crypto.generate_mldsa65(out aml, out amlpriv);
+            uint8[] alice_aik = make_aik_bytes(bytes_to_arr(aed), bytes_to_arr(aml));
+            Bytes bed; Bytes bpriv; Crypto.generate_ed25519(out bed, out bpriv);
+            Bytes bml; Bytes bmlpriv; Crypto.generate_mldsa65(out bml, out bmlpriv);
+            uint8[] bob_aik = make_aik_bytes(bytes_to_arr(bed), bytes_to_arr(bml));
+
+            string room = "room@conference.example.org";
+            GroupSession alice = GroupSession.new_session(room, alice_aik, 1);
+            GroupSession bob = GroupSession.new_session(room, bob_aik, 2);
+            alice.add_member(make_member(bob_aik, 2));
+            bob.add_member(make_member(alice_aik, 1));
+
+            SenderChainAnnouncement ann = alice.announce_sender_chain();
+            bob.accept_sender_chain(ann);
+            string alice_fp = ann.aik_fingerprint();
+
+            // Three messages on Alice's chain: indices 0, 1, 2.
+            GroupMessageHeader h0; uint8[] c0; uint8[] s0;
+            GroupMessageHeader h1; uint8[] c1; uint8[] s1;
+            GroupMessageHeader h2; uint8[] c2; uint8[] s2;
+            alice.encrypt(string_to_bytes("m0"), out h0, out c0, out s0);
+            alice.encrypt(string_to_bytes("m1"), out h1, out c1, out s1);
+            alice.encrypt(string_to_bytes("m2"), out h2, out c2, out s2);
+            fail_if_not_eq_int((int) h0.chain_index, 0, "m0 must go out at index 0");
+            fail_if_not_eq_int((int) h1.chain_index, 1, "m1 must go out at index 1");
+            fail_if_not_eq_int((int) h2.chain_index, 2, "m2 must go out at index 2");
+
+            // Bob consumes index 0, then index 2 — which banks the key for index 1.
+            GroupReceiveOutcome o0 = bob.receive(alice_fp, h0, c0, null, s0,
+                GroupDeviceAuthorization.AUTHORIZED);
+            fail_if_not(o0.decision == GroupDecision.ACCEPT, "m0 must decrypt");
+            GroupReceiveOutcome o2 = bob.receive(alice_fp, h2, c2, null, s2,
+                GroupDeviceAuthorization.AUTHORIZED);
+            fail_if_not(o2.decision == GroupDecision.ACCEPT, "m2 must decrypt");
+
+            /* THE RESTART. Exactly what Database.store_group_session writes and
+             * load_group_session reads back — nothing else is carried over. */
+            string send_state = bob.serialize_send_state();
+            string member_state = bob.serialize_member_state() + bob.serialize_recv_chains();
+            GroupSession? reloaded = GroupSession.deserialize(room, bob_aik, 2, send_state, member_state);
+            fail_if(reloaded == null, "the persisted group session must reload");
+
+            /* 1. The advance was durable: index 0 is behind the reloaded chain and is
+             * refused as an already-consumed index, not decrypted a second time. A
+             * session resumed from a pre-decrypt snapshot would ACCEPT here and
+             * re-deliver a message the user has already seen — and would have derived
+             * a message key §18.3 says was destroyed. */
+            GroupReceiveOutcome replay = ((!) reloaded).receive(alice_fp, h0, c0, null, s0,
+                GroupDeviceAuthorization.AUTHORIZED);
+            fail_if_not(replay.decision == GroupDecision.REJECT_CHAIN_INDEX,
+                "after a reload the recv chain must still be past index 0, not replay it "
+                + @"(got $(replay.decision.to_name()))");
+
+            /* 2. The skipped-key cache was durable too: index 1 arrived late and is
+             * served from the banked key. Losing the cache makes exactly this message
+             * permanently undecryptable, since the chain cannot walk backwards. */
+            GroupReceiveOutcome late = ((!) reloaded).receive(alice_fp, h1, c1, null, s1,
+                GroupDeviceAuthorization.AUTHORIZED);
+            fail_if_not(late.decision == GroupDecision.ACCEPT,
+                "the persisted skipped-key cache must still serve the late index 1 "
+                + @"(got $(late.decision.to_name()))");
+            fail_if_not_eq_uint8_arr(string_to_bytes("m1"), (!) late.plaintext,
+                "the late message must decrypt to its own plaintext");
+
+            /* 3. Consuming the cached key is itself durable — persist again and the
+             * same message is no longer servable. */
+            string ss2 = ((!) reloaded).serialize_send_state();
+            string ms2 = ((!) reloaded).serialize_member_state() + ((!) reloaded).serialize_recv_chains();
+            GroupSession? reloaded2 = GroupSession.deserialize(room, bob_aik, 2, ss2, ms2);
+            fail_if(reloaded2 == null, "the group session must reload a second time");
+            GroupReceiveOutcome dup = ((!) reloaded2).receive(alice_fp, h1, c1, null, s1,
+                GroupDeviceAuthorization.AUTHORIZED);
+            fail_if_not(dup.decision == GroupDecision.REJECT_CHAIN_INDEX,
+                "consuming a cached skipped key must be persisted too, so the same message "
+                + @"is not served twice (got $(dup.decision.to_name()))");
+        } catch (Error e) {
+            fail_if_reached(e.message);
+        }
     }
 
     // D7 + D5.2: v1/v2 announcements are rejected outright, and trailing bytes after

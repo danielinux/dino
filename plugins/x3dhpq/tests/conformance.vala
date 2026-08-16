@@ -1,7 +1,7 @@
 /* The shared x3dhpq conformance corpus (§19.2.0), executed against the PRODUCTION
  * decision path.
  *
- * conformance/v1/group-accept.json pins observable outcomes of the receive state
+ * conformance/v2/group-accept.json pins observable outcomes of the receive state
  * machine — which decision a receiver reaches for a given state and inbound header,
  * and the ORDER in which its checks fire — rather than byte strings. It exists
  * because twice now the two reference clients each passed a complete green suite,
@@ -45,7 +45,7 @@ class ConformanceTest : Gee.TestCase {
             /* Loud, not silent. A build that cannot see the corpus has not run it,
              * and pretending otherwise is worse than not having one. */
             add_test("group_accept_CORPUS_NOT_FOUND", () => {
-                fail_if_reached("conformance/v1/group-accept.json not found. Looked at "
+                fail_if_reached("conformance/v2/group-accept.json not found. Looked at "
                     + "$X3DHPQ_CONFORMANCE_DIR and upward from both the working directory "
                     + "and the test binary. The corpus is normative (§19.2.0): a vector "
                     + "that cannot be executed is a failure, not a skip.");
@@ -67,7 +67,7 @@ class ConformanceTest : Gee.TestCase {
         Jv? root = new JsonReader(contents).parse();
         if (root == null || root.kind != Jv.Kind.OBJECT) {
             add_test("group_accept_CORPUS_UNPARSEABLE", () => {
-                fail_if_reached("conformance/v1/group-accept.json did not parse as a JSON object");
+                fail_if_reached("conformance/v2/group-accept.json did not parse as a JSON object");
             });
             return;
         }
@@ -91,7 +91,7 @@ class ConformanceTest : Gee.TestCase {
         Jv? vectors = ((!) root).member("vectors");
         if (vectors == null || ((!) vectors).kind != Jv.Kind.ARRAY) {
             add_test("group_accept_CORPUS_HAS_NO_VECTORS", () => {
-                fail_if_reached("conformance/v1/group-accept.json carries no `vectors` array");
+                fail_if_reached("conformance/v2/group-accept.json carries no `vectors` array");
             });
             return;
         }
@@ -120,7 +120,7 @@ class ConformanceTest : Gee.TestCase {
     private static string? find_corpus() {
         string? env = GLib.Environment.get_variable("X3DHPQ_CONFORMANCE_DIR");
         if (env != null) {
-            string direct = Path.build_filename((!) env, "v1", "group-accept.json");
+            string direct = Path.build_filename((!) env, "v2", "group-accept.json");
             if (FileUtils.test(direct, FileTest.EXISTS)) return direct;
         }
 
@@ -135,7 +135,7 @@ class ConformanceTest : Gee.TestCase {
         foreach (string root in roots) {
             string dir = root;
             for (int depth = 0; depth < 10; depth++) {
-                string candidate = Path.build_filename(dir, "conformance", "v1", "group-accept.json");
+                string candidate = Path.build_filename(dir, "conformance", "v2", "group-accept.json");
                 if (FileUtils.test(candidate, FileTest.EXISTS)) return candidate;
                 string parent = Path.get_dirname(dir);
                 if (parent == dir) break;

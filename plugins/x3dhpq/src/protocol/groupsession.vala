@@ -36,7 +36,10 @@ public errordomain GroupSessionError {
     ANNOUNCEMENT_FROM_REMOVED,
     ANNOUNCEMENT_WRONG_ROOM,
     ANNOUNCEMENT_UNKNOWN_SENDER,
-    STALE_EPOCH,
+    /* NOTE: there is deliberately no STALE_EPOCH. §13.7a (OQ-12) removed the global
+     * stale-epoch comparison: a receiver MUST NOT refuse a message merely because
+     * header.epoch is below its own fold epoch. Do not reintroduce it — see the
+     * ordering comment on receive() for what protects §13.6 instead. */
     /* D5.3: a message tagged with an epoch_id other than the one the selected recv
      * chain was installed under. Decrypting it anyway would silently accept a
      * message produced under a DIFFERENT fold of the membership DAG. */
@@ -431,8 +434,6 @@ public class GroupSession : Object {
                 throw new GroupSessionError.UNAUTHORIZED_DEVICE(outcome.detail);
             case GroupDecision.REJECT_REMOVED_MEMBER:
                 throw new GroupSessionError.REMOVED_MEMBER(outcome.detail);
-            case GroupDecision.REJECT_STALE_EPOCH:
-                throw new GroupSessionError.STALE_EPOCH(outcome.detail);
             case GroupDecision.REJECT_EPOCH_ID_MISMATCH:
                 throw new GroupSessionError.EPOCH_ID_MISMATCH(outcome.detail);
             case GroupDecision.DEFER_NO_CHAIN:
@@ -446,24 +447,37 @@ public class GroupSession : Object {
         }
     }
 
-    /* THE receive-side decision point (§19.2.0, conformance/v1/group-accept.json).
+    /* THE receive-side decision point (§19.2.0, conformance/v2/group-accept.json).
      *
      * Every check the specification places on an inbound group message runs here, in
      * this order, and nowhere else:
      *
      *   1. device_authorization  §13.5b — supplied by the caller (see `auth`)
      *   2. membership            §13.6
-     *   3. stale_epoch           §13.7a
-     *   4. chain_selection       §13.5a
-     *   5. sender_signature      §13.3a
-     *   6. aead                  §13.3, preceded by the §13.7 chain-index query (6a)
+     *   3. chain_selection       §13.5a
+     *   4. sender_signature      §13.3a
+     *   5. aead                  §13.3, preceded by the §13.7 chain-index query (5a)
      *
-     * The order is normative, not incidental, because checks 1, 3 and 4 carry side
+     * The order is normative, not incidental, because checks 1 and 3 carry side
      * effects. The one that motivates the whole arrangement: an UNAUTHORIZED device
-     * whose message is ALSO stale must still trigger the chain drop. Testing
-     * staleness first reaches the same verdict — rejected — while leaving the revoked
-     * device's installed chains in place, which is exactly the state §13.5b exists to
-     * remove. Keeping the sequence in one function is what makes that observable.
+     * whose message is ALSO at an old epoch must still trigger the chain drop.
+     * Deciding the epoch question first reaches a verdict — rejected — while leaving
+     * the revoked device's installed chains in place, which is exactly the state
+     * §13.5b exists to remove. Keeping the sequence in one function is what makes
+     * that observable.
+     *
+     * THERE IS NO GLOBAL STALE-EPOCH COMPARISON (§13.7a, OQ-12 resolved). An earlier
+     * revision refused any message whose header.epoch was below this room's fold
+     * epoch, and that was a mistake: a fold epoch is monotone and members converge at
+     * different times, so a member whose fold merely LAGS emitted messages the rule
+     * refused PERMANENTLY — our epoch never descends to meet them, and the sender's
+     * recovery produces a new message at a higher epoch rather than redelivering the
+     * old one. What actually protects §13.6 is step 2, which refuses a removed sender
+     * at ANY epoch; alongside it step 1 refuses a device its account no longer
+     * authorizes (§13.5b), step 3 confines decryption to a chain this receiver really
+     * installed for that exact (epoch, epoch_id) (§13.5a), and §13.7's chain-index
+     * rules refuse replays. Every one of those is independent of how far apart the two
+     * peers' folds happen to be.
      *
      * `auth` is an input rather than a lookup: resolving it needs the Trust Manifest
      * fold and the account database, neither of which belongs in the protocol layer.
@@ -497,17 +511,12 @@ public class GroupSession : Object {
                 "message from a removed member (§13.6)");
         }
 
-        /* 3. §13.7a stale epoch. One-directional: a sender AHEAD of our fold is
-         * legitimate (we are the ones lagging) and falls through to chain selection.
-         * Stashed rather than discarded — the message must never surface as a
-         * decryption failure — though §13.7a is explicit that this is a presentation
-         * choice and not a path to eventual decryption. */
-        if (hdr.epoch < epoch) {
-            return new GroupReceiveOutcome.stashed(GroupDecision.REJECT_STALE_EPOCH,
-                "header epoch is behind this room's fold epoch (§13.7a)");
-        }
-
-        // 4. §13.5a chain selection by the 4-tuple (aik_fp, device_id, epoch, epoch_id).
+        /* 3. §13.5a chain selection by the 4-tuple (aik_fp, device_id, epoch, epoch_id).
+         *
+         * §13.7a: selection proceeds on the 4-tuple REGARDLESS of how hdr.epoch
+         * compares to our own fold epoch. Below, equal or above, the tuple either
+         * names a chain we installed or it does not, and that — not a comparison
+         * between two independently-converging folds — is what decides. */
         string rk = recv_key(sender_aik_fp, hdr.sender_device_id, hdr.epoch, hdr.epoch_id);
         SenderChain? sc = recv_chains[rk];
         if (sc == null) {
@@ -534,7 +543,7 @@ public class GroupSession : Object {
         uint8[] aad_bytes = hdr.aad_with_heads(room_jid, heads_payload);
         uint8[] nonce_bytes = hdr.aead_nonce();
 
-        /* 5. §13.3a: verify the SENDER SIGNATURE, BEFORE any message key is derived.
+        /* 4. §13.3a: verify the SENDER SIGNATURE, BEFORE any message key is derived.
          *
          * The AEAD tag alone cannot attribute a group message: the sender chain key it
          * derives from is symmetric and was handed to every member, so any member could
@@ -572,7 +581,7 @@ public class GroupSession : Object {
                 "group sender signature did not verify (§13.3a)");
         }
 
-        /* 6a. §13.7 chain index. Ask whether this index can be served at all BEFORE
+        /* 5a. §13.7 chain index. Ask whether this index can be served at all BEFORE
          * trying to derive a key for it. Both refusals — already ratcheted past
          * (ErrSenderChainPast) and beyond the skipped-key budget
          * (ErrSenderChainTooManySkipped) — are ordinary verdicts, not errors: §13.7 is
@@ -589,7 +598,7 @@ public class GroupSession : Object {
                 "chain index already ratcheted past, or beyond the skipped-key budget (§13.7)");
         }
 
-        /* 6b. §13.3 AEAD. Derive WITHOUT mutating the chain, authenticate, and only then
+        /* 5b. §13.3 AEAD. Derive WITHOUT mutating the chain, authenticate, and only then
          * commit. The header (including chain_index) is unauthenticated until the tag
          * verifies, so ratcheting first would let anyone able to place a group stanza in
          * the room push this recv chain permanently past the real sender. */
@@ -597,7 +606,7 @@ public class GroupSession : Object {
         try {
             pending = sc.derive_message_key_at(hdr.chain_index);
         } catch (GLib.Error e) {
-            /* 6a already excluded both index refusals, so anything left is an internal
+            /* 5a already excluded both index refusals, so anything left is an internal
              * crypto failure. It stays REJECT_AEAD rather than REJECT_CHAIN_INDEX
              * precisely because the caller treats the latter as a benign duplicate:
              * a message we could not process for an unexpected reason must not be
