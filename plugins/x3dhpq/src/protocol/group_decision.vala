@@ -37,7 +37,15 @@ public enum GroupDecision {
     REJECT_EPOCH_ID_MISMATCH,
     DEFER_NO_CHAIN,
     REJECT_SIGNATURE,
-    REJECT_AEAD;
+    REJECT_AEAD,
+    /* §13.7: the requested chain index cannot be served — already ratcheted past
+     * (ErrSenderChainPast) or beyond the skipped-key budget
+     * (ErrSenderChainTooManySkipped). Deliberately NOT folded into REJECT_AEAD: the
+     * tag is never evaluated on this path, and the past-index case is the routine
+     * DUPLICATE delivery (a replayed archive message), not a failure at all. A caller
+     * that saw REJECT_AEAD here would be told "authentication failed" about a message
+     * it already displayed correctly. */
+    REJECT_CHAIN_INDEX;
 
     // Corpus spelling. Kept next to the enum so the two cannot drift apart.
     public string to_name() {
@@ -50,6 +58,7 @@ public enum GroupDecision {
             case DEFER_NO_CHAIN:             return "DEFER_NO_CHAIN";
             case REJECT_SIGNATURE:           return "REJECT_SIGNATURE";
             case REJECT_AEAD:                return "REJECT_AEAD";
+            case REJECT_CHAIN_INDEX:         return "REJECT_CHAIN_INDEX";
             default:                         return "UNKNOWN";
         }
     }

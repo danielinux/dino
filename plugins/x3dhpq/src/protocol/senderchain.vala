@@ -126,6 +126,32 @@ public class SenderChain : Object {
         return ((!) pending).message_key;
     }
 
+    /* §13.7: can `target` be served AT ALL? A pure query — nothing here mutates, and
+     * nothing here derives a key.
+     *
+     * Two ways the answer is no, and NEITHER is an AEAD failure, because the tag is
+     * never evaluated: the index is already ratcheted past (ErrSenderChainPast — the
+     * routine duplicate-delivery case, a replayed archive message) or reaching it
+     * would need more skipped keys than DefaultMaxSkipped allows
+     * (ErrSenderChainTooManySkipped). §13.7 is normative that both are ordinary
+     * verdicts rather than exceptions, so the receive path asks this BEFORE calling
+     * derive_message_key_at() instead of turning that function's throws into a
+     * decision — an exception mapped after the fact would make the CALLER's error
+     * handling the real decision point, and would also swallow genuine internal
+     * crypto errors into the same bucket.
+     */
+    public bool index_usable(uint32 target) {
+        if (skipped.has_key(target)) return true;
+        if (target < next_index) return false;
+        /* Mirrors the loop bound in derive_message_key_at() exactly: it caches one key
+         * per index in [next_index, target) and refuses as soon as the cache WOULD
+         * reach MAX_SKIPPED. 64-bit arithmetic because `target` is attacker-chosen and
+         * unauthenticated at this point — a 32-bit sum here would wrap and report a
+         * wildly out-of-range index as servable. */
+        uint64 needed = (uint64) target - (uint64) next_index;
+        return ((uint64) skipped.size + needed) <= (uint64) MAX_SKIPPED;
+    }
+
     // Derive the message key for `target` WITHOUT mutating the chain. The caller
     // authenticates the ciphertext first and only then calls commit().
     //

@@ -172,6 +172,24 @@ class ConformanceTest : Gee.TestCase {
         }
     }
 
+    // Does this recv-chain entry match the message on the §13.5a 4-tuple?
+    private bool selects(Jv c, string msg_fp, uint32 dev, uint32 epoch, uint64 epoch_id) throws GLib.Error {
+        return konst(c.req("aik_fp").str) == msg_fp
+            && (uint32) c.int_member("device_id", 0) == dev
+            && (uint32) c.int_member("epoch", 0) == epoch
+            && hex64(konst(c.req("epoch_id").str)) == epoch_id;
+    }
+
+    /* Advance a session's SEND chain by `n` pure ratchet steps, discarding the message
+     * keys. This is the production ratchet, so the resulting chain key really is the one
+     * a peer would hold at that index. */
+    private static void ratchet_send_chain(GroupSession gs, uint32 n) throws GLib.Error {
+        for (uint32 i = 0; i < n; i++) {
+            uint32 idx;
+            ((!) gs.send_chain).step(out idx);
+        }
+    }
+
     private void evaluate(string id, Jv vector, Gee.ArrayList<string> problems) throws GLib.Error {
         Jv receiver_spec = vector.req("receiver");
         Jv message_spec = vector.req("message");
@@ -180,16 +198,28 @@ class ConformanceTest : Gee.TestCase {
         // ---- receiver state -------------------------------------------------
         uint32 fold_epoch = (uint32) receiver_spec.int_member("fold_epoch", 0);
         bool sender_authorized = receiver_spec.bool_member("sender_authorized", true);
+        // The corpus `defaults` block fixes all four of these explicitly.
         bool manifest_known = receiver_spec.bool_member("sender_manifest_known", true);
+        bool owner_known = receiver_spec.bool_member("sender_owner_known", true);
         bool sender_removed = receiver_spec.bool_member("sender_removed", false);
 
         /* Step 1 is an INPUT, exactly as it is for Manager: authorization is resolved
          * from the Trust Manifest fold, which the protocol layer has no business
-         * reaching into. That is what lets the corpus supply it directly. */
-        GroupDeviceAuthorization auth = sender_authorized
-            ? GroupDeviceAuthorization.AUTHORIZED
-            : (manifest_known ? GroupDeviceAuthorization.NOT_AUTHORIZED
-                              : GroupDeviceAuthorization.NO_MANIFEST);
+         * reaching into. That is what lets the corpus supply it directly.
+         *
+         * The three-way mapping mirrors Manager.group_sender_authorization() exactly.
+         * NO_MANIFEST is the only value that asks for a fetch, and it requires an OWNER
+         * to fetch from: a fingerprint that resolves to no account at all is
+         * NOT_AUTHORIZED, because there is no JID to request a manifest for. Both
+         * reject either way — this path does not fail open. */
+        GroupDeviceAuthorization auth;
+        if (sender_authorized) {
+            auth = GroupDeviceAuthorization.AUTHORIZED;
+        } else if (!owner_known || manifest_known) {
+            auth = GroupDeviceAuthorization.NOT_AUTHORIZED;
+        } else {
+            auth = GroupDeviceAuthorization.NO_MANIFEST;
+        }
 
         // ---- the inbound message -------------------------------------------
         string msg_fp = konst(message_spec.req("sender_aik_fp").str);
@@ -199,22 +229,76 @@ class ConformanceTest : Gee.TestCase {
         string gsig_mode = message_spec.req("gsig").str;
         string aead_mode = message_spec.req("aead").str;
 
+        /* The corpus can state that the message's index is NOT sitting in the
+         * skipped-key cache. Every chain this harness restores has an empty cache, so
+         * that holds by construction — but a vector asking for the opposite would need
+         * a construction that does not exist here, and silently ignoring the field
+         * would make it pass for the wrong reason. */
+        if (!message_spec.bool_member("not_in_skipped_cache", true)) {
+            problems.add("vector requires the message index to be PRESENT in the skipped-key "
+                + "cache; this harness only restores chains with an empty cache");
+            return;
+        }
+
+        Jv? chains = receiver_spec.member("recv_chains");
+
+        /* Two chain positions matter and they are independent: where the receiver's
+         * SELECTED chain stands (R = its next_index) and which index the message was
+         * sent at (N). N defaults to R, which is what keeps every vector naming neither
+         * field exactly where it was — a fresh chain at 0 receiving a message at 0. */
+        uint32 recv_next_index = 0;
+        if (chains != null) {
+            foreach (Jv c in ((!) chains).arr) {
+                if (selects(c, msg_fp, msg_device, msg_epoch, msg_epoch_id)) {
+                    recv_next_index = (uint32) c.int_member("next_index", 0);
+                }
+            }
+        }
+        uint32 msg_index = (uint32) message_spec.int_member("chain_index", (int) recv_next_index);
+
         /* A real sender session at the message's (epoch, epoch_id). Everything the
          * receiver will check — ciphertext, tag, per-epoch Ed25519 signature — is
          * produced by the production encrypt path, so "present_valid" really is valid
          * and the AEAD really does authenticate. */
         GroupSession sender = GroupSession.new_session(ROOM, random_aik(), msg_device);
         sender.apply_fold_epoch(msg_epoch, msg_epoch_id);
-        uint8[] live_chain_key = ((!) sender.send_chain).chain_key.copy();
         uint8[] live_sig_pub = ((!) sender.send_chain).sig_pub.copy();
         uint8[] live_sig_priv = ((!) sender.send_chain).sig_priv.copy();
+
+        /* Walk the sender's own chain to both positions rather than fabricating a chain
+         * key and a header index that do not belong together: the key the receiver ends
+         * up holding is genuinely the sender's chain key at R, and the message genuinely
+         * came out of the chain at N. That matters for the index vectors specifically —
+         * an implementation that ignored the index bound and derived anyway would derive
+         * the RIGHT key and decrypt, so a fabricated pairing could make a broken
+         * implementation look correct. Stepping is a pure ratchet (two HMACs, no
+         * encryption), so even the 5000-index vector is cheap. */
+        GroupMessageHeader hdr;
+        uint8[] ciphertext;
+        uint8[] signature;
+        uint8[] chain_key_at_recv_index;
+        if (msg_index >= recv_next_index) {
+            ratchet_send_chain(sender, recv_next_index);
+            chain_key_at_recv_index = ((!) sender.send_chain).chain_key.copy();
+            ratchet_send_chain(sender, msg_index - recv_next_index);
+            sender.encrypt(string_bytes(PAYLOAD), out hdr, out ciphertext, out signature);
+        } else {
+            // The already-ratcheted-past case: the message was sent, and only afterwards
+            // did the receiver's chain move on past it.
+            ratchet_send_chain(sender, msg_index);
+            sender.encrypt(string_bytes(PAYLOAD), out hdr, out ciphertext, out signature);
+            ratchet_send_chain(sender, recv_next_index - msg_index - 1);
+            chain_key_at_recv_index = ((!) sender.send_chain).chain_key.copy();
+        }
+        if (hdr.chain_index != msg_index) {
+            problems.add(@"harness bug: the message went out at chain index $(hdr.chain_index), vector says $msg_index");
+        }
 
         // ---- restore the receiver from persisted state ----------------------
         var member_state = new StringBuilder();
         if (sender_removed) {
             member_state.append("R:%s:%u\n".printf(msg_fp, fold_epoch));
         }
-        Jv? chains = receiver_spec.member("recv_chains");
         if (chains != null) {
             foreach (Jv c in ((!) chains).arr) {
                 string cfp = konst(c.req("aik_fp").str);
@@ -222,6 +306,7 @@ class ConformanceTest : Gee.TestCase {
                 uint32 cepoch = (uint32) c.int_member("epoch", 0);
                 uint64 cepoch_id = hex64(konst(c.req("epoch_id").str));
                 bool has_sig_pub = c.bool_member("has_sig_pub", true);
+                uint32 cnext = (uint32) c.int_member("next_index", 0);
 
                 /* Only the chain the 4-tuple actually selects gets the sender's real
                  * key material. Every other chain is unrelated noise — which is the
@@ -230,7 +315,7 @@ class ConformanceTest : Gee.TestCase {
                 bool selected = (cfp == msg_fp && cdev == msg_device
                                  && cepoch == msg_epoch && cepoch_id == msg_epoch_id);
                 SenderChain? sc = SenderChain.restore(cepoch,
-                    selected ? live_chain_key : random32(), 0, cepoch_id);
+                    selected ? chain_key_at_recv_index : random32(), cnext, cepoch_id);
                 if (sc == null) throw new IOError.FAILED("could not build a recv chain for the vector");
                 ((!) sc).sig_pub = has_sig_pub
                     ? (selected ? live_sig_pub : random32())
@@ -249,12 +334,7 @@ class ConformanceTest : Gee.TestCase {
             problems.add(@"harness bug: receiver fold epoch is $(((!) receiver).epoch), vector says $fold_epoch");
         }
 
-        // ---- produce, then damage as the vector prescribes -------------------
-        GroupMessageHeader hdr;
-        uint8[] ciphertext;
-        uint8[] signature;
-        sender.encrypt(string_bytes(PAYLOAD), out hdr, out ciphertext, out signature);
-
+        // ---- damage the produced message as the vector prescribes -------------
         if (aead_mode == "fail") {
             /* Flip a ciphertext byte so the tag cannot verify, then RE-SIGN: the
              * message has to reach step 6 with a signature that passes step 5, or the

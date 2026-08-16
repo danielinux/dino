@@ -2750,16 +2750,26 @@ public class Manager : Object, global::Dino.Plugins.X3dhpqGroupManager {
                 // "abort pipeline?", see DecryptMessageListener).
                 return false;
 
+            case Protocol.GroupDecision.REJECT_CHAIN_INDEX:
+                /* NOT a security failure, and deliberately not logged as one. This is
+                 * the DUPLICATE case (§13.7 ErrSenderChainPast): the same stanza reached
+                 * us twice — live delivery plus MUC MAM catch-up after being offline —
+                 * the first copy already consumed that chain index, and the ratchet is
+                 * one-way. The first copy was displayed correctly, so dropping this one
+                 * is exactly right and there is nothing to warn about. The other half of
+                 * this verdict is an index beyond the skipped-key budget, which retrying
+                 * cannot fix either, so it is not stashed. */
+                debug("x3dhpq: dropping duplicate/unusable-index group message from %s in %s: %s",
+                    sender_aik_fp, room_jid_str, outcome.detail);
+                return true;
+
             case Protocol.GroupDecision.REJECT_AEAD:
-                /* Authentication failed. Overwhelmingly this is a DUPLICATE: the same
-                 * stanza reached us twice (live delivery plus MUC MAM catch-up after
-                 * being offline), the first copy already consumed that chain index, and
-                 * the ratchet is one-way (§13.7), so the second copy can never
-                 * authenticate. The first copy was displayed correctly, so dropping this
-                 * one is exactly right. The remainder are tampering. Not stashed: unlike
-                 * the no-recv-chain case, retrying cannot help. */
-                debug("x3dhpq: dropping group message from %s in %s that did not authenticate"
-                    + " (duplicate delivery, or tampered)", sender_aik_fp, room_jid_str);
+                /* Authentication genuinely failed: the tag did not verify over a chain
+                 * index we were able to serve. Duplicates land in REJECT_CHAIN_INDEX
+                 * above, not here, so what reaches this arm is tampering (or a bug).
+                 * Not stashed: unlike the no-recv-chain case, retrying cannot help. */
+                debug("x3dhpq: dropping group message from %s in %s that did not authenticate",
+                    sender_aik_fp, room_jid_str);
                 return true;
 
             default:

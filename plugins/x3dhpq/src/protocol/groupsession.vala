@@ -51,6 +51,12 @@ public errordomain GroupSessionError {
      * is derived, so conflating the two hides an implementation that derives first
      * and verifies second. */
     SIGNATURE_INVALID,
+    /* §13.7: the chain index is already ratcheted past (ErrSenderChainPast) or beyond
+     * the skipped-key budget (ErrSenderChainTooManySkipped). Distinct from
+     * AEAD_FAILURE — the tag was never evaluated — and mostly not a failure at all:
+     * the past-index case is a duplicate delivery. Only the exception-shaped adapter
+     * below raises it; the live receive path sees GroupDecision.REJECT_CHAIN_INDEX. */
+    CHAIN_INDEX_UNUSABLE,
 }
 
 // D5.3: recv chains are keyed by the 4-TUPLE (aik_fp, device_id, epoch, epoch_id).
@@ -433,6 +439,8 @@ public class GroupSession : Object {
                 throw new GroupSessionError.UNKNOWN_SENDER(outcome.detail);
             case GroupDecision.REJECT_SIGNATURE:
                 throw new GroupSessionError.SIGNATURE_INVALID(outcome.detail);
+            case GroupDecision.REJECT_CHAIN_INDEX:
+                throw new GroupSessionError.CHAIN_INDEX_UNUSABLE(outcome.detail);
             default:
                 throw new GroupSessionError.AEAD_FAILURE(outcome.detail);
         }
@@ -448,7 +456,7 @@ public class GroupSession : Object {
      *   3. stale_epoch           §13.7a
      *   4. chain_selection       §13.5a
      *   5. sender_signature      §13.3a
-     *   6. aead                  §13.3
+     *   6. aead                  §13.3, preceded by the §13.7 chain-index query (6a)
      *
      * The order is normative, not incidental, because checks 1, 3 and 4 carry side
      * effects. The one that motivates the whole arrangement: an UNAUTHORIZED device
@@ -564,7 +572,24 @@ public class GroupSession : Object {
                 "group sender signature did not verify (§13.3a)");
         }
 
-        /* 6. §13.3 AEAD. Derive WITHOUT mutating the chain, authenticate, and only then
+        /* 6a. §13.7 chain index. Ask whether this index can be served at all BEFORE
+         * trying to derive a key for it. Both refusals — already ratcheted past
+         * (ErrSenderChainPast) and beyond the skipped-key budget
+         * (ErrSenderChainTooManySkipped) — are ordinary verdicts, not errors: §13.7 is
+         * normative that neither may escape as an exception, and neither is an AEAD
+         * failure because the tag is never evaluated here. The past-index case is
+         * overwhelmingly a DUPLICATE (the same stanza delivered live and again through
+         * MAM catch-up), which the caller must not surface as a security failure.
+         *
+         * Nothing is mutated on either path: this query touches no state, and the
+         * budget refusal in particular does not bank the skipped keys it would have
+         * walked over on the way to `target`. */
+        if (!sc.index_usable(hdr.chain_index)) {
+            return new GroupReceiveOutcome(GroupDecision.REJECT_CHAIN_INDEX,
+                "chain index already ratcheted past, or beyond the skipped-key budget (§13.7)");
+        }
+
+        /* 6b. §13.3 AEAD. Derive WITHOUT mutating the chain, authenticate, and only then
          * commit. The header (including chain_index) is unauthenticated until the tag
          * verifies, so ratcheting first would let anyone able to place a group stanza in
          * the room push this recv chain permanently past the real sender. */
@@ -572,13 +597,17 @@ public class GroupSession : Object {
         try {
             pending = sc.derive_message_key_at(hdr.chain_index);
         } catch (GLib.Error e) {
-            /* Index already ratcheted past (overwhelmingly a duplicate delivery), or
-             * beyond the skipped-key bound. Nothing was mutated getting here. */
+            /* 6a already excluded both index refusals, so anything left is an internal
+             * crypto failure. It stays REJECT_AEAD rather than REJECT_CHAIN_INDEX
+             * precisely because the caller treats the latter as a benign duplicate:
+             * a message we could not process for an unexpected reason must not be
+             * silently discarded as one. Still no throw — §19.2.0 requires every input
+             * to resolve to a decision. */
             pending = null;
         }
         if (pending == null) {
             return new GroupReceiveOutcome(GroupDecision.REJECT_AEAD,
-                "no message key available for this chain index (§13.7)");
+                "message key derivation failed for this chain index (§13.7)");
         }
 
         try {
